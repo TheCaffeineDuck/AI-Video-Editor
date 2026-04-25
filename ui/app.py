@@ -12,12 +12,18 @@ from pathlib import Path
 import customtkinter as ctk
 
 from core import audio, exporters
+from core.model_loader import download_model
+from core.models import is_downloaded
+from core.settings import Settings, load_settings
 from core.transcriber import Transcriber
 from ui import theme
 from ui.components.drop_zone import DropZone
+from ui.components.language_picker import LanguagePicker
 from ui.components.model_picker import ModelPicker
+from ui.components.output_formats import OutputFormatPicker
 from ui.components.progress_card import ProgressCard
 from ui.components.result_card import ResultCard
+from ui.components.settings_panel import open_settings
 from ui.state import (
     AppState,
     AppStateMachine,
@@ -49,13 +55,19 @@ def _make_root() -> tk.Tk:
 class App:
     """Top-level controller. Owns the root window, state, worker thread, and queue."""
 
-    def __init__(self, root: tk.Tk | None = None) -> None:
+    def __init__(
+        self,
+        root: tk.Tk | None = None,
+        *,
+        settings: Settings | None = None,
+    ) -> None:
         theme.apply_theme()
         self.root = root or _make_root()
         self.root.title(theme.WINDOW_TITLE)
         self.root.geometry(f"{theme.WINDOW_DEFAULT_SIZE[0]}x{theme.WINDOW_DEFAULT_SIZE[1]}")
         self.root.minsize(*theme.WINDOW_MIN_SIZE)
 
+        self.settings = settings or load_settings()
         self.state = AppStateMachine()
         self.event_queue: queue.Queue = queue.Queue()
         self._transcriber: Transcriber | None = None
@@ -72,6 +84,19 @@ class App:
     # ----- layout -----
 
     def _build(self) -> None:
+        # Top bar with gear icon.
+        topbar = ctk.CTkFrame(self.root, fg_color="transparent")
+        topbar.pack(fill="x", padx=16, pady=(12, 0))
+        ctk.CTkButton(
+            topbar,
+            text="⚙",
+            width=32,
+            fg_color="transparent",
+            hover_color="#E5E7EB",
+            text_color=theme.MUTED,
+            command=self._open_settings,
+        ).pack(side="right")
+
         self._main = ctk.CTkFrame(self.root, fg_color="transparent")
         self._main.pack(fill="both", expand=True, padx=16, pady=16)
 
@@ -97,9 +122,25 @@ class App:
         self.drop_zone.pack(fill="both", expand=True, padx=8, pady=8)
 
         controls = ctk.CTkFrame(self._idle_frame, fg_color="transparent")
-        controls.pack(fill="x", padx=8, pady=8)
-        self.model_picker = ModelPicker(controls, initial="base")
-        self.model_picker.pack(side="left")
+        controls.pack(fill="x", padx=8, pady=(8, 0))
+        self.model_picker = ModelPicker(controls, initial=self.settings.default_model)
+        self.model_picker.pack(side="left", anchor="w")
+
+        controls2 = ctk.CTkFrame(self._idle_frame, fg_color="transparent")
+        controls2.pack(fill="x", padx=8, pady=(4, 0))
+        self.language_picker = LanguagePicker(
+            controls2, initial_code=self.settings.default_language
+        )
+        self.language_picker.pack(side="left", anchor="w")
+
+        controls3 = ctk.CTkFrame(self._idle_frame, fg_color="transparent")
+        controls3.pack(fill="x", padx=8, pady=(4, 8))
+        self.output_picker = OutputFormatPicker(
+            controls3,
+            initial=self.settings.output_formats,
+            on_change=self._handle_output_format_change,
+        )
+        self.output_picker.pack(side="left", anchor="w")
 
         self.transcribe_btn = ctk.CTkButton(
             self._idle_frame,
@@ -139,10 +180,10 @@ class App:
             self._idle_frame.pack(fill="both", expand=True)
             if state == AppState.FILE_LOADED and self.state.media_path:
                 self._show_loaded_preview(self.state.media_path)
-                self.transcribe_btn.configure(state="normal")
+                self._refresh_transcribe_button(text="Transcribe")
             elif state == AppState.ERROR and self.state.media_path:
                 self._show_loaded_preview(self.state.media_path)
-                self.transcribe_btn.configure(text="Retry", state="normal")
+                self._refresh_transcribe_button(text="Retry")
             else:
                 self.drop_zone.show_idle()
                 self.transcribe_btn.configure(text="Transcribe", state="disabled")
@@ -154,6 +195,21 @@ class App:
         elif state == AppState.COMPLETE:
             self._show_result()
             self.result_card.pack(fill="both", expand=True)
+
+    def _refresh_transcribe_button(self, *, text: str) -> None:
+        if self.output_picker.has_selection:
+            self.transcribe_btn.configure(text=text, state="normal")
+        else:
+            self.transcribe_btn.configure(
+                text=f"{text} (pick an output format)", state="disabled"
+            )
+
+    def _handle_output_format_change(self, _formats: list[str]) -> None:
+        # Re-render so Transcribe button enable/disable updates immediately.
+        if self.state.state in (AppState.FILE_LOADED, AppState.ERROR):
+            self._refresh_transcribe_button(
+                text="Retry" if self.state.state == AppState.ERROR else "Transcribe"
+            )
 
     def _show_loaded_preview(self, path: Path) -> None:
         try:
@@ -187,7 +243,7 @@ class App:
             self._handle_invalid_file(str(exc))
 
     def _handle_invalid_file(self, message: str) -> None:
-        # We surface the error as a transient message via the error banner state.
+        # Surface as a transient banner without a persistent ERROR state.
         self.state.error_message = message
         self._render_for_state(self.state.state)
         self.root.after(2500, self._clear_transient_error)
@@ -206,16 +262,22 @@ class App:
                 self.state._emit()
         if self.state.state != AppState.FILE_LOADED:
             return
+        if not self.output_picker.has_selection:
+            self._handle_invalid_file("Select at least one output format.")
+            return
         self.state.start_transcribing()
         self.progress_card.reset()
+        self.progress_card.set_label("Preparing…")
         self._cancel_requested.clear()
 
         media_path = self.state.media_path
         model_name = self.model_picker.value
+        language = self.language_picker.selected_code
+        formats = list(self.output_picker.formats)
         assert media_path is not None
         self._worker = threading.Thread(
             target=self._run_transcription,
-            args=(media_path, model_name),
+            args=(media_path, model_name, language, formats),
             daemon=True,
         )
         self._worker.start()
@@ -237,12 +299,51 @@ class App:
             self._transcriber.cancel()
         self.root.destroy()
 
+    def _open_settings(self) -> None:
+        open_settings(self.root, current=self.settings, on_save=self._apply_settings)
+
+    def _apply_settings(self, new: Settings) -> None:
+        self.settings = new
+        # Live-apply the affected widgets where it makes sense.
+        try:
+            self.model_picker.set(new.default_model)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.language_picker.set_code(new.default_language)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.output_picker.set_formats(new.output_formats)
+        except Exception:  # noqa: BLE001
+            pass
+
     # ----- worker thread -----
 
-    def _run_transcription(self, media_path: Path, model_name: str) -> None:
+    def _run_transcription(
+        self,
+        media_path: Path,
+        model_name: str,
+        language: str | None,
+        formats: list[str],
+    ) -> None:
         start = time.monotonic()
         try:
-            self._transcriber = Transcriber(model_name)
+            # First-run: download model with real progress.
+            if not is_downloaded(model_name):
+                def on_dl(fraction: float, label: str) -> None:
+                    if self._cancel_requested.is_set():
+                        return
+                    self.event_queue.put(ProgressEvent(fraction=fraction, label=label))
+                download_model(model_name, on_progress=on_dl)
+                if self._cancel_requested.is_set():
+                    return
+
+            self._transcriber = Transcriber(
+                model_name,
+                device=self.settings.compute_device,
+                compute_type=self.settings.compute_type,
+            )
 
             def on_segment(text: str) -> None:
                 if self._cancel_requested.is_set():
@@ -252,16 +353,23 @@ class App:
             def on_progress(fraction: float) -> None:
                 if self._cancel_requested.is_set():
                     return
-                self.event_queue.put(ProgressEvent(fraction=fraction))
+                self.event_queue.put(ProgressEvent(fraction=fraction, label="Transcribing…"))
 
             segments, info = self._transcriber.transcribe(
-                media_path, language=None, on_segment=on_segment, on_progress=on_progress
+                media_path, language=language, on_segment=on_segment, on_progress=on_progress
             )
 
             if self._cancel_requested.is_set():
                 return
 
-            files = exporters.write_outputs(media_path, segments, ["txt", "srt"])
+            output_dir = (
+                Path(self.settings.output_dir)
+                if self.settings.output_dir
+                else media_path.parent
+            )
+            output_dir.mkdir(parents=True, exist_ok=True)
+            output_base = output_dir / media_path.name
+            files = exporters.write_outputs(output_base, segments, formats)
             elapsed = time.monotonic() - start
             self.event_queue.put(
                 DoneEvent(segments=segments, info=info, output_files=files, elapsed=elapsed)
@@ -283,7 +391,10 @@ class App:
         if n > 0:
             self._render_for_state(self.state.state)
             if self.state.state == AppState.TRANSCRIBING:
-                self.progress_card.set_progress(self.state.progress)
+                self.progress_card.set_progress(
+                    self.state.progress,
+                    label=self.state.progress_label or "Transcribing…",
+                )
                 for line in self.state.streaming_text[-3:]:
                     self.progress_card.append_stream(line)
                 self.state.streaming_text = []
