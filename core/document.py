@@ -5,6 +5,14 @@ system stops leaking faster-whisper's objects across module boundaries.
 Phase 4b adds :class:`Document` (the persisted project model) and
 :class:`CutMark` (an edit-state primitive) on top of these, plus JSON
 serialization with explicit schema versioning.
+
+Immutability contract (Phase 4c): :class:`Document`, :class:`CutMark`,
+:class:`Segment`, and :class:`Word` are all ``frozen=True``. Edit commands
+in :mod:`core.editing` produce *new* Documents via
+``dataclasses.replace`` and always pass a fresh list for ``cuts`` /
+``segments`` — never mutate the inner list of an existing Document, since
+``frozen`` prevents reassigning the attribute but cannot prevent
+``doc.cuts.append(...)``. Stick to ``replace(doc, cuts=[*doc.cuts, x])``.
 """
 
 from __future__ import annotations
@@ -63,13 +71,18 @@ class UnsupportedSchemaError(ValueError):
     """Raised when ``Document.from_json`` is asked to load an unknown schema."""
 
 
-@dataclass
+@dataclass(frozen=True)
 class Document:
     """The canonical, serializable transcription project.
 
     SRT/TXT/VTT files written next to a media file are *derivatives* of this
     model — the editor (Phase 5+) will round-trip through Document JSON, not
     through the subtitle files.
+
+    Frozen: callers can't reassign ``doc.cuts`` / ``doc.segments``. The
+    inner lists are still mutable Python lists, so edit commands are
+    responsible for never appending to them — they always pass a fresh
+    list to :func:`dataclasses.replace`.
     """
 
     media_path: Path
