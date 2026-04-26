@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from core.document import Segment, Word
+from core.document import Document, Segment, Word, build_document
 from core.exporters import (
     SimpleSegment,
     format_srt_timestamp,
@@ -402,3 +404,116 @@ def test_each_fixture_yields_three_cues(fixture):
     assert [s.text for s in parsed] == ["Hello", "world", "foo bar"]
     assert [s.start for s in parsed] == pytest.approx([0.0, 1.5, 3.0])
     assert [s.end for s in parsed] == pytest.approx([1.5, 3.0, 4.5])
+
+
+# ---------------------------------------------------------------------------
+# Phase 4e: JSON output (the editable-project artifact)
+# ---------------------------------------------------------------------------
+
+
+def _example_doc(media_path: Path) -> Document:
+    return Document(
+        media_path=media_path,
+        duration=2.0,
+        language="en",
+        segments=[
+            Segment("Hello", 0.0, 1.0, words=(Word("Hello", 0.0, 1.0, 0.95),)),
+            Segment("world", 1.0, 2.0),
+        ],
+        cuts=[],
+        created_at=datetime(2026, 4, 27, 10, 0, 0, tzinfo=UTC),
+        model_name="tiny",
+    )
+
+
+def test_write_outputs_json_uses_transcribe_json_extension(tmp_path: Path):
+    src = tmp_path / "lecture.mp4"
+    doc = _example_doc(src)
+    written = write_outputs(src, doc.segments, ["json"], document=doc)
+    assert written["json"] == tmp_path / "lecture.transcribe.json"
+
+
+def test_write_outputs_json_writes_loadable_document(tmp_path: Path):
+    src = tmp_path / "lecture.mp4"
+    doc = _example_doc(src)
+    written = write_outputs(src, doc.segments, ["json"], document=doc)
+    data = json.loads(written["json"].read_text())
+    assert data["schema_version"] == 1
+    restored = Document.from_json(data)
+    assert restored == doc
+
+
+def test_write_outputs_json_requires_document(tmp_path: Path):
+    src = tmp_path / "x.mp4"
+    with pytest.raises(ValueError, match="json.*requires document"):
+        write_outputs(src, [], ["json"])
+
+
+def test_write_outputs_writes_all_four_formats_together(tmp_path: Path):
+    src = tmp_path / "lecture.mp4"
+    doc = _example_doc(src)
+    written = write_outputs(
+        src, doc.segments, ["txt", "srt", "vtt", "json"], document=doc
+    )
+    assert set(written) == {"txt", "srt", "vtt", "json"}
+    # Files all live next to source with the right extensions.
+    assert written["txt"] == tmp_path / "lecture.txt"
+    assert written["srt"] == tmp_path / "lecture.srt"
+    assert written["vtt"] == tmp_path / "lecture.vtt"
+    assert written["json"] == tmp_path / "lecture.transcribe.json"
+
+
+def test_write_outputs_json_collision_uses_numbered_suffix(tmp_path: Path):
+    """Existing .transcribe.json file → collision → ``_1.transcribe.json``."""
+    src = tmp_path / "lecture.mp4"
+    doc = _example_doc(src)
+
+    # First write: clean target.
+    first = write_outputs(src, doc.segments, ["json"], document=doc)["json"]
+    assert first == tmp_path / "lecture.transcribe.json"
+    assert first.is_file()
+
+    # Second write: collision → _1 suffix (matches resolve_output_path's
+    # existing convention used by txt/srt/vtt).
+    second = write_outputs(src, doc.segments, ["json"], document=doc)["json"]
+    assert second == tmp_path / "lecture_1.transcribe.json"
+    assert second.is_file()
+
+    # Third write: _2 suffix.
+    third = write_outputs(src, doc.segments, ["json"], document=doc)["json"]
+    assert third == tmp_path / "lecture_2.transcribe.json"
+
+
+def test_write_outputs_json_off_by_default_does_not_create_file(tmp_path: Path):
+    """If 'json' isn't in formats, no .transcribe.json is written."""
+    src = tmp_path / "lecture.mp4"
+    doc = _example_doc(src)
+    write_outputs(src, doc.segments, ["txt", "srt"], document=doc)
+    assert not (tmp_path / "lecture.transcribe.json").exists()
+
+
+def test_build_document_then_write_outputs_round_trips(tmp_path: Path):
+    """End-to-end (no transcription): build_document + write_outputs +
+    read back equals the original Document."""
+    src = tmp_path / "lecture.mp4"
+    segments = [
+        Segment(
+            "It works",
+            0.0,
+            2.0,
+            words=(
+                Word("It", 0.0, 1.0, 0.9),
+                Word("works", 1.0, 2.0, 0.85),
+            ),
+        ),
+    ]
+    doc = build_document(
+        media_path=src,
+        duration=2.0,
+        language="en",
+        segments=segments,
+        model_name="tiny",
+    )
+    written = write_outputs(src, segments, ["json"], document=doc)
+    restored = Document.from_json(json.loads(written["json"].read_text()))
+    assert restored == doc

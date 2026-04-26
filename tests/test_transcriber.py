@@ -240,3 +240,52 @@ def test_real_transcription_word_timestamps_can_be_disabled():
         word_timestamps=False,
     )
     assert all(s.words == () for s in segments)
+
+
+@pytest.mark.slow
+def test_end_to_end_writes_loadable_transcribe_json(tmp_path: Path):
+    """Phase 4e: transcribe sample.wav, write json, re-load Document, verify
+    word-level data and metadata survived."""
+    import json
+    import shutil
+
+    from core import exporters
+    from core.document import Document, build_document
+
+    # Copy the fixture into tmp so we write its outputs alongside without
+    # polluting the repo.
+    src = tmp_path / "sample.wav"
+    shutil.copy2(SAMPLE, src)
+
+    tx = transcriber.Transcriber("tiny", device="auto", compute_type="int8")
+    segments, info = tx.transcribe(
+        src,
+        language=None,
+        on_segment=lambda _t: None,
+        on_progress=lambda _p: None,
+    )
+
+    doc = build_document(
+        media_path=src,
+        duration=float(info.duration or 0.0),
+        language=info.language,
+        segments=segments,
+        model_name="tiny",
+    )
+    written = exporters.write_outputs(
+        src, segments, ["txt", "srt", "json"], document=doc
+    )
+
+    json_path = written["json"]
+    assert json_path == tmp_path / "sample.transcribe.json"
+    assert json_path.is_file()
+
+    restored = Document.from_json(json.loads(json_path.read_text()))
+    assert restored.media_path == src
+    assert restored.language == info.language
+    assert restored.duration == pytest.approx(info.duration, abs=0.05)
+    assert restored.model_name == "tiny"
+    assert restored.cuts == []
+    # Word-level data flows through end-to-end:
+    flat_words = [w for s in restored.segments for w in s.words]
+    assert flat_words, "expected word-level timestamps to round-trip through JSON"

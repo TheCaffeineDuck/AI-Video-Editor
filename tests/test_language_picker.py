@@ -167,7 +167,8 @@ def test_output_format_picker_default_selection(tk_root):
     from ui.components.output_formats import OutputFormatPicker
 
     p = OutputFormatPicker(tk_root)
-    assert set(p.formats) == {"txt", "srt"}
+    # Phase 4e: fresh installs include the editable-project artifact.
+    assert set(p.formats) == {"txt", "srt", "json"}
     assert p.has_selection is True
 
 
@@ -187,6 +188,21 @@ def test_output_format_picker_set_formats_fires_change(tk_root):
     p.set_formats(["vtt"])
     assert p.formats == ["vtt"]
     assert seen and seen[-1] == ["vtt"]
+
+
+def test_output_format_picker_json_toggle_round_trip(tk_root):
+    """Phase 4e: turn json off, check it's gone; turn back on, check it's back."""
+    from ui.components.output_formats import OutputFormatPicker
+
+    p = OutputFormatPicker(tk_root)  # default has json on
+    assert "json" in p.formats
+
+    p.set_formats(["txt", "srt"])  # json off
+    assert "json" not in p.formats
+    assert p.formats == ["txt", "srt"]
+
+    p.set_formats(["txt", "srt", "json"])  # json back on
+    assert "json" in p.formats
 
 
 @pytest.mark.parametrize(

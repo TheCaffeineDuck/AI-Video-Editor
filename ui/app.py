@@ -12,6 +12,7 @@ from pathlib import Path
 import customtkinter as ctk
 
 from core import audio, exporters
+from core.document import build_document
 from core.model_loader import download_model
 from core.models import is_downloaded
 from core.settings import Settings, load_settings
@@ -369,7 +370,16 @@ class App:
             )
             output_dir.mkdir(parents=True, exist_ok=True)
             output_base = output_dir / media_path.name
-            files = exporters.write_outputs(output_base, segments, formats)
+            document = build_document(
+                media_path=media_path,
+                duration=float(getattr(info, "duration", 0.0) or 0.0),
+                language=getattr(info, "language", None),
+                segments=segments,
+                model_name=model_name,
+            )
+            files = exporters.write_outputs(
+                output_base, segments, formats, document=document
+            )
             elapsed = time.monotonic() - start
             self.event_queue.put(
                 DoneEvent(segments=segments, info=info, output_files=files, elapsed=elapsed)

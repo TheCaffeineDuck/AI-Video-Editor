@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -15,6 +15,7 @@ from core.document import (
     Segment,
     UnsupportedSchemaError,
     Word,
+    build_document,
 )
 
 
@@ -218,3 +219,87 @@ def test_from_json_unknown_schema_version_raises():
 def test_unsupported_schema_error_is_value_error_subclass():
     """Subclassing ValueError lets generic except blocks catch it cleanly."""
     assert issubclass(UnsupportedSchemaError, ValueError)
+
+
+# ---------------------------------------------------------------------------
+# build_document — Phase 4e
+# ---------------------------------------------------------------------------
+
+
+def test_build_document_populates_all_fields():
+    segments = [
+        Segment(
+            text=" hi",
+            start=0.0,
+            end=1.0,
+            words=(Word(" hi", 0.0, 1.0, 0.92),),
+        ),
+    ]
+    before = datetime.now(UTC)
+    doc = build_document(
+        media_path=Path("/tmp/sample.wav"),
+        duration=6.10,
+        language="en",
+        segments=segments,
+        model_name="tiny",
+    )
+    after = datetime.now(UTC)
+
+    assert doc.media_path == Path("/tmp/sample.wav")
+    assert doc.duration == 6.10
+    assert doc.language == "en"
+    assert list(doc.segments) == segments
+    assert doc.model_name == "tiny"
+    # cuts is always empty for a freshly-transcribed document
+    assert doc.cuts == []
+    # created_at is captured at call time, in UTC
+    assert before <= doc.created_at <= after
+    assert doc.created_at.tzinfo is not None
+    assert doc.created_at.utcoffset().total_seconds() == 0.0
+
+
+def test_build_document_serializes_with_schema_version():
+    doc = build_document(
+        media_path=Path("/tmp/x.wav"),
+        duration=1.0,
+        language=None,
+        segments=[Segment("x", 0.0, 1.0)],
+        model_name="base",
+    )
+    data = doc.to_json()
+    assert data["schema_version"] == 1
+    # And the dict is JSON-clean (datetime is ISO string).
+    blob = json.dumps(data)
+    parsed = json.loads(blob)
+    assert parsed["schema_version"] == 1
+    # Round-trip preserves UTC tz on created_at.
+    restored = Document.from_json(parsed)
+    assert restored.created_at.utcoffset().total_seconds() == 0.0
+
+
+def test_build_document_accepts_iterable_segments():
+    """Passing a generator works — build_document materializes it."""
+    def seg_iter():
+        yield Segment("a", 0.0, 1.0)
+        yield Segment("b", 1.0, 2.0)
+
+    doc = build_document(
+        media_path=Path("/tmp/x.wav"),
+        duration=2.0,
+        language=None,
+        segments=seg_iter(),
+        model_name="tiny",
+    )
+    assert [s.text for s in doc.segments] == ["a", "b"]
+
+
+def test_build_document_default_no_cuts_serialized():
+    """The serialized form has cuts: []."""
+    doc = build_document(
+        media_path=Path("/tmp/x.wav"),
+        duration=1.0,
+        language=None,
+        segments=[Segment("x", 0.0, 1.0)],
+        model_name="tiny",
+    )
+    assert doc.to_json()["cuts"] == []

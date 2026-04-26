@@ -17,8 +17,9 @@ in :mod:`core.editing` produce *new* Documents via
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -193,3 +194,28 @@ class Document:
             created_at=datetime.fromisoformat(data["created_at"]),
             model_name=data.get("model_name", ""),
         )
+
+
+def build_document(
+    *,
+    media_path: Path,
+    duration: float,
+    language: str | None,
+    segments: Iterable[Segment],
+    model_name: str,
+) -> Document:
+    """Assemble a freshly-transcribed :class:`Document` from core types.
+
+    ``cuts`` is always empty for a brand-new transcription. ``created_at``
+    is captured at call time as a UTC ``datetime`` — never local time, so
+    the serialized artifact is portable across machines and time zones.
+    """
+    return Document(
+        media_path=Path(media_path),
+        duration=float(duration),
+        language=language,
+        segments=list(segments),
+        cuts=[],
+        created_at=datetime.now(UTC),
+        model_name=model_name,
+    )

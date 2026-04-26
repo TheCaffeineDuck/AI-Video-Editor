@@ -19,7 +19,9 @@ from core.settings import (
 def test_defaults_match_spec():
     s = Settings()
     assert s.default_model == DEFAULT_MODEL == "base"
-    assert tuple(s.output_formats) == DEFAULT_OUTPUT_FORMATS == ("txt", "srt")
+    # Phase 4e: fresh installs include json (the editable-project artifact)
+    # alongside the original txt+srt defaults.
+    assert tuple(s.output_formats) == DEFAULT_OUTPUT_FORMATS == ("txt", "srt", "json")
     assert s.default_language is None  # auto-detect
     assert s.compute_device == DEFAULT_DEVICE == "auto"
     assert s.output_dir is None
@@ -98,3 +100,36 @@ def test_settings_dir_default_is_app_support_on_darwin(monkeypatch):
     monkeypatch.setattr(settings_mod.platform, "system", lambda: "Darwin")
     expected = Path.home() / "Library" / "Application Support" / "WhisperTranscriber"
     assert settings_mod.settings_dir() == expected
+
+
+# ---------------------------------------------------------------------------
+# Phase 4e: backward-compatible settings load (no auto-migration to add json)
+# ---------------------------------------------------------------------------
+
+
+def test_existing_user_settings_without_json_are_preserved(tmp_path: Path):
+    """A pre-Phase-4e settings.json saying ['txt', 'srt'] must NOT auto-migrate.
+
+    Existing users keep what they had. The new default only applies to
+    fresh installs (no settings.json on disk).
+    """
+    p = tmp_path / "settings.json"
+    p.write_text('{"output_formats": ["txt", "srt"]}')
+    s = load_settings(path=p)
+    assert s.output_formats == ["txt", "srt"]
+
+
+def test_fresh_install_default_includes_json(tmp_path: Path):
+    """No settings.json on disk → fresh-install default has json on."""
+    p = tmp_path / "absent.json"
+    s = load_settings(path=p)
+    assert "json" in s.output_formats
+    assert tuple(s.output_formats) == ("txt", "srt", "json")
+
+
+def test_existing_user_explicit_only_vtt_is_preserved(tmp_path: Path):
+    """Make sure backward-compat is general, not just for the txt+srt case."""
+    p = tmp_path / "settings.json"
+    p.write_text('{"output_formats": ["vtt"]}')
+    s = load_settings(path=p)
+    assert s.output_formats == ["vtt"]

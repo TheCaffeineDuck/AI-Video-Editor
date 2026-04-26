@@ -19,9 +19,12 @@ log = logging.getLogger(__name__)
 APP_DIRNAME = "WhisperTranscriber"
 
 # Defaults — spec §4.2 (output formats default to txt+srt, vtt off) and
-# §4.9 (model "base", auto language, auto device + precision).
+# §4.9 (model "base", auto language, auto device + precision). Phase 4e
+# adds "json" to the fresh-install default so new users get an editable
+# project artifact alongside the subtitle/text exports. Existing users'
+# saved output_formats are preserved verbatim — no auto-migration.
 DEFAULT_MODEL = "base"
-DEFAULT_OUTPUT_FORMATS = ("txt", "srt")
+DEFAULT_OUTPUT_FORMATS = ("txt", "srt", "json")
 DEFAULT_LANGUAGE: str | None = None
 DEFAULT_DEVICE = "auto"
 DEFAULT_COMPUTE_TYPE = "int8"  # spec note: int8 on this CPU-only platform

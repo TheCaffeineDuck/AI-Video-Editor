@@ -10,17 +10,25 @@ millisecond separator in SRT, exactly one blank line between cues, single
 trailing newline. The parser (:func:`parse_srt`) is the opposite — lenient
 on everything real-world SRT files throw at it (BOM, CRLF, period decimals,
 missing index numbers, extra blanks).
+
+Phase 4e adds a fourth output format ``"json"`` — the Document JSON
+artifact (see :class:`core.document.Document`). It's produced from a
+``Document`` rather than raw segments because it needs metadata
+(media_path, duration, language, model_name, created_at, cuts) the
+segments alone can't carry. Callers that select ``"json"`` must pass a
+``document=`` kwarg to :func:`write_outputs`.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from core.document import Segment
+from core.document import Document, Segment
 
 
 class SegmentLike(Protocol):
@@ -110,6 +118,23 @@ _RENDERERS = {
     "vtt": render_vtt,
 }
 
+# Formats that render from raw segments (no Document metadata required).
+SEGMENT_FORMATS: frozenset[str] = frozenset(_RENDERERS)
+# Formats that need a full Document. These are dispatched separately in
+# write_outputs because they carry metadata segments alone can't express.
+DOCUMENT_FORMATS: frozenset[str] = frozenset({"json"})
+ALL_FORMATS: frozenset[str] = SEGMENT_FORMATS | DOCUMENT_FORMATS
+
+# The on-disk extension for each format. ``"json"`` writes
+# ``<stem>.transcribe.json`` so users can spot it next to the .srt/.txt
+# files without confusing it with arbitrary JSON.
+_FORMAT_SUFFIXES: dict[str, str] = {
+    "txt": "txt",
+    "srt": "srt",
+    "vtt": "vtt",
+    "json": "transcribe.json",
+}
+
 
 def resolve_output_path(base: Path, suffix: str) -> Path:
     """Return ``base.with_suffix('.' + suffix)``, appending ``_1``, ``_2``…
@@ -138,22 +163,37 @@ def write_outputs(
     source_path: Path,
     segments: Sequence[SegmentLike],
     formats: Iterable[str],
+    *,
+    document: Document | None = None,
 ) -> dict[str, Path]:
     """Render and write the requested formats next to ``source_path``.
 
     Returns a mapping of format → path written. Unknown formats raise
     ``ValueError``. Existing target files are not overwritten — a numbered
-    suffix is appended instead.
+    suffix is appended via :func:`resolve_output_path`.
+
+    ``"json"`` writes the Document JSON artifact and requires
+    ``document=`` to be passed; missing that raises ``ValueError`` with
+    a clear message rather than silently dropping the format.
     """
     formats = list(formats)
-    unknown = [f for f in formats if f not in _RENDERERS]
+    unknown = [f for f in formats if f not in ALL_FORMATS]
     if unknown:
         raise ValueError(f"unsupported output formats: {unknown}")
+    if "json" in formats and document is None:
+        raise ValueError("'json' output format requires document= to be passed")
     written: dict[str, Path] = {}
     materialized = list(segments)
     for fmt in formats:
-        path = resolve_output_path(source_path, fmt)
-        path.write_text(_RENDERERS[fmt](materialized), encoding="utf-8")
+        path = resolve_output_path(source_path, _FORMAT_SUFFIXES[fmt])
+        if fmt in SEGMENT_FORMATS:
+            path.write_text(_RENDERERS[fmt](materialized), encoding="utf-8")
+        else:  # DOCUMENT_FORMATS — currently just "json"
+            assert document is not None  # guarded above
+            path.write_text(
+                json.dumps(document.to_json(), indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
         written[fmt] = path
     return written
 
