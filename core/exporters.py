@@ -1,17 +1,26 @@
-"""Write transcription segments to .txt, .srt, .vtt files.
+"""Write transcription segments to .txt, .srt, .vtt files, and parse SRT back.
 
 A "segment" is any object exposing ``start: float`` (seconds), ``end: float``
 (seconds), and ``text: str``. ``faster_whisper.transcribe.Segment`` matches
 this shape; we accept any duck-typed equivalent so tests can pass simple
 namedtuples.
+
+Renderers stay strict — they always emit canonical form: LF endings, comma
+millisecond separator in SRT, exactly one blank line between cues, single
+trailing newline. The parser (:func:`parse_srt`) is the opposite — lenient
+on everything real-world SRT files throw at it (BOM, CRLF, period decimals,
+missing index numbers, extra blanks).
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+
+from core.document import Segment
 
 
 class SegmentLike(Protocol):
@@ -147,3 +156,66 @@ def write_outputs(
         path.write_text(_RENDERERS[fmt](materialized), encoding="utf-8")
         written[fmt] = path
     return written
+
+
+# ---------------------------------------------------------------------------
+# parse_srt — lenient on input, strict on output (renderer is the canonical form)
+# ---------------------------------------------------------------------------
+
+
+# Captures both SRT (comma) and VTT-style (period) decimals; tolerates extra
+# whitespace anywhere on the line, including before/after the arrow.
+_TIMESTAMP_RE = re.compile(
+    r"(\d{1,2}):(\d{2}):(\d{2})[.,](\d{3})\s*-->\s*"
+    r"(\d{1,2}):(\d{2}):(\d{2})[.,](\d{3})"
+)
+_BLANK_LINE_RE = re.compile(r"\n[ \t]*\n")
+
+
+def _ts_to_seconds(h: str, m: str, s: str, ms: str) -> float:
+    return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000.0
+
+
+def parse_srt(text: str) -> list[Segment]:
+    """Parse an SRT (or VTT-flavored SRT) into :class:`Segment` objects.
+
+    Tolerates: UTF-8 BOM, CRLF/CR/mixed line endings, missing index numbers,
+    period decimals (``.500`` instead of ``,500``), whitespace around
+    timestamps, extra blank lines between cues, and a missing trailing
+    newline. Cues without a parseable timestamp line are dropped silently —
+    we treat junk as junk rather than aborting on an ugly file.
+
+    Returned segments have no word-level data (``words=()``); SRT carries
+    only segment-level timing.
+    """
+    if text.startswith("﻿"):
+        text = text[1:]
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    segments: list[Segment] = []
+    for raw_block in _BLANK_LINE_RE.split(text):
+        block = raw_block.strip("\n")
+        if not block.strip():
+            continue
+        lines = block.split("\n")
+
+        ts_match = None
+        ts_line_idx = -1
+        for idx, line in enumerate(lines):
+            m = _TIMESTAMP_RE.search(line)
+            if m is not None:
+                ts_match = m
+                ts_line_idx = idx
+                break
+        if ts_match is None:
+            continue
+
+        h1, m1, s1, ms1, h2, m2, s2, ms2 = ts_match.groups()
+        start = _ts_to_seconds(h1, m1, s1, ms1)
+        end = _ts_to_seconds(h2, m2, s2, ms2)
+
+        cue_lines = lines[ts_line_idx + 1 :]
+        cue_text = "\n".join(cue_lines).strip()
+        segments.append(Segment(text=cue_text, start=start, end=end, words=()))
+
+    return segments
