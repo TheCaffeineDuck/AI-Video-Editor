@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from core.document import Segment, Word
 from core.exporters import (
     SimpleSegment,
     format_srt_timestamp,
@@ -208,3 +209,40 @@ def test_write_outputs_preserves_existing_files_via_suffix(tmp_path: Path):
     assert (tmp_path / "lecture.txt").read_text() == "PRIOR"
     assert written["txt"] == tmp_path / "lecture_1.txt"
     assert written["txt"].read_text() == "new\n"
+
+
+# ---------------------------------------------------------------------------
+# Phase 4a: Segment dataclass (with words) renders identically to SimpleSegment
+# ---------------------------------------------------------------------------
+
+
+def _doc_seg(start: float, end: float, text: str, words: tuple[Word, ...] = ()) -> Segment:
+    return Segment(text=text, start=start, end=end, words=words)
+
+
+def test_renderers_accept_core_document_segment():
+    """The new Segment dataclass must render the same as SimpleSegment."""
+    words = (
+        Word(text="Hello", start=0.0, end=0.5, probability=0.9),
+        Word(text="world", start=0.6, end=1.4, probability=0.8),
+    )
+    new = [
+        _doc_seg(0.0, 1.5, "Hello", words=words),
+        _doc_seg(1.5, 3.0, "world"),
+    ]
+    old = [seg(0.0, 1.5, "Hello"), seg(1.5, 3.0, "world")]
+    assert render_txt(new) == render_txt(old)
+    assert render_srt(new) == render_srt(old)
+    assert render_vtt(new) == render_vtt(old)
+
+
+def test_write_outputs_accepts_core_document_segment(tmp_path: Path):
+    src = tmp_path / "lecture.mp4"
+    segments = [
+        _doc_seg(0.0, 1.0, "Hello", words=(Word("Hello", 0.0, 1.0, 0.9),)),
+        _doc_seg(1.0, 2.0, "world"),
+    ]
+    written = write_outputs(src, segments, ["txt", "srt", "vtt"])
+    assert written["txt"].read_text() == "Hello world\n"
+    assert "00:00:00,000 --> 00:00:01,000" in written["srt"].read_text()
+    assert written["vtt"].read_text().startswith("WEBVTT\n")

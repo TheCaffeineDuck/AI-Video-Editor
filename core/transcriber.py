@@ -7,6 +7,8 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
+from core.document import Segment, Word
+
 # We don't import faster_whisper at module top-level so that the rest of
 # core/ stays cheap to import in tests that don't actually load a model.
 
@@ -16,6 +18,31 @@ DEFAULT_COMPUTE_TYPE = "int8"
 
 SegmentCallback = Callable[[str], None]
 ProgressCallback = Callable[[float], None]
+
+
+def _to_core_segment(seg: Any) -> Segment:
+    """Convert a faster-whisper Segment to our :class:`core.document.Segment`.
+
+    faster-whisper's Word has fields ``start, end, word, probability``; ours
+    uses ``text`` for the surface form. ``seg.words`` is ``None`` when
+    ``word_timestamps=False`` was requested — that case becomes an empty tuple.
+    """
+    raw_words = getattr(seg, "words", None) or ()
+    words = tuple(
+        Word(
+            text=w.word,
+            start=float(w.start),
+            end=float(w.end),
+            probability=(float(w.probability) if w.probability is not None else None),
+        )
+        for w in raw_words
+    )
+    return Segment(
+        text=seg.text,
+        start=float(seg.start),
+        end=float(seg.end),
+        words=words,
+    )
 
 
 class Transcriber:
@@ -60,13 +87,15 @@ class Transcriber:
         *,
         beam_size: int = 5,
         vad_filter: bool = True,
-    ) -> tuple[list[Any], Any]:
+        word_timestamps: bool = True,
+    ) -> tuple[list[Segment], Any]:
         """Run a transcription job and stream callbacks for each segment.
 
-        Returns a ``(segments, info)`` tuple. ``segments`` is a list of the
-        underlying faster_whisper Segment objects (whatever was consumed
-        before cancellation, if any). ``info`` is the TranscriptionInfo
-        returned by the model.
+        Returns a ``(segments, info)`` tuple. ``segments`` is a list of
+        :class:`core.document.Segment` objects (our own boundary type — we
+        don't leak faster-whisper's classes outside this module). ``info``
+        is the TranscriptionInfo returned by the model and is treated as
+        opaque metadata by callers.
         """
         self.reset_cancel()
         segments_iter, info = self.model.transcribe(
@@ -74,11 +103,11 @@ class Transcriber:
             language=language,
             beam_size=beam_size,
             vad_filter=vad_filter,
-            word_timestamps=False,
+            word_timestamps=word_timestamps,
         )
         total = float(getattr(info, "duration", 0.0) or 0.0)
-        collected = self._consume_segments(segments_iter, total, on_segment, on_progress)
-        return collected, info
+        raw = self._consume_segments(segments_iter, total, on_segment, on_progress)
+        return [_to_core_segment(s) for s in raw], info
 
     def _consume_segments(
         self,

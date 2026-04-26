@@ -6,12 +6,13 @@ The real-model integration test is marked slow because it downloads the
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 
 from core import transcriber
+from core.document import Segment, Word
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SAMPLE = REPO_ROOT / "tests" / "fixtures" / "sample.wav"
@@ -125,6 +126,74 @@ def test_reset_cancel_clears_flag():
 
 
 # ---------------------------------------------------------------------------
+# Boundary conversion: faster-whisper → core.document.Segment
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _FWWord:
+    """Shape-compatible with faster_whisper.transcribe.Word (start/end/word/probability)."""
+
+    start: float
+    end: float
+    word: str
+    probability: float
+
+
+@dataclass
+class _FWSegment:
+    """Shape-compatible with faster_whisper.transcribe.Segment for our purposes."""
+
+    start: float
+    end: float
+    text: str
+    words: list[_FWWord] | None = field(default=None)
+
+
+def test_to_core_segment_with_words():
+    raw = _FWSegment(
+        start=0.0,
+        end=1.5,
+        text=" Hello world",
+        words=[
+            _FWWord(start=0.0, end=0.5, word=" Hello", probability=0.95),
+            _FWWord(start=0.6, end=1.4, word=" world", probability=0.88),
+        ],
+    )
+    converted = transcriber._to_core_segment(raw)
+    assert isinstance(converted, Segment)
+    assert converted.text == " Hello world"
+    assert converted.start == 0.0
+    assert converted.end == 1.5
+    assert len(converted.words) == 2
+    assert isinstance(converted.words, tuple)
+    first = converted.words[0]
+    assert isinstance(first, Word)
+    assert first.text == " Hello"
+    assert first.start == 0.0
+    assert first.end == 0.5
+    assert first.probability == 0.95
+
+
+def test_to_core_segment_without_words():
+    """word_timestamps=False yields seg.words == None — must convert to ()."""
+    raw = _FWSegment(start=0.0, end=2.0, text="anything", words=None)
+    converted = transcriber._to_core_segment(raw)
+    assert converted.words == ()
+
+
+def test_to_core_segment_handles_none_probability():
+    raw = _FWSegment(
+        start=0.0,
+        end=1.0,
+        text="hi",
+        words=[_FWWord(start=0.0, end=0.5, word="hi", probability=None)],  # type: ignore[arg-type]
+    )
+    converted = transcriber._to_core_segment(raw)
+    assert converted.words[0].probability is None
+
+
+# ---------------------------------------------------------------------------
 # Integration test — downloads tiny model on first run.
 # ---------------------------------------------------------------------------
 
@@ -149,3 +218,25 @@ def test_real_transcription_on_sample_fixture():
     assert info.language, "expected language detection to set info.language"
     # Final progress callback should reach the end of the file.
     assert progresses[-1] == pytest.approx(1.0, abs=0.05)
+    # Phase 4a: returned segments are core.document.Segment, with words by default.
+    assert all(isinstance(s, Segment) for s in segments)
+    flat_words = [w for s in segments for w in s.words]
+    assert flat_words, "expected non-empty word-level timestamps with default word_timestamps=True"
+    assert all(isinstance(w, Word) for w in flat_words)
+    # Word boundaries should be monotonic and lie within their parent segment.
+    for s in segments:
+        for w in s.words:
+            assert s.start - 0.05 <= w.start <= w.end <= s.end + 0.05
+
+
+@pytest.mark.slow
+def test_real_transcription_word_timestamps_can_be_disabled():
+    tx = transcriber.Transcriber("tiny", device="auto", compute_type="int8")
+    segments, _ = tx.transcribe(
+        SAMPLE,
+        language=None,
+        on_segment=lambda _t: None,
+        on_progress=lambda _p: None,
+        word_timestamps=False,
+    )
+    assert all(s.words == () for s in segments)
