@@ -13,3 +13,6 @@ htmlcov/
 .coverage
 .coverage.*
 *.egg-info/
+
+# Regenerated per-developer by tests/conftest.py::synthetic_video
+tests/fixtures/synthetic.mp4
