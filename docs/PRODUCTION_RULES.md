@@ -1,0 +1,221 @@
+# Production Rules — Transcribe
+
+This document codifies non-obvious decisions about how this project cuts, renders, caches, and persists. It is loaded into every Claude Code session via `[CLAUDE.md](http://CLAUDE.md)` so that future changes don't silently violate constraints chosen for reasons.
+
+Each rule has:
+
+- **Rule** — the normative statement
+- **Why** — rationale (delete this and the rule looks arbitrary)
+- **Status** — `PASS` (implemented), `GAP` (scheduled for Phase 4f), or `FUTURE` (later phase, captured here so the architecture leaves room)
+- **Where** — file or function reference
+
+If a rule looks wrong while you're modifying code that touches it, change the rule first (in this doc, in a commit) before changing the code.
+
+---
+
+## Cutting and rendering
+
+### Per-segment extract → concat, never single-pass filtergraph
+
+**Rule.** When rendering a cut version of a video, extract each kept range as an independent intermediate, then concatenate. Never build a single ffmpeg filtergraph that does the whole edit in one pass.
+
+**Why.** A 100-segment filtergraph using `aselect`/`vselect`/`concat` chains is a debugging nightmare: a failure at segment 47 surfaces as a generic ffmpeg error with no clue which segment caused it. Per-segment intermediates mean each cut is isolated — a single bad timestamp affects exactly one file, not the whole render. This is also how smartcut works: per keep-range, copying when frame boundaries align, re-encoding only at the boundaries.
+
+**Status.** `PASS` — `core/[render.py](http://render.py):render_cut` delegates to smartcut, which is per-segment by construction.
+
+**Where.** `core/[render.py](http://render.py)`
+
+### Never cut inside a word
+
+**Rule.** Cut boundaries always sit on word boundaries — never mid-word.
+
+**Why.** Cutting mid-word produces an audible glitch that no fade can rescue, and there's no use case where it's the right thing to do. A user who selects part of a word in the editor means "cut the whole word" — not "cut a fraction of the audio."
+
+**Status.** `PASS` — enforced at construction time in `CutWordRange`. Constructing one whose boundaries don't match a word's start/end raises `ValueError`.
+
+**Where.** `core/[editing.py](http://editing.py):CutWordRange`
+
+### Pad direction expands keep-ranges
+
+**Rule.** The `pad` parameter to `render_cut` widens kept ranges, which equivalently shrinks cut ranges. A `pad=0.10` cut leaves 100ms of the cut content on each side intact.
+
+**Why.** Whisper's word boundaries are slightly conservative — it tends to call a word ended a few tens of ms before the actual acoustic decay. If pad shrunk keep-ranges, every cut would clip the trailing consonants of words on either side. Expanding kept ranges guarantees the surrounding words are intact, at the cost of leaving 100ms of cut content. For removing fillers and silences that's the right trade. The reverse semantic ("widen the cut to be safe") clips word audio and is wrong.
+
+**Status.** `PASS` — implemented and tested in Phase 4d-1.
+
+**Where.** `core/[render.py](http://render.py):render_cut`
+
+### Asymmetric pad: lead and trail are independent parameters
+
+**Rule.** `render_cut` exposes `pad_lead` (before each kept range) and `pad_trail` (after) as separate parameters. Both default to 0.10. Per-project overrides allowed.
+
+**Why.** Leading and trailing time around a cut serve different purposes. Leading is "breath before the next word" — too much and pacing drags. Trailing is "decay of the previous word + breath" — too little and consonants clip, too much and the dead air signals "this was edited." Symmetric `pad=0.10` is a fine starting point but the right defaults for emotional weight are typically asymmetric (less lead, more trail). Surfacing them separately is what makes that tunable.
+
+**Status.** `GAP` — current implementation uses a single symmetric `pad`. Phase 4f-1 will split into `pad_lead` / `pad_trail`, both defaulting to 0.10 (preserves existing test behavior).
+
+**Where.** `core/[render.py](http://render.py):render_cut` (current); modified in Phase 4f-1.
+
+### 30ms audio fades at every segment boundary
+
+**Rule.** Every cut boundary in the rendered output applies a 30ms fade on the audio track — fade-out before the cut, fade-in after. Configurable via `audio_fade_ms`, default 30. Values above 50ms are discouraged (viewers hear the dissolve).
+
+**Why.** Hard cuts at arbitrary samples produce a discontinuity in the waveform — a click or pop, depending on amplitude at the cut point. 30ms is below the threshold of conscious perception of "fade" but above the threshold needed to avoid the discontinuity. Smartcut's frame-accurate cutting solves the visual side; the audio still needs this even on per-frame-aligned cuts because audio samples don't align to frame boundaries.
+
+**Status.** `GAP` — currently no fade is applied. Smartcut may already handle this via its audio export options; investigate before reimplementing. If it doesn't, post-process the concatenated output with ffmpeg's `afade` at the joins. Phase 4f-1.
+
+**Where.** `core/[render.py](http://render.py):render_cut` (modified in Phase 4f-1).
+
+### Subtitles render last in the filter chain
+
+**Rule.** When subtitle burn-in lands (Phase 6), the subtitle filter is applied to the concatenated output, not to each segment intermediate. Filter chain order: per-segment cut → concat → audio fades at joins → subtitle burn-in → final encode.
+
+**Why.** Burning subtitles per-segment produces stutters at boundaries (the subtitle filter's internal state resets at each segment). Burning after concat means subtitle timestamps are output-timeline timestamps, not source-timeline (see "Output-timeline SRT" below). Baking the order into `core/[render.py](http://render.py)`'s structure now means Phase 6 doesn't need to refactor.
+
+**Status.** `FUTURE` (Phase 6). Captured now so `core/[render.py](http://render.py)` is structured to accommodate it. No code yet.
+
+**Where.** `core/[render.py](http://render.py)` structure; Phase 6 burn-in TBD.
+
+### Output-timeline SRT (deferred)
+
+**Rule.** When subtitle burn-in lands, the SRT used for burn-in carries output-timeline timestamps — reflecting position in the rendered output, not the source. The source-timeline SRT (the one we ship today) remains the editing artifact.
+
+**Why.** Burning a source-timeline SRT into a cut output produces subtitles at the wrong times because cuts have changed the timeline. Two SRTs serve two purposes: source-timeline for editing/reference, output-timeline for burn-in.
+
+**Status.** `FUTURE` (Phase 6). Do not write the second renderer until Phase 6 burn-in actually has a caller — code without a caller rots.
+
+**Where.** TBD.
+
+### Smartcut's `emit()` is non-monotonic; wrap it
+
+**Rule.** Smartcut's progress callbacks emit non-uniform increments and can briefly exceed the announced total. Any progress signal piped to the UI must be clamped to `[0, 1]` and made monotonic by an adapter, never trusted raw.
+
+**Why.** A progress bar that flickers from 0.95 → 1.02 → 0.99 → 1.0 looks broken and undermines user trust. Fix it in one place: wrap the sloppy upstream signal into a clean downstream contract at the boundary. The pattern (adapter at the boundary) generalizes — apply it whenever an upstream library emits messy signals.
+
+**Status.** `PASS` — `_ProgressAdapter` in `core/[render.py](http://render.py)` clamps and monotonizes. A `finalize()` call ensures the bar reaches 1.0 even if smartcut stops emitting before completion.
+
+**Where.** `core/[render.py](http://render.py):_ProgressAdapter`
+
+---
+
+## Transcripts and caching
+
+### Document JSON is the cache; do not add a separate cache file
+
+**Rule.** When a media file is transcribed, the resulting `Document` JSON is the cache. On a subsequent transcribe request for the same file, if a Document JSON exists with a matching `source_hash`, load it instead of re-running inference. Do not add a separate cache database, cache directory, or cache key store.
+
+**Why.** Whisper inference is non-deterministic: re-transcribing the same file produces slightly different word timestamps each run. Variance is small but non-zero — enough to break edit reproducibility across sessions. If a user opens a project on Tuesday whose timestamps were set on Monday, every cut they made Monday sits in a slightly different place — sometimes mid-word, sometimes off by a beat. Caching the Document means timestamps are immutable for the life of the project, which is what an editor needs. The Document JSON is already on disk as the editable artifact; doubling it as the cache eliminates a class of synchronization bugs.
+
+**Status.** `GAP` — currently re-transcribes every time. Phase 4f-2 adds the cache lookup.
+
+**Where.** `core/[cache.py](http://cache.py)` (new, Phase 4f-2); transcription flow in `ui/[app.py](http://app.py)` (modified, Phase 4f-2).
+
+### Cache key: sha256 of path + mtime + size
+
+**Rule.** The cache key for a media file is `sha256(absolute_path_bytes || mtime_int || size_int).hexdigest()`. Stored as `source_hash` on the Document.
+
+**Why.** A full content hash is too slow for large media files. Path+mtime+size is the standard "is this the same file" heuristic — wrong only if a user replaces the file in-place with the exact same byte count and mtime, an edge case where requiring an explicit re-transcribe is acceptable. Including the absolute path means renaming or moving the file invalidates the cache, which is correct: a moved file is a different project context.
+
+**Status.** `GAP` — Phase 4f-2.
+
+**Where.** `core/[cache.py](http://cache.py):cache_key` (new).
+
+---
+
+## Project layout
+
+### Output isolation: `<source_dir>/edit/` for new projects
+
+**Rule.** New projects write all derived artifacts (Document JSON, eventual master SRT, smartcut intermediates, preview frames) into a `<source_dir>/edit/` subdirectory rather than alongside the source media. Existing sidecar-file projects (Document JSON next to the source) continue to work — backward-compat fallback, not migrated.
+
+**Why.** A user with five source videos in a folder ends up with twenty-plus derived files clogging the same folder if outputs sit alongside sources. Isolating outputs in a subdirectory keeps the source folder readable and makes "delete all my edits, keep the source" trivial. Backward compat for existing layouts follows the same principle as the Phase 4e settings non-migration: don't surprise users with a working setup.
+
+Subdirectory layout:
+
+- `project.json` — the Document JSON (canonical artifact)
+- `clips/` — smartcut intermediates per cut operation
+- `verify/` — preview frames generated during editing
+- `master.srt` — burn-in SRT (Phase 6, when burn-in lands)
+
+Do **not** add `transcripts/<n>.json` — Document JSON is the cache.
+
+**Status.** `FUTURE` (Phase 5+) — current code writes sidecar-style.
+
+**Where.** `ui/[app.py](http://app.py)` output path resolution; to be extended in Phase 5+.
+
+---
+
+## Schema and versioning
+
+### Schema version is mandatory; unknown versions raise
+
+**Rule.** Every persisted Document JSON has a `schema_version` integer field. `Document.from_json` raises `UnsupportedSchemaError` (a `ValueError` subclass) on missing, null, or unrecognized version. Never silently coerce.
+
+**Why.** A future contributor who modifies the Document shape without bumping the version creates a bug class where old files load with wrong assumptions and fail downstream confusingly ("why is `cuts` a string?"). A loud failure at parse time forces the discipline of versioning every breaking change. Migrations are written as needed; silent coercion is never the answer.
+
+**Status.** `PASS` — `core/[document.py](http://document.py):Document.from_json` raises on missing/null/unknown.
+
+**Where.** `core/[document.py](http://document.py):Document.from_json`, `core/[document.py](http://document.py):UnsupportedSchemaError`
+
+### Migrations are written, not skipped
+
+**Rule.** When the Document shape changes in a breaking way, bump `schema_version` and write an explicit migration in `from_json` that converts the old shape to the new one. The migration runs automatically on load.
+
+**Why.** Users with existing projects shouldn't be told "delete and re-transcribe" because we changed the schema. Writing the migration is the cost of breaking the schema; it's paid by the engineer making the change, not the user.
+
+**Status.** `FUTURE` — Phase 4f-3 introduces `schema_version: 2` (multi-clip-ready Document) and the v1→v2 migration. Templates the policy.
+
+**Where.** `core/[document.py](http://document.py):Document.from_json` (Phase 4f-3).
+
+---
+
+## Settings and migration
+
+### Settings non-migration: existing users keep their settings
+
+**Rule.** When a default value in `Settings` changes, existing users on disk keep whatever they had. Only fresh installs (no `settings.json` on disk) get the new default.
+
+**Why.** A user who explicitly saved `output_formats = ["txt", "srt"]` shouldn't have JSON silently appear in their output folder on the next app launch because we changed the default. The right behavior: respect their choice, communicate the new default in UI copy where it matters ("JSON is required for the upcoming editor view"), let them opt in. The Phase 4e default-format change ("json" added to defaults) is the template.
+
+**Status.** `PASS` — Phase 4e `output_formats` default change followed this rule.
+
+**Where.** `core/[settings.py](http://settings.py)` defaults; `ui/components/output_[formats.py](http://formats.py)` for the nudge copy.
+
+---
+
+## Rejected rules
+
+These rules appear in upstream production-rules documents (notably `browser-use/video-use`'s, which informed but did not dictate ours). Each was considered and rejected. Recording the rationale here prevents re-litigating later.
+
+### REJECTED — WhisperX as a hard requirement
+
+**Why rejected.** faster-whisper's native word timestamps + our 100ms pad are good enough for editing-grade cuts. Phase 4a probe data confirmed cross-attention-derived word boundaries are clean enough. WhisperX adds a 600MB model, a second inference pass, and a pyannote-audio dependency for diarization we don't need yet. Cost (install size, runtime, packaging complexity) exceeds benefit (sub-frame timestamp precision) for our use case.
+
+**Reconsider when.** Sub-frame precision becomes a user-visible problem (which it isn't yet — Phase 4d-1 verified pad semantics handle the slack), or diarization becomes a feature we want.
+
+### REJECTED — CrisperWhisper as the default ASR model
+
+**Why rejected.** Research-grade model with a non-PyPI install path (`pip install git+https://github.com/nyrahealth/transformers.git@crisper_whisper`). Installing a custom transformers fork breaks dependency hygiene for everyone using the app to make first-pass cuts on a long-form podcast. CrisperWhisper's main strength — disfluency/filler detection — is genuinely useful, but for a specific Verbatim mode, not as the default.
+
+**Reconsider when.** Phase 6+ Verbatim mode toggle. Off by default, opt-in for users who specifically want filler-by-filler transcripts.
+
+### REJECTED — Separate `edl.json` from `project.json`
+
+**Why rejected.** Splitting the edit decision list into a second file (the upstream doc's pattern) creates synchronization bugs the moment any tool updates one without the other. Our unified `Document` JSON holds segments, words, cuts, and (in v2) ranges in one place — one file, one truth. Cost of consolidation is negligible; benefit is no class of "the EDL says cut at 12.3s but the project says 12.5s, who wins" bugs.
+
+### REJECTED — `takes_[packed.md](http://packed.md)` export format
+
+**Why rejected.** A markdown export of "all the takes packed together for an LLM to pick the best one" is useful when an LLM is doing the editing. Our workflow is GUI-driven: a human picks takes by clicking. The export adds maintenance cost without serving the workflow we built.
+
+**Reconsider when.** An LLM-driven editing mode exists. Phase 6+, if at all.
+
+---
+
+## Phase 4f gap summary
+
+Rules above marked `GAP` are scheduled for Phase 4f:
+
+- **4f-1** — `pad_lead` / `pad_trail` split + 30ms `audio_fade_ms` parameter (both in `render_cut`)
+- **4f-2** — Document JSON cache via `source_hash`
+- **4f-3** — `schema_version: 2` migration (multi-clip-ready Document)
+
+The audit prompt run after this doc is committed will verify these are the real gaps and surface anything else.
