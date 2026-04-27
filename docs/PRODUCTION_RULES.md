@@ -192,9 +192,29 @@ Do **not** add `transcripts/<n>.json` — Document JSON is the cache.
 
 **Why.** Users with existing projects shouldn't be told "delete and re-transcribe" because we changed the schema. Writing the migration is the cost of breaking the schema; it's paid by the engineer making the change, not the user.
 
-**Status.** `FUTURE` — Phase 4f-3 introduces `schema_version: 2` (multi-clip-ready Document) and the v1→v2 migration. Templates the policy.
+**Status.** `PASS` — Phase 4f-3's v1→v2 migration is the canonical example. v1 sidecars (the flat `media_path` / `duration` / `cuts` shape) load on demand via `_migrate_v1_to_v2`, which derives v2 ranges by subtracting each cut from a full-source keep-range and attaches each cut's reason to the surviving range immediately preceding (or, for cuts at timestamp 0, immediately following) the cut.
 
-**Where.** `core/[document.py](http://document.py):Document.from_json` (Phase 4f-3).
+**Where.** `core/[document.py](http://document.py):Document.from_json` and `core/[document.py](http://document.py):_migrate_v1_to_v2`.
+
+### Migration on read, write-through on next save
+
+**Rule.** Schema migration happens in `Document.from_json` when the file is loaded. The migrated Document is returned in memory. The on-disk file is **not** rewritten as a side effect of loading. The next `to_json` / save will emit the new schema; until then the file stays as-is.
+
+**Why.** On-load migration in `from_json` keeps the load path simple — there's no separate migration tool, no command users have to run, no question about whether their files have been "upgraded." Write-through on save means the migration is one-way and clean once a file is touched. The opposite policy — aggressive auto-migrate-on-load that rewrites the file immediately — would surprise users with version-controlled project files (a `git diff` showing a bunch of schema-change churn the user didn't intend), and would also break the "open the same file from two builds" workflow since older builds would suddenly be unable to read newer files. Lazy write-through is the user-friendly default.
+
+**Status.** `PASS` — Phase 4f-3.
+
+**Where.** `core/[document.py](http://document.py):_migrate_v1_to_v2` (loads but doesn't write); the next `to_json` call elsewhere in the app emits v2.
+
+### Range model: timeline is the ordered keep-list, cuts are derived
+
+**Rule.** The v2 Document's canonical timeline data is `ranges: list[Range]` — what to KEEP, in playback order. Cuts are not stored; they're whatever's complementary to the ranges over a source's duration. Edit commands operate on ranges (subtract or union an interval) and emit a new Documents with a new ranges list.
+
+**Why.** v1's cuts model was operationally convenient for filler-removal — "I want to remove these spans from the original" — but doesn't scale to multi-source compositing. Storing keep-ranges as the canonical data lets us add sources, reorder ranges, and have multiple non-contiguous spans of the same source on the timeline — none of which a flat cuts list could express. It also collapses two abstractions (source media + edit decisions) into one (a timeline of `(source_id, start, end)` tuples) that Phase 5's editor view can work with directly. The cost — every v1 file needs a one-time migration, every edit command needs to be re-thought as range arithmetic — was paid in 4f-3.
+
+**Status.** `PASS` — Phase 4f-3.
+
+**Where.** `core/[document.py](http://document.py):Range`, `core/[document.py](http://document.py):Document.ranges`, `core/[timeline.py](http://timeline.py)`.
 
 ---
 
@@ -242,10 +262,9 @@ These rules appear in upstream production-rules documents (notably `browser-use/
 
 ## Phase 4f gap summary
 
-Rules above marked `GAP` are scheduled for Phase 4f:
+All Phase 4f gaps are closed as of `phase 4f-3 (3/3)`:
 
-- **4f-1** — `pad_lead` / `pad_trail` split + 30ms `audio_fade_ms` parameter (both in `render_cut`)
-- **4f-2** — Document JSON cache via `source_hash`
-- **4f-3** — `schema_version: 2` migration (multi-clip-ready Document)
-
-The audit prompt run after this doc is committed will verify these are the real gaps and surface anything else.
+- **4f-0** — UTC default-factory fix; three new PASS rules (empty-cuts byte-for-byte copy; audio is passthru except at fade boundaries; cut timestamps quantize to 1ms).
+- **4f-1** — `pad_lead` / `pad_trail` split + 30ms `audio_fade_ms` parameter + render-time word-boundary snap. Asymmetric pad and audio-fade rules flipped GAP→PASS.
+- **4f-2** — Document JSON cache via `source_hash`. "Document JSON is the cache" and "Cache key" rules flipped GAP→PASS.
+- **4f-3** — `schema_version: 2` migration (multi-clip-ready Document). "Migrations are written, not skipped" flipped FUTURE→PASS; two new PASS rules (migration-on-read-write-through-on-save; range-model-is-canonical).
