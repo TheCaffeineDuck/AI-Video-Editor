@@ -106,29 +106,54 @@ def _make_document(media_path: Path) -> Document:
 # ---------------------------------------------------------------------------
 
 
-def test_collect_words_skips_words_outside_ranges(qtbot):
+def test_collect_words_returns_every_word_with_kept_flag(qtbot):
+    """5c: cut words still appear in the transcript (Decision 2 — strikethrough).
+
+    ``collect_words`` returns all words; ``ref.kept`` distinguishes
+    kept (rendered normally) from cut (rendered with strikethrough).
+    """
     doc = _make_document(SAMPLE_WAV)
     refs = collect_words(doc)
     rendered = [r.word.text for r in refs]
-    # seg0 fully kept; from seg1 only words overlapping (2.0, 2.5);
-    # seg2 fully kept.
-    assert rendered[:2] == ["hello", " world"]
-    assert " test" in rendered or " a" in rendered  # at minimum the overlap survives
-    assert rendered[-1] == "goodbye"
-    # "this" (1.5-1.9) is outside any range and must be excluded.
-    assert "this" not in rendered
+    # Every word in every segment is present, in document order.
+    assert rendered == ["hello", " world", "this", " is", " a", " test", "goodbye"]
+    kept_lookup = {r.word.text: r.kept for r in refs}
+    # seg0 fully kept; seg2 fully kept.
+    assert kept_lookup["hello"] is True
+    assert kept_lookup[" world"] is True
+    assert kept_lookup["goodbye"] is True
+    # seg1: only words overlapping the (2.0, 2.5) range survive as kept.
+    assert kept_lookup["this"] is False  # 1.5-1.9, no overlap
+    assert kept_lookup[" is"] is True    # 1.9-2.1, overlaps
+    assert kept_lookup[" a"] is True     # 2.1-2.3, overlaps
+    assert kept_lookup[" test"] is True  # 2.3-3.0, overlaps at 2.3-2.5
 
 
-def test_transcript_view_renders_kept_words(qtbot):
+def test_transcript_view_renders_every_word_and_strikes_cut_ones(qtbot):
+
+    from ui_qt.components.transcript_view import WORD_INDEX_PROPERTY
+
     view = TranscriptView()
     qtbot.addWidget(view)
     doc = _make_document(SAMPLE_WAV)
     view.set_document_model(doc)
     text = view.toPlainText()
+    # Both kept and cut words appear in the rendered text.
     assert "hello" in text
-    assert " world" in text
+    assert "this" in text  # 5c: cut words still rendered (strikethrough)
     assert "goodbye" in text
-    assert "this" not in text  # outside ranges
+    # The cut word's character format carries strikethrough.
+    cut_word_idx = next(i for i, r in enumerate(view.words) if r.word.text == "this")
+    cursor = view._cursor_for_word(cut_word_idx)
+    assert cursor is not None
+    fmt = cursor.charFormat()
+    assert fmt.fontStrikeOut() is True
+    # And the kept word's format does not.
+    kept_word_idx = next(i for i, r in enumerate(view.words) if r.word.text == "hello")
+    cursor = view._cursor_for_word(kept_word_idx)
+    assert cursor.charFormat().fontStrikeOut() is False
+    # Each word is indexed by WORD_INDEX_PROPERTY.
+    assert int(cursor.charFormat().property(WORD_INDEX_PROPERTY)) == kept_word_idx
 
 
 def test_waveform_placeholder_min_height(qtbot):

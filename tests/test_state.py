@@ -154,6 +154,47 @@ def test_listener_fires_on_state_change(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# transition_to — public counterpart to the internal _go (Phase 5c)
+# ---------------------------------------------------------------------------
+
+
+def test_transition_to_fires_listeners(tmp_path):
+    sm = AppStateMachine()
+    sm.load_file(media(tmp_path))
+    sm.start_transcribing()
+    seen: list[AppState] = []
+    sm.on_change(seen.append)
+    sm.transition_to(AppState.IDLE)
+    assert sm.state == AppState.IDLE
+    assert seen == [AppState.IDLE]
+
+
+def test_transition_to_validates_legal(tmp_path):
+    sm = AppStateMachine()
+    sm.load_file(media(tmp_path))
+    sm.apply_event(ErrorEvent(message="boom"))
+    assert sm.state == AppState.ERROR
+    # ERROR → FILE_LOADED is legal.
+    sm.transition_to(AppState.FILE_LOADED)
+    assert sm.state == AppState.FILE_LOADED
+
+
+def test_transition_to_rejects_illegal(tmp_path):
+    sm = AppStateMachine()
+    # IDLE → COMPLETE is not a legal transition.
+    with pytest.raises(InvalidTransitionError):
+        sm.transition_to(AppState.COMPLETE)
+
+
+def test_transition_to_same_state_is_noop():
+    sm = AppStateMachine()
+    seen: list[AppState] = []
+    sm.on_change(seen.append)
+    sm.transition_to(AppState.IDLE)
+    assert seen == []  # no emit when already in target state
+
+
+# ---------------------------------------------------------------------------
 # apply_event behaviors
 # ---------------------------------------------------------------------------
 

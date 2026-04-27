@@ -117,6 +117,19 @@ class AppStateMachine:
         for cb in self._listeners:
             cb(self.state)
 
+    def transition_to(self, new_state: AppState) -> None:
+        """Force a validated transition into ``new_state`` and notify listeners.
+
+        Public counterpart to the internal call sites (``load_file``,
+        ``start_transcribing``, …). Use this from UI code instead of
+        ``state.state = X; state._emit()``: the assignment-then-emit
+        pattern bypasses the legal-transitions check, and re-using
+        ``transition_to`` keeps the state-machine the single owner of
+        validation. Phase 5c added this so both UIs could come back from
+        ERROR cleanly without poking at the internals.
+        """
+        self._go(new_state)
+
     def _go(self, new_state: AppState) -> None:
         if new_state == self.state:
             return

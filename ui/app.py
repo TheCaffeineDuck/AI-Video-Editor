@@ -254,8 +254,7 @@ class App:
             # Retry: clear error, drop back to FILE_LOADED if a media_path exists.
             self.state.error_message = None
             if self.state.media_path:
-                self.state.state = AppState.FILE_LOADED
-                self.state._emit()
+                self.state.transition_to(AppState.FILE_LOADED)
         if self.state.state != AppState.FILE_LOADED:
             return
         if not self.output_picker.has_selection:

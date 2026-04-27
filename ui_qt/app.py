@@ -128,6 +128,7 @@ class MainWindow(QMainWindow):
         self._transcribe_pane = pane
         self.setCentralWidget(pane)
         self._render_for_state(self.state.state)
+        self.setWindowTitle(WINDOW_TITLE)
 
     def show_editor(self, document: Document) -> None:
         """Swap to a fresh EditorPane bound to ``document``."""
@@ -135,8 +136,11 @@ class MainWindow(QMainWindow):
         editor = EditorPane(document, settings=self.settings)
         editor.back_to_transcribe.connect(self._handle_back_from_editor)
         editor.layout_changed.connect(self._apply_settings)
+        editor.dirty_changed.connect(self._refresh_window_title)
+        editor.document_saved.connect(self._handle_document_saved)
         self._editor_pane = editor
         self.setCentralWidget(editor)
+        self._refresh_window_title(False)
 
     def _dispose_transcribe_pane(self) -> None:
         if self._transcribe_pane is None:
@@ -212,8 +216,7 @@ class MainWindow(QMainWindow):
         if self.state.state == AppState.ERROR:
             self.state.error_message = None
             if self.state.media_path:
-                self.state.state = AppState.FILE_LOADED
-                self.state._emit()  # noqa: SLF001
+                self.state.transition_to(AppState.FILE_LOADED)
         if self.state.state != AppState.FILE_LOADED:
             return
         self.state.start_transcribing()
@@ -248,6 +251,35 @@ class MainWindow(QMainWindow):
     def _handle_back_from_editor(self) -> None:
         self.state.reset()
         self.show_transcribe()
+
+    def _refresh_window_title(self, dirty: bool) -> None:
+        """Title bar tracks the editor's dirty state.
+
+        Format: ``"● filename.ext — Whisper Transcriber"`` when dirty,
+        ``"filename.ext — Whisper Transcriber"`` when clean. The
+        leading dot is the textual modified indicator; macOS also
+        paints a dot in the close button via ``setWindowModified`` for
+        windows where Qt knows the title contains ``[*]`` — we use the
+        explicit prefix instead because it's deterministic across
+        backends.
+        """
+        if self._editor_pane is None:
+            self.setWindowTitle(WINDOW_TITLE)
+            return
+        doc = self._editor_pane.document
+        if doc.sources:
+            primary = next(iter(doc.sources.values()))
+            name = primary.path.name or "(unnamed)"
+        else:
+            name = "(no source)"
+        marker = "● " if dirty else ""
+        self.setWindowTitle(f"{marker}{name} — {WINDOW_TITLE}")
+        self.setWindowModified(dirty)
+
+    def _handle_document_saved(self, _path: Path) -> None:
+        # mark_saved already fired dirty_changed → title updated.
+        # Hook reserved for future use (recent files, status flash).
+        pass
 
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self, current=self.settings)

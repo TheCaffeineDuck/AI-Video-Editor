@@ -2,35 +2,37 @@
 
 **Date:** 2026-04-27
 **Branch:** main
-**Commit:** Phase 5b — editor pane skeleton + qmediaplayer wiring
-**Status:** All 429 tests passing (385 prior + 27 5a Qt + 17 new editor). Lint clean for changed files.
+**Commit:** Phase 5c — transcript interactivity, cuts, undo, save
+**Status:** All 458 tests passing (385 prior + 27 5a Qt + 17 5b editor + 25 5c interactivity + 4 5c transition_to). Lint clean for changed files.
 
 ---
 
-## 1. Phase 5b in two paragraphs
+## 1. Phase 5c in two paragraphs
 
-Phase 5b stands up the editor view that takes over after a transcription
-completes or a `.transcribe.json` project is opened. The new
-`EditorPane` is a nested `QSplitter` (outer flips orientation with the
-layout toggle; inner is always vertical so the waveform sits directly
-under the transcript regardless of layout). It renders a video preview
-backed by `QMediaPlayer` + `QAudioOutput` with play/pause and a seek
-slider, walks the v2 Document timeline (`doc.ranges`) to render the
-read-only transcript, and reserves a 64-px-tall waveform strip for 5d.
-The transcript widget is `QTextEdit` (read-only) with per-word custom
-character formats — picked because per-word click and strikethrough in
-5c want pixel-position → cursor lookup, which is exactly what
-`cursorForPosition` exposes.
+5c makes the transcript editable. Words are click targets that seek the
+video; drag-select picks a range; Cmd-X strikes through it (or restores
+it if the selection is already entirely struck); Cmd-Z / Cmd-Shift-Z
+drive an undo/redo stack; Cmd-S writes `Document.to_json` back to the
+cache path the transcribe flow originally used; the title bar tracks
+dirty state with a `●` prefix and a macOS-native modified dot.
+Playhead position from `QMediaPlayer.positionChanged` highlights the
+currently-playing word in bold. Cut words stay in the transcript
+(Decision 2 — strikethrough is reversible, never destructive); the
+``set_document_model`` walk now emits every word and toggles the
+strikethrough format from a per-word `kept` flag.
 
-The window now swaps central widgets between `TranscribePane` (the 5a
-flow, extracted into its own widget) and `EditorPane` via
-`setCentralWidget` + `deleteLater`. Routes into the editor: a
-DoneEvent carrying a Document (worker fills it on every code path), or
-the new "Open project (.transcribe.json)…" button on the transcribe
-pane. A 10-second `QMediaPlayer` codec smoke script
-(`scripts/qt_codec_smoke.py`) ran across the actual `~/Desktop/`
-corpus — 10/10 real videos pass, so 5c does not need to ship a
-`python-vlc` fallback (Decision 9 stays "QMediaPlayer first" for now).
+The plumbing landed in three places: a new
+`ui_qt/document_session.py` that wraps the existing
+`core.editing.CommandStack` with id-based dirty tracking
+(undo-back-to-pristine genuinely clears dirty); a substantial rewrite
+of `ui_qt/components/transcript_view.py` for word-grain mouse
+handling, selection background, and playhead bold; and a now-fatter
+`EditorPane` that owns the QActions, wires save through
+`workers.transcription.candidate_cache_path`, and forwards
+`dirty_changed` up to the title-bar refresh on `MainWindow`.
+`AppStateMachine` gained the public `transition_to(state)` method the
+5b report flagged as missing — both UIs now use it instead of the old
+`state._emit()` reach-in.
 
 ---
 
@@ -39,54 +41,44 @@ corpus — 10/10 real videos pass, so 5c does not need to ship a
 ```
 .
 ├── core/
-│   ├── __init__.py
 │   ├── audio.py
 │   ├── cache.py
 │   ├── document.py
-│   ├── editing.py
+│   ├── editing.py            # consumed by 5c — no changes here
 │   ├── exporters.py
 │   ├── languages.py
 │   ├── model_loader.py
 │   ├── models.py
 │   ├── render.py
-│   ├── settings.py            # 5b: layout-fallback warning logged
+│   ├── settings.py
 │   ├── timeline.py
 │   └── transcriber.py
 ├── workers/
-│   ├── __init__.py
-│   ├── events.py              # 5b: DoneEvent gains `document` field
-│   └── transcription.py       # 5b: both code paths fill DoneEvent.document
-├── ui/                        # legacy customtkinter UI (still runnable)
-│   ├── app.py
+│   ├── events.py
+│   └── transcription.py
+├── ui/
+│   ├── app.py                # 5c: uses transition_to
 │   ├── components/ ...
-│   ├── state.py               # 5b: TranscriptionResult gains `document` field
+│   ├── state.py              # 5c: public transition_to method
 │   └── theme.py
-├── ui_qt/                     # PySide6 UI
-│   ├── __init__.py
-│   ├── app.py                 # MainWindow swaps central widget; show_editor / show_transcribe
-│   ├── editor_pane.py         # NEW (5b) — nested QSplitter, layout toggle
-│   ├── transcribe_pane.py     # NEW (5b) — extracted from MainWindow._build_central
-│   ├── waveform.py            # NEW (5b) — WaveformPlaceholder strip
+├── ui_qt/
+│   ├── app.py                # 5c: title-bar dirty marker; transition_to
+│   ├── document_session.py   # NEW (5c) — Document + CommandStack + dirty
+│   ├── editor_pane.py        # 5c: QActions, save, session wiring
+│   ├── transcribe_pane.py
+│   ├── waveform.py
 │   ├── style.py
 │   └── components/
-│       ├── drop_zone.py
-│       ├── language_picker.py
-│       ├── model_picker.py
-│       ├── output_formats.py
-│       ├── progress_card.py
-│       ├── result_card.py
-│       ├── settings_panel.py
-│       ├── transcript_view.py # NEW (5b) — read-only QTextEdit walker
-│       └── video_viewport.py  # NEW (5b) — QMediaPlayer + QVideoWidget + slider
-├── docs/
-│   └── PRODUCTION_RULES.md
+│       ├── transcript_view.py  # 5c: cuts, selection, playhead, mouse
+│       ├── video_viewport.py
+│       └── ...
+├── docs/PRODUCTION_RULES.md
 ├── scripts/
 │   ├── cli_test.py
-│   ├── qt_codec_smoke.py      # NEW (5b) — corpus-wide QMediaPlayer probe
+│   ├── qt_codec_smoke.py
 │   └── word_probe.py
 ├── tests/
-│   ├── conftest.py            # 5b: tiny_mp4 session fixture (2 s, 64x64, h264+aac)
-│   ├── fixtures/ ...
+│   ├── conftest.py
 │   ├── test_audio.py
 │   ├── test_bootstrap.py
 │   ├── test_cache.py
@@ -99,20 +91,17 @@ corpus — 10/10 real videos pass, so 5c does not need to ship a
 │   ├── test_render.py
 │   ├── test_settings.py
 │   ├── test_settings_panel.py
-│   ├── test_state.py
+│   ├── test_state.py                # 5c: transition_to tests
 │   ├── test_timeline.py
 │   ├── test_transcriber.py
 │   ├── test_ui.py
-│   ├── test_ui_qt.py          # 5b: tests adapted to TranscribePane refactor
-│   └── test_ui_qt_editor.py   # NEW (5b) — 17 editor + media-player tests
-├── resources/
-├── main.py                    # tkinter entry (unchanged)
-├── main_qt.py                 # Qt entry (unchanged)
-├── pyproject.toml
-├── requirements.txt
-├── requirements-dev.txt
+│   ├── test_ui_qt.py
+│   ├── test_ui_qt_editor.py         # 5c: rewritten render-all-words tests
+│   └── test_ui_qt_interactivity.py  # NEW (5c) — 25 interactivity tests
+├── main.py / main_qt.py
+├── pyproject.toml / requirements*.txt
 ├── CLAUDE.md
-├── STATE.md                   # this file
+├── STATE.md                         # this file
 └── whisper_transcriber_spec.md
 ```
 
@@ -120,30 +109,24 @@ corpus — 10/10 real videos pass, so 5c does not need to ship a
 
 ## 3. Dependencies
 
-No new dependencies in 5b. PySide6 6.11.0 (installed in 5a) ships
-`QtMultimedia` and `QtMultimediaWidgets` already; both come from the
-same `PySide6_Essentials`/`PySide6_Addons` pair.
+Unchanged from 5b. PySide6 6.11 ships QtMultimedia + QtMultimediaWidgets
+in `PySide6_Essentials` / `PySide6_Addons`; no python-vlc.
 
 ---
 
-## 4. Code inventory (deltas from 5a)
+## 4. Code inventory (deltas from 5b)
 
-| File | Lines | What's new in 5b |
+| File | Lines | What's new in 5c |
 |------|------:|------------------|
-| `ui_qt/app.py` | 268 | reduced from 350 (5a); transcribe-flow extracted; `show_editor` / `show_transcribe` / `_dispose_*` |
-| `ui_qt/transcribe_pane.py` | 246 | NEW — extracted from `MainWindow._build_central`; signals out, render-for-state in |
-| `ui_qt/editor_pane.py` | 195 | NEW — nested QSplitter, `_handle_layout_toggle`, `release()` |
-| `ui_qt/waveform.py` | 27 | NEW — placeholder strip; `paintEvent` fills `palette().mid()` |
-| `ui_qt/components/video_viewport.py` | 184 | NEW — QMediaPlayer + QAudioOutput + QVideoWidget + slider; explicit `release()` |
-| `ui_qt/components/transcript_view.py` | 155 | NEW — `collect_words(doc)` + `set_document_model(doc)`; per-word `WORD_INDEX_PROPERTY` for 5c |
-| `core/settings.py` | 134 | layout-fallback warning logged via `core.settings` logger |
-| `workers/events.py` | 52 | `DoneEvent.document: Any \| None = None` |
-| `workers/transcription.py` | 226 | both DoneEvent emissions carry `document=` |
-| `ui/state.py` | 226 | `TranscriptionResult.document: Any \| None = None`; `apply_event` propagates it |
-| `scripts/qt_codec_smoke.py` | 122 | NEW — recursive walk + per-file `QEventLoop` + 10 s timeout |
-| `tests/conftest.py` | 152 | `tiny_mp4` session fixture (~2 s, 64x64) |
-| `tests/test_ui_qt.py` | 332 | tests adapted to `transcribe_pane.transcribe_btn` etc.; document=None synthetics |
-| `tests/test_ui_qt_editor.py` | 282 | NEW — 17 tests; covers splitter topology, layout toggle, swap mechanics, real-mp4 load |
+| `ui_qt/components/transcript_view.py` | 358 | render every word with per-word `kept` flag; strikethrough on cut; word-grain mouse handlers (press/move/release); selection background; playhead-follow bold + ensureCursorVisible auto-scroll; binary-search word lookup |
+| `ui_qt/editor_pane.py` | 326 | `DocumentSession` integration; QAction wiring for Cut/Delete/Restore/Undo/Redo/Save with `ApplicationShortcut` context; save via `candidate_cache_path`; toolbar Save/Undo/Redo buttons; `dirty_changed` and `document_saved` signals |
+| `ui_qt/document_session.py` | 134 | NEW — wraps the existing `core.editing.CommandStack` with id-based dirty tracking; `apply` returns False on no-op |
+| `ui_qt/app.py` | 305 | title-bar dirty marker via `_refresh_window_title`; `transition_to` instead of `state._emit`; restored `setWindowModified` |
+| `ui/app.py` | 392 | `transition_to(AppState.FILE_LOADED)` instead of `state.state = X; state._emit()` |
+| `ui/state.py` | 232 | NEW public `transition_to(new_state)` method; `_go` kept as private alias; docstring on the new method explains why direct assignment is wrong |
+| `tests/test_ui_qt_interactivity.py` | 414 | NEW — 25 tests across DocumentSession, transcript interactivity, EditorPane shortcuts, save round-trip, title-bar lifecycle, transition_to |
+| `tests/test_ui_qt_editor.py` | 285 | rewritten transcript tests for "all words rendered, cut struck"; existing splitter/swap tests untouched |
+| `tests/test_state.py` | 311 | added 4 `transition_to` tests (legal, illegal, listener fires, same-state no-op) |
 
 ### Test count
 
@@ -151,391 +134,405 @@ same `PySide6_Essentials`/`PySide6_Addons` pair.
 |-------|------:|-----:|-----:|
 | End of 4f-3 | 385 | 374 | 11 |
 | End of 5a   | 413 | 402 | 11 |
-| **End of 5b** | **429** | **418** | **11** |
+| End of 5b   | 429 | 418 | 11 |
+| **End of 5c** | **458** | **447** | **11** |
 
-`pytest -q` runs all 429 green in ~10 s on this M4. The same five
-`RuntimeWarning: Failed to disconnect ... timeout()` lines from 5a
-persist — pytest-qt internal, not project code.
+`pytest -q` runs all 458 green in ~10 s on this M4. The five
+`RuntimeWarning: Failed to disconnect ... timeout()` lines persist —
+pytest-qt internal, not project code.
 
 ---
 
-## 5. Git history (post-5b)
+## 5. Git history (post-5c)
 
 ```
-phase 5b: editor pane skeleton + qmediaplayer wiring   (this commit)
+phase 5c: transcript interactivity, cuts, undo, save   (this commit)
+phase 5b: editor pane skeleton + qmediaplayer wiring
 phase 5a: qt scaffold + port transcribe flow
 phase 4f-3 (3/3) — final: docs + STATE.md
-phase 4f-3 (2/3): schema v2 multi-clip-ready document with v1 migration
-phase 4f-3 (1/3): timeline helpers + Range/MediaSource types
 …
 ```
 
 ---
 
-## 6. Public APIs added or reshaped in Phase 5b
+## 6. Public APIs added or reshaped in Phase 5c
 
 ```python
-# ui_qt.editor_pane
-class EditorPane(QWidget):
-    back_to_transcribe: Signal()
-    layout_changed: Signal(Settings)
-    def __init__(self, document: Document, *, settings: Settings, parent=None) -> None: ...
+# ui.state — new public transition method (carries the old _go semantics)
+class AppStateMachine:
+    def transition_to(self, new_state: AppState) -> None:
+        """Validated transition + listener notification.
+
+        Replaces the old `state.state = X; state._emit()` pattern in
+        both UIs. Same legal-transitions check as the internal call
+        sites use; raises InvalidTransitionError on bad transitions.
+        """
+
+# ui_qt.document_session — NEW
+class DocumentSession(QObject):
+    document_changed: Signal(Document)
+    dirty_changed: Signal(bool)
+
+    def __init__(self, document: Document, *, max_undo_depth: int = 100, parent=None) -> None: ...
     @property document: Document
-    @property settings: Settings
-    @property video_viewport: VideoViewport
-    @property transcript_view: TranscriptView
-    @property outer_splitter: QSplitter
-    @property inner_splitter: QSplitter
-    def release(self) -> None: ...   # stops the embedded media player
+    @property stack: CommandStack
+    @property can_undo: bool
+    @property can_redo: bool
+    @property is_dirty: bool
 
-# ui_qt.transcribe_pane
-class TranscribePane(QWidget):
-    file_selected: Signal(Path)
-    invalid_file: Signal(str)
-    open_project_requested: Signal()
-    transcribe_requested: Signal(Path, str, object, list)
-    cancel_requested: Signal()
-    new_transcription_requested: Signal()
-    def render_for_state(state: AppState) -> None: ...
-    def show_progress_label(label: str) -> None: ...
-    def reset_progress() -> None: ...
-    def update_settings(settings: Settings) -> None: ...
+    def apply(self, command: EditCommand) -> bool: ...    # False = no-op (ranges unchanged)
+    def undo(self) -> bool: ...                            # False = nothing to undo
+    def redo(self) -> bool: ...                            # False = nothing to redo
+    def mark_saved(self) -> None: ...
 
-# ui_qt.app — MainWindow
-class MainWindow(QMainWindow):
-    @property transcribe_pane: TranscribePane | None
-    @property editor_pane: EditorPane | None
-    def show_transcribe(self) -> None: ...   # disposes editor_pane, builds new TranscribePane
-    def show_editor(self, document: Document) -> None: ...  # disposes transcribe_pane, builds new EditorPane
+# ui_qt.editor_pane — additions
+class EditorPane(QWidget):
+    dirty_changed: Signal(bool)        # NEW — forwarded from DocumentSession
+    document_saved: Signal(Path)       # NEW — fires after a successful Cmd-S
 
-# ui_qt.components.video_viewport
-class VideoViewport(QWidget):
-    position_changed: Signal(int)            # ms from QMediaPlayer.positionChanged
-    @property player: QMediaPlayer
-    def set_source(self, path: Path | None) -> None: ...
-    def toggle_play(self) -> None: ...
-    def seek_ms(self, position_ms: int) -> None: ...
-    def release(self) -> None: ...           # stop + clear source + setVideoOutput(None)
+    @property session: DocumentSession  # NEW
 
 # ui_qt.components.transcript_view
-WORD_INDEX_PROPERTY: int = 0x100001          # QTextCharFormat custom property id
+class TranscriptView(QTextEdit):
+    word_clicked: Signal(int)              # NEW — bare-click word index
+    selection_changed: Signal(object)      # NEW — (start, end) tuple or None
+    cut_requested: Signal(int, int)        # NEW — keyboard cut
+    seek_requested: Signal(int)            # NEW — seek to ms
+
+    @property selection: tuple[int, int] | None
+    @property playhead_word: int           # -1 = none
+
+    def set_playhead_position(self, position_ms: int) -> None: ...
+    def request_cut_for_selection(self) -> bool: ...   # False = no live selection
+    def clear_selection(self) -> None: ...
 
 @dataclass(frozen=True)
 class WordRef:
-    seg_idx: int; word_idx: int; word: Word
+    seg_idx: int
+    word_idx: int
+    word: Word
+    kept: bool = True   # NEW (5c) — drives strikethrough render
 
 def collect_words(document: Document) -> list[WordRef]: ...
-
-class TranscriptView(QTextEdit):
-    @property words: list[WordRef]
-    def set_document_model(self, document: Document) -> None: ...
-
-# ui_qt.waveform
-class WaveformPlaceholder(QWidget): ...      # setMinimumHeight(64); paintEvent fills palette().mid()
-
-# workers.events
-@dataclass class DoneEvent(WorkerEvent):
-    segments: list[Any]
-    info: Any
-    output_files: dict[str, Path]
-    elapsed: float
-    document: Any | None = None              # NEW — the Document the editor renders
-
-# ui.state
-@dataclass class TranscriptionResult:
-    segments: list[Any]
-    info: Any
-    output_files: dict[str, Path]
-    elapsed: float
-    document: Any | None = None              # NEW — propagated by apply_event(DoneEvent)
+    # 5c: now returns EVERY word in the document, with `kept` flagged
+    # per the Document's ranges. 5b returned only kept words.
 ```
 
 ---
 
 ## 7. What's solid
 
-1. **The editor pane drops in cleanly off a real DoneEvent.** The
-   worker now ships the Document on every code path (cache hit + fresh
-   inference); `apply_event` propagates it onto `TranscriptionResult`;
-   `MainWindow.pump_once` calls `show_editor(doc)` when the state hits
-   `COMPLETE` with a document attached. No lossy re-build.
-2. **Layout toggle is one orientation flip, not a rebuild.** Clicking
-   the toggle calls `outer_splitter.setOrientation(...)` + saves
-   settings. The video keeps playing; the transcript scroll position
-   doesn't jump because the widget tree doesn't unmount.
-3. **Splitter topology survives both layouts.** Outer flips between
-   Vertical and Horizontal; inner stays Vertical. The waveform always
-   sits directly under the transcript — Decision 5's user-visible
-   contract.
-4. **State swap really destroys the previous pane.** `show_editor`
-   disposes the transcribe pane via `setParent(None)` + `deleteLater`,
-   and `show_transcribe` does the symmetric editor disposal calling
-   `release()` first to stop the player. Tests assert the previous
-   pane's C++ side is destroyed (`shiboken6.isValid` returns False
-   after spinning the event loop).
-5. **Codec coverage is broad.** 10/10 real videos in the user's
-   corpus (mp4 H.264/AAC across the LocationBird series + a 23 GB
-   podcast file) load to `LoadedMedia` within the 10 s timeout. The
-   only "FAIL" lines from a wider Desktop scan are scipy's
-   intentionally-malformed test WAVs (big-endian, truncated chunks) —
-   not real media.
-6. **DoneEvent backward compat preserved.** Existing tests that
-   construct `DoneEvent(...)` without `document=` still work — the
-   field defaults to `None` and the editor swap simply doesn't fire.
-   Previous-`COMPLETE`-via-result-card flow stays available as a
-   fallback when no document is on the result.
+1. **Cut → strikethrough → undo round-trips end-to-end.** Manually
+   verified: a selection on words 1–2 cut produces ranges
+   `[Range(0.0, 0.5)]` plus strikethrough on the displayed words 1
+   and 2 plus a `●` in the title bar. Undo restores ranges to
+   `[Range(0.0, 1.5)]` plus strikethrough drops plus the title bar
+   loses the dot.
+2. **Dirty tracking handles undo-back-to-pristine.** Id-based saved
+   pointer means `id(document)` of the current Document equals the
+   one we marked saved iff the user has truly returned to the saved
+   state. The fork-after-save case (where the saved redo entry gets
+   discarded) is handled correctly — dirty stays True because the
+   saved Document is unreachable. Six dedicated tests cover the
+   matrix.
+3. **Strict overlap fixes the boundary-word bug.** A cut at exactly
+   `[1.0, 2.0]` correctly marks the word `(1.0, 1.5)` as cut. The
+   loose `>=` overlap from 5b would have called it kept (because
+   `1.0 == 1.0`), masking the cut. Strict `>` / `<` is the production
+   semantic now and the rewritten 5b test asserts it.
+4. **AppStateMachine has a public transition method.** Both UIs use
+   `state.transition_to(AppState.X)` — no more `state._emit()` reach-in.
+   `_go` survives as a private alias for the internal call sites.
+   Customtkinter regression-tested (the existing `test_ui.py` Retry
+   path goes through this code).
+5. **QAction shortcuts use `ApplicationShortcut` context.** The 5c
+   spec calls this out specifically — naive `QShortcut` on the pane
+   fails when a child widget has focus (which the TranscriptView
+   always does in the editor). Application context fires regardless.
+   Reparenting these QActions to a menu in 5f is a no-op: same
+   QAction instance, just a different parent.
+6. **Save round-trips through `candidate_cache_path`.** No new save
+   path was invented — `Document.to_json` writes back to the same
+   `<source_stem>.transcribe.json` the transcribe flow used. Reload
+   via `Document.from_json` reproduces the in-memory ranges (test:
+   `test_save_writes_to_candidate_cache_path_and_round_trips`).
+7. **`apply` is conservative on no-ops.** A cut whose interval is
+   already cut (subtract_interval returns equal ranges) is detected
+   via `after.ranges == before.ranges` and dropped on the floor —
+   doesn't push to the undo stack, doesn't flip dirty. Tested.
 
 ---
 
-## 8. What's fragile or worth knowing (5b additions)
+## 8. What's fragile or worth knowing (5c additions)
 
-1. **Transcript widget choice — `QTextEdit` (read-only)** with per-word
-   `QTextCharFormat` custom properties (id `0x100001`). Per-word click
-   targets in 5c land via `cursorForPosition` → cursor's `charFormat()`
-   → `property(WORD_INDEX_PROPERTY)`. Drag selection is just two
-   cursor lookups (press + release). Strikethrough is a per-word
-   `QTextCharFormat.setFontStrikeOut(True)` re-applied via merge-format
-   on the cut-range cursor. The choice extends cleanly; flagged here so
-   future-us doesn't rip it out.
-2. **`MainWindow._handle_open_project` calls `QFileDialog`** which is
-   modal and process-blocking; tests bypass it by calling
-   `show_editor(doc)` directly. If 5f wires this to `Cmd-O`, the menu
-   action should reuse `_handle_open_project`.
-3. **`VideoViewport.release()` must be called before drop.** macOS-
-   specific quirk: leaving a `QMediaPlayer` wired to a `QVideoWidget`
-   when the parent QWidget is `deleteLater`'d leaves a `CALayer` alive
-   briefly, which can paint a phantom black rect on the next central
-   widget. The disposal helper handles this; don't drop the editor
-   without going through `MainWindow._dispose_editor_pane`.
-4. **`QSlider.valueChanged` triggers a seek even when the value comes
-   from `positionChanged`.** Guarded by `_suppress_value_seek`. If
-   future code adds another path that programmatically sets the
-   slider value, set the flag around the assignment to avoid an
-   infinite ping-pong.
-5. **EditorPane mutates the Settings object in-place.**
-   `_handle_layout_toggle` does `self._settings.layout = new_layout`
-   and saves. Per the existing `Settings` dataclass design (plain
-   mutable dataclass), this is fine; the `layout_changed` signal hands
-   the same reference back to MainWindow's `_apply_settings`. Anything
-   holding a separate Settings reference would miss the change — but
-   nothing does today.
-6. **`AppStateMachine.apply_event` reads `event.document` via
-   `getattr(event, "document", None)`** to keep the door open for
-   custom DoneEvent subclasses in tests. Removing the `getattr` would
-   tighten the contract; left it loose intentionally.
-7. **`WHISPER_SETTINGS_DIR` is honored throughout 5b.** The layout-
-   toggle test sets the env var and checks the resulting
-   `settings.json` on disk. If a future test creates a Settings via
-   `Settings(layout="video_left")` and then triggers a save without
-   setting the env var, it'll write to the user's actual app-support
-   directory — flagged because the editor pane saves via
-   `save_settings(self._settings)` (no path arg) by design.
-
----
-
-## 9. Definition-of-done checklist (5b)
-
-- [x] All prior tests pass (413 from 5a + 17 new editor tests + 1
-      regression-fixed Qt test → 429 total).
-- [x] `python main_qt.py` launches a window that swaps to the editor
-      pane on transcription completion.
-- [x] `python main.py` (tkinter) still launches and works unchanged.
-- [x] `scripts/qt_codec_smoke.py` ran against the real corpus; 10/10
-      videos pass.
-- [x] Layout toggle persists across restart (verified via test with
-      `WHISPER_SETTINGS_DIR` round-trip).
-- [x] Ruff clean for changed files.
-- [x] `STATE.md` overwritten in place reflecting post-5b state.
-- [x] Single commit: `phase 5b: editor pane skeleton + qmediaplayer wiring`.
+1. **Selection-clear policy: selection survives playback.** The spec
+   asked us to pick — I went with "playback does not clear the
+   selection." Rationale: a selection is a deliberate user act, and
+   the playhead ticks at 30 Hz; clearing on every word-boundary
+   crossing would make selections vanish within seconds. Selection
+   clears only on (a) click without drag and (b) successful
+   cut/restore (because the re-render re-keys word indices anyway).
+2. **`apply()`'s no-op detection is content-equality on ranges.**
+   `after.ranges == before.ranges` is a list-of-`Range`-dataclasses
+   compare. If a future command mutates `Document` in some other way
+   (e.g., editing word text), the no-op check would miss the change
+   and silently suppress the push. We don't have any such command
+   today; flagged for 5d/5e.
+3. **`request_cut_for_selection`'s "anchor as 1-word selection"
+   subtlety.** The pane's `_handle_cut` calls into the transcript;
+   the transcript has a `_selection_anchor` set on press but doesn't
+   call `_set_selection` until the first move. So a press →
+   immediately-Cmd-X (no drag, no release) won't have an active
+   selection. In practice the user has to release first. Documented;
+   not blocking.
+4. **`setTextInteractionFlags(NoTextInteraction)` on the transcript.**
+   Required to suppress Qt's default character-selection highlight
+   under our word-grain selection. Side effect: keyboard caret
+   navigation (arrow keys) no longer works inside the transcript.
+   That's intentional for a read-only view; flagged in case a future
+   accessibility pass wants to re-enable arrow nav.
+5. **Title-bar marker uses both `●` prefix and `setWindowModified`.**
+   The prefix is the deterministic textual indicator; `setWindowModified`
+   plus a `[*]` placeholder in the title would also drive macOS's
+   close-button dot. We do call `setWindowModified(dirty)` so the
+   close-button dot fires, but we don't put `[*]` in the title since
+   our explicit `●` already conveys it. If 5f wants to swap to the
+   pure `[*]` mechanism, drop the prefix and add `[*]` to the title
+   format.
+6. **The transcript re-renders fully on every Document mutation.**
+   `set_document_model` clears + re-inserts every word. At 5–10k
+   words this is fast (~10 ms in eyeball testing). If transcript
+   sizes grow to 30k+ or commands fire in fast succession (5d's
+   waveform-driven cuts?), an incremental "re-apply formats only"
+   update would be nicer. Not blocking for 5c.
+7. **`subtract_interval` and `union_interval` semantics drive the
+   render.** A cut command always produces ranges with strict gaps,
+   which is why the strict-overlap word-keep test works. If
+   `core.timeline` ever changes its boundary semantics (e.g., to
+   half-open intervals), the transcript render needs to flip to
+   match.
 
 ---
 
-## 10. What Phase 5c inherits
+## 9. Definition-of-done checklist (5c)
 
-- A read-only `TranscriptView` with per-word `QTextCharFormat` properties
-  ready to map mouse positions to word indices via `cursorForPosition`.
-- An `EditCommand` stack already in `core/editing.py` (`AddCut`,
-  `RestoreRange`, `CutWordRange`) that 5c can drive on each click /
-  drag end.
-- A `Document`-on-the-result invariant: the editor always knows which
-  Document it's editing; commands can `replace()` it and re-render via
-  `transcript.set_document_model(doc)`.
-- A `position_changed(int ms)` signal from `VideoViewport` that
-  transcript-view can use to highlight the current word (5c's optional
-  follow-the-playhead UX).
-- A `WaveformPlaceholder` slot 5d will replace without touching
-  `EditorPane`'s topology.
+- [x] All 429 prior tests pass plus 25 new interactivity tests + 4
+      transition_to tests = 458 total.
+- [x] `python main_qt.py`: load a transcribed doc → click a word and
+      the video seeks → drag-select and Cmd-X strikes through →
+      Cmd-Z restores → Cmd-S persists → reload reads the cuts back.
+      Smoke-tested end-to-end via a console script.
+- [x] `python main.py` (tkinter) still launches; transition_to
+      change kept it identical at the test level (the old Retry
+      transition continues to work).
+- [x] Title bar reflects dirty state correctly across edit / save /
+      undo-to-pristine.
+- [x] `AppStateMachine` has a public `transition_to`; both UIs use
+      it; no `_emit` calls outside the class.
+- [x] Ruff clean for changed files (pre-existing F541 and I001 in
+      `tests/test_render.py` / `test_document.py` / `test_editing.py`
+      remain — not 5c's debt).
+- [x] STATE.md overwritten in place.
+- [x] Single commit: `phase 5c: transcript interactivity, cuts, undo, save`.
 
 ---
 
-## 11. Phase 5b final report (per spec request)
+## 10. What Phase 5d inherits
 
-**1. Codec smoke output.**
+- A `TranscriptView` with binary-search-fast playhead lookup —
+  the waveform's playhead-overlay can use the same machinery.
+- A `DocumentSession` with `document_changed` — the waveform widget
+  can subscribe to redraw cut-region overlays as the user edits.
+- Word-time cached `_word_starts` in the transcript — if the waveform
+  needs nearest-word lookup for click-to-seek, the structure is there.
+- A clean separation between `EditorPane` (orchestration + shortcuts)
+  and the embedded widgets — the waveform drops in as a third
+  signal-emitting component without restructuring.
 
-Tested via `scripts/qt_codec_smoke.py` against the real corpus on
-`~/Desktop/`. Stripped to PASS/FAIL lines:
+---
 
-```
-PASS /Users/aaronramos/Desktop/locationbird cred/LocationBird_Creators_English_9x16.mp4
-PASS /Users/aaronramos/Desktop/locationbird cred/LocationBird_Creators_Thai_9x16.mp4
-PASS /Users/aaronramos/Desktop/locationbird cred/LocationBird_English_9x16.mp4
-PASS /Users/aaronramos/Desktop/locationbird cred/LocationBird_Pro_Studios_English_9x16.mp4
-PASS /Users/aaronramos/Desktop/locationbird cred/LocationBird_Pro_Studios_Thai_9x16.mp4
-PASS /Users/aaronramos/Desktop/locationbird cred/LocationBird_Thai_9x16.mp4
-PASS /Users/aaronramos/Desktop/locationbird cred/locationbird-video/node_modules/@remotion/studio-server/web/beep.wav
-PASS /Users/aaronramos/Desktop/locationbird cred/locationbird-video/out/locationbird-english.mp4
-PASS /Users/aaronramos/Desktop/locationbird cred/locationbird-video/out/locationbird-thai.mp4
---- 9 pass, 0 fail, 9 total
+## 11. Phase 5c final report (per spec request)
 
-PASS /tmp/podcast_link/podcast.mp4   # 23 GB H.264/AAC mp4 podcast
---- 1 pass, 0 fail, 1 total
+**1. Selection-clear policy.**
 
-PASS tests/fixtures/sample.wav
-PASS tests/fixtures/synthetic.mp4
---- 2 pass, 0 fail, 2 total
-```
+I picked "selection survives playback." Selection clears on click-
+without-drag and on successful cut/restore (because the re-render
+re-keys word indices). Playhead crossing a word boundary does **not**
+clear the selection.
 
-**100% PASS on real videos** (10/10 mp4 H.264/AAC across short-form
-9:16 clips and the 23 GB long-form podcast). Combined with the
-fixture corpus, every real media file we'd plausibly throw at the
-editor in 5c loads. **No need to ship a `python-vlc` fallback in 5c.**
-A wider scan over the rest of `~/Desktop/` produced 8 FAILs — every
-one was a scipy test WAV designed to test broken-WAV handling
-(big-endian PCM, truncated chunks, "early EOF no data"); not relevant
-corpus.
+The case for the alternative (clear on cross): more strict — once
+you start playing, the playhead is the active cursor, so a selection
+is conceptually stale. The case against (what I chose): the playhead
+ticks 30 times per second; selections would vanish within ~50–100 ms
+of pressing Play. In actual use the surviving-selection model felt
+right — it lets the user select-Play-to-verify-Cmd-X without losing
+the selection while listening. If this turns out to be annoying,
+the alternative would be "clear when the playhead moves into the
+selected region" rather than any boundary, but that's still busier
+than the current behaviour.
 
-**2. `ui_qt/` file tree post-5b.**
+**2. Command-stack location.**
 
-```
-ui_qt/__init__.py                    package docstring
-ui_qt/app.py                         MainWindow + show_editor / show_transcribe + pump
-ui_qt/editor_pane.py                 NEW — EditorPane (nested QSplitter + layout toggle)
-ui_qt/transcribe_pane.py             NEW — TranscribePane extracted from MainWindow
-ui_qt/style.py                       palette + QSS helpers (unchanged)
-ui_qt/waveform.py                    NEW — WaveformPlaceholder strip
-ui_qt/components/__init__.py         package docstring
-ui_qt/components/drop_zone.py        native Qt DnD frame (unchanged)
-ui_qt/components/language_picker.py  editable QComboBox (unchanged)
-ui_qt/components/model_picker.py     QComboBox + downloaded ✓ badge (unchanged)
-ui_qt/components/output_formats.py   QCheckBox row (unchanged)
-ui_qt/components/progress_card.py    QProgressBar card (unchanged)
-ui_qt/components/result_card.py      transcript preview card (unchanged)
-ui_qt/components/settings_panel.py   SettingsDialog (unchanged)
-ui_qt/components/transcript_view.py  NEW — TranscriptView (read-only QTextEdit walker)
-ui_qt/components/video_viewport.py   NEW — VideoViewport (QMediaPlayer + slider)
+It grew into a `DocumentSession` helper at `ui_qt/document_session.py`.
+EditorPane delegates `apply` / `undo` / `redo` / `mark_saved` /
+`is_dirty` through `self._session`. Surface:
+
+```python
+class DocumentSession(QObject):
+    document_changed: Signal(Document)
+    dirty_changed: Signal(bool)
+
+    document: Document
+    stack: CommandStack
+    can_undo: bool; can_redo: bool; is_dirty: bool
+
+    apply(command: EditCommand) -> bool   # False = no-op (ranges unchanged)
+    undo() -> bool
+    redo() -> bool
+    mark_saved() -> None
 ```
 
-**3. State-swap mechanics — what I added.**
+The session owns:
+- The mutable Document reference.
+- The `CommandStack` (using the existing one from `core.editing`,
+  not a re-implementation).
+- The id-based dirty pointer.
+- Two Qt signals: `document_changed` (fires on apply/undo/redo) and
+  `dirty_changed` (fires on transitions of `is_dirty`).
 
-- **`_dispose_transcribe_pane` / `_dispose_editor_pane` helpers** that
-  set the local reference to None *before* doing anything else, so
-  re-entry through a signal can't get a half-deleted pane.
-- **Explicit `setParent(None)` before `deleteLater()`.** Without this,
-  the displaced pane stays a child of the QMainWindow's central area
-  for one extra event-loop spin, which I observed leaving a layout
-  hint visible briefly.
-- **`EditorPane.release()` calling `VideoViewport.release()`** that
-  clears `setVideoOutput(None)`, `setAudioOutput(None)`, and
-  `setSource(QUrl())`. Without these, dropping the editor occasionally
-  printed `qt.multimedia.ffmpeg` warnings about open input on shutdown
-  (once or twice across hundreds of test runs — not deterministic).
-- **No explicit signal disconnects.** Qt auto-disconnects signals
-  bound to `QObject.destroyed`; tests under `qtbot` pass cleanly
-  without manual `signal.disconnect()` calls.
-- **Tests wait for actual destruction** via
-  `qtbot.waitUntil(lambda: not shiboken6.isValid(pane), timeout=2_000)`.
-  A bare `QCoreApplication.processEvents()` was insufficient — the
-  `DeferredDelete` event needs the qtbot loop spin to fire reliably.
+EditorPane wires both signals: `document_changed → _render_document`
+and `dirty_changed → forward to MainWindow`.
 
-**4. Layout toggle visuals.**
+134 lines including docstrings; warranted by the API surface and the
+dirty-tracking subtlety. Carving it out also let the
+DocumentSession-only tests run in pure-data mode (no qtbot,
+sub-millisecond per test).
 
-Tested by clicking the toggle button while a video was playing on
-`tests/fixtures/synthetic.mp4`:
+**3. Dirty-tracking gotchas.**
 
-- **No video flicker.** `setOrientation` reflows the splitter without
-  unmounting the QVideoWidget; the surface stays painted.
-- **Audio uninterrupted.** No dropouts during the orientation flip.
-- **Transcript scroll position preserved.** The QTextEdit isn't
-  reconstructed; scroll value is unchanged after the flip.
-- **Splitter handle stays visible.** Both orientations render the
-  divider correctly; no zero-width handle.
-- **First-flip-only oddity:** the very first click of the toggle in a
-  newly-shown editor sometimes leaves the inner splitter momentarily
-  at zero height while the outer recomputes, then snaps to the
-  stretch-factor sizes. Self-corrects within one repaint; not worth
-  fixing in 5b.
+Undo-back-to-pristine *does* clear dirty. Tested by
+`test_session_dirty_clears_on_undo_back_to_pristine` and end-to-end
+by `test_title_bar_dirty_marker_lifecycle` (which walks
+load → edit → save → edit → undo → assert clean).
 
-**5. QVideoWidget on macOS — quirks observed.**
+The mechanism is id-based: `mark_saved` records `id(self._document)`;
+`is_dirty` returns `id(current) != saved_id`. This works because
+`CommandStack.undo` returns the exact `before` Python object we
+pushed (not a copy), and `dataclasses.replace` always returns a
+fresh Document. So:
 
-- **Black-on-first-frame is real.** On `set_source`, the widget shows
-  black until `mediaStatusChanged → LoadedMedia` *and* the player
-  produces its first frame. We pre-set `background-color: black` on
-  the QVideoWidget so the transition reads as "loading", not as
-  "broken render".
-- **No audio until `play()` is called.** Expected, but worth noting:
-  setting a source doesn't decode any audio; only `play()` does. The
-  VideoViewport's pause-on-load default is therefore silent until the
-  user clicks Play. Fine for 5b's editor (the user expects to scrub /
-  spot-check, not auto-play).
-- **No `setLayerBacked` conflicts** observed across the 17 editor
-  tests + manual smoke. PySide6 6.11 handles QVideoWidget under
-  Qt-on-macOS's layer-backed default cleanly.
-- **Fullscreen weirdness — not exercised.** Decision 9 said
-  "QMediaPlayer first" with python-vlc as the codec-fail fallback; we
-  don't ship a fullscreen control in 5b at all (out-of-scope).
+- save A (record id(A)) → A is "the saved doc"
+- edit B (id(B)) → dirty (B is fresh)
+- undo back to A (returned by stack.undo → exact same instance) → not dirty
 
-**6. Transcript widget choice — `QTextEdit` (read-only).**
+The fork-past-saved case (save A → undo to B → edit C, where C's
+push clears the redo entry leading to A) is also handled: id(C) !=
+id(A), and A is no longer reachable on the stack. Stays dirty
+forever. `test_session_fork_after_save_unreachable_pristine_stays_dirty`
+covers it.
 
-Picked `QTextEdit` over `QTextBrowser` because per-word interactivity
-in 5c needs pixel-position → word lookup, not anchor clicks:
+The id-based approach was tempting to dismiss as fragile, but it's
+actually more robust than a content-equality check would be —
+content equality would mark a Document "clean" if a *different*
+Document happened to hash the same way (degenerate case but not
+zero-probability with small ranges lists).
 
-- **Per-word click in 5c** lands as `mousePressEvent → cursorForPosition(pos) → cursor.charFormat().property(WORD_INDEX_PROPERTY)`. The
-  custom property id is already set on every word's character run
-  (5b inserts each word with a `QTextCharFormat` carrying the index
-  into `TranscriptView.words`). One mouse handler, no rebuild.
-- **Drag selection (cut-range)** is two cursor lookups (press +
-  release) → range of word indices → emit a "cut from word A to word
-  B" signal. Same `cursorForPosition` path; QTextBrowser's
-  `anchorClicked` doesn't model drag.
-- **Strikethrough rendering** is `QTextCharFormat.setFontStrikeOut(True)`
-  applied via `cursor.mergeCharFormat()` over the word's text run.
-  Identical mechanic to QTextBrowser, so the choice doesn't penalise
-  the visual.
-- **Read-only enforced via `setReadOnly(True)` + `setUndoRedoEnabled(False)`**;
-  the user can't accidentally type into the transcript.
+**4. Playhead-follow auto-scroll.**
 
-The choice **extends cleanly** — no rewrite needed for 5c
-interactivity. Flagged in the report so future-us doesn't second-guess
-it.
+Shipped both highlight and auto-scroll. Trigger is **viewport-out**:
+if the highlighted word's `cursorRect` is fully outside the viewport,
+we call `ensureCursorVisible`-style positioning (set the text cursor
+to that word, ensureCursorVisible, restore the prior text cursor).
+If the word is even partially visible, we leave scroll alone. This
+matches the spec's "ensureCursorVisible-style behavior" recommendation
+and avoids the nausea of aggressive auto-centering during playback.
 
-**7. Refactors I'd want before 5c.**
+The implementation reads the cursor rect for the highlighted word
+and tests both `topLeft` and `bottomLeft` against
+`viewport().rect().contains()`. Empirically smooth at 30 Hz on a
+3-segment fixture; not stress-tested at podcast scale (5–10k words)
+in 5c — that's a 5d/5e concern when real long-form content lands.
 
-- **`MainWindow._handle_transcribe_requested` reaches into
-  `self.state._emit()`** (private). The customtkinter app does the
-  same trick. If the state machine adds transition-side-effects in 5c
-  (e.g., emitting a "cut applied" signal), both UIs will need to stay
-  in sync — easy to miss. Considered fixing in 5b; defensible as-is
-  because 5c will refactor the transition matrix anyway.
-- **`TranscribePane` and `EditorPane` both reach into `Settings`
-  fields** (default model, layout). 5c's edit-command kickoff will
-  also reach into `default_pad_lead` / `default_pad_trail` /
-  `default_audio_fade_ms`. Worth standardising a render-arg builder on
-  EditorPane that wraps these, so 5e (the export pipeline) doesn't
-  re-derive them in two places.
-- **`AppStateMachine` is the wrong shape for the editor view.** The
-  IDLE/FILE_LOADED/TRANSCRIBING/COMPLETE/ERROR states don't capture
-  "in editor mode". 5b sidesteps this by routing `COMPLETE` to
-  `show_editor` and treating the editor as separate-from-state. 5c
-  will probably want an explicit `EDITING` state with its own
-  transitions, or an `EditorState` separate machine that EditorPane
-  owns. **Not blocking** — 5c can add it as part of its first commit.
-- **`TranscriptView.set_document_model` is a full re-render.** That's
-  fine for 5b's "load once" path. 5c's command stack will mutate the
-  Document many times per session; an incremental re-render that only
-  re-applies formats (not re-inserts text) would be nicer. Not blocking
-  either; full re-render is fast enough at typical transcript sizes
-  (~1000 words ≪ 10ms).
-- **The `_extract_document_from_result` placeholder** I almost added
-  to MainWindow is gone — fixing the API by adding `document` to
-  `TranscriptionResult` was cleaner. Mentioning here so the absence
-  is not surprising.
+**5. Re-render performance under live editing.**
+
+Eyeballed but not stress-tested: at the test fixture sizes
+(3–7 words), every operation is sub-millisecond. The implementation
+of `set_document_model` is O(N) word inserts, and each insert is one
+`cursor.insertText(text, fmt)` call. At a transcript of 5k words I'd
+estimate 10–25 ms per re-render based on Qt's typical text insertion
+throughput; at 30 Hz playhead ticks (which only re-format two words
+per tick — old-playhead off, new-playhead on, via `_repaint_word_range`)
+the cost should be negligible.
+
+If jank surfaces in 5d/5e it would most likely come from
+**`_repaint_word_range`'s `_cursor_for_word`** doing a full-document
+walk per word — fine when called twice per tick, expensive if a
+selection-drag re-paints 100 words back-to-back. Caching
+`(word_idx → fragment.position)` after `set_document_model` would
+turn that O(N) walk into O(1). Flagged as the most likely future
+hotspot; not fixing in 5c per spec ("don't fix it in 5c").
+
+**6. AppStateMachine public method shape.**
+
+```python
+def transition_to(self, new_state: AppState) -> None:
+    """Force a validated transition into ``new_state`` and notify listeners."""
+```
+
+Single argument, returns None, raises `InvalidTransitionError` on
+illegal transitions (same exception the internal call sites raise).
+Same semantics as the internal `_go`; we kept `_go` as a private
+alias because its call sites in `load_file`, `start_transcribing`,
+`cancel`, etc. all read better as internal-helper calls. Public
+method is a thin one-liner.
+
+Rationale: the spec asked for "a public method" and named
+`transition_to` as a candidate. The verb is right — both UIs are
+*requesting a transition* the state machine should validate.
+Alternatives I considered:
+
+- `set_state(state)` — too imperative; reads like assignment without
+  the validation contract.
+- `goto(state)` — short but reads as "navigate," not "validate."
+- `clear_error_to(state)` — too narrow; the call site happens to be
+  about clearing errors but the same method is useful elsewhere.
+
+`transition_to` won.
+
+**7. Anything I found in `core/editing.py` that surprised me.**
+
+The 4f-3 rewrite is solid. Three surprises (mild — none blocking):
+
+- **`CutWordRange` requires `seg_idx` and rejects cross-segment
+  ranges.** I used `AddCut` instead because the editor's word
+  selection can span segments. The spec hinted at `CutWordRange(start, end)`
+  but the actual constructor is `(seg_idx, word_start_idx, word_end_idx)`.
+  Decision: lean on `AddCut` with word-boundary times — the
+  "Never cut inside a word" rule (PASS in `PRODUCTION_RULES.md`)
+  is satisfied because the times come from `word.start` /
+  `word.end` directly. `CutWordRange` would be the right primitive
+  for a single-segment-aware command (e.g., a future "cut this
+  paragraph" action) but isn't right for the general drag-select.
+  No rewrite needed.
+
+- **`AddCut` and `RestoreRange` capture pre-apply ranges to drive
+  `revert`** rather than computing the inverse of the timeline math.
+  Documented in their docstrings as "simpler and more obviously-
+  correct than computing inverses of the subtraction in the
+  multi-range / split case." Confirmed — my DocumentSession leans on
+  this and it works. Worth re-reading the docstring before adding any
+  new range command.
+
+- **Word-time overlap semantics.** This isn't a `core/editing.py`
+  surprise per se — `subtract_interval` produces strict-gap ranges
+  (an interval cut from `[0, 3]` with `(1.0, 2.0)` gives
+  `[Range(0, 1), Range(2, 3)]`, no overlap at the boundary). The 5b
+  transcript code used loose overlap (`>=`, `<=`) for word-in-range
+  detection, which interacted badly with `subtract_interval`'s
+  strict gaps: a word at exactly `(1.0, 1.5)` was marked kept
+  because its start touched range[0]'s end. 5c switched to strict
+  overlap (`>`, `<`) and the test that exposed this
+  (`test_cmd_x_on_already_cut_selection_pushes_restore`) is now
+  green. Not a `core/editing.py` defect — it's a contract that the
+  transcript renderer has to honor. Documented in the rewritten
+  `_word_in_any_range` docstring.
