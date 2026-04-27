@@ -39,6 +39,10 @@ class DoneEvent(WorkerEvent):
     info: Any
     output_files: dict[str, Path]
     elapsed: float
+    # Phase 5b — the canonical Document handed to MainWindow.show_editor.
+    # Optional only because pre-5b call sites in tests construct DoneEvent
+    # without one; both worker code paths fill it in.
+    document: Any | None = None
 
 
 @dataclass

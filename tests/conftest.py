@@ -120,3 +120,32 @@ def probe_duration():
 @pytest.fixture(scope="session")
 def is_playable():
     return _is_playable
+
+
+# ---------------------------------------------------------------------------
+# Tiny fixture mp4 for QMediaPlayer wiring tests (Phase 5b).
+#
+# 2 s, 64x64, h264 video + silent aac audio. Generated on demand into the
+# session tmp dir so it never lives in git. Tests skip cleanly if ffmpeg
+# isn't on disk.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def tiny_mp4(tmp_path_factory) -> Path:
+    """Smallest .mp4 that exercises QMediaPlayer's video + audio path."""
+    if not FFMPEG.exists():
+        pytest.skip(f"ffmpeg not found at {FFMPEG}")
+    out = tmp_path_factory.mktemp("media") / "tiny.mp4"
+    cmd = [
+        str(FFMPEG), "-y", "-loglevel", "error",
+        "-f", "lavfi", "-i", "testsrc=duration=2:size=64x64:rate=10",
+        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+        "-t", "2",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "32k",
+        "-shortest",
+        str(out),
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+    return out

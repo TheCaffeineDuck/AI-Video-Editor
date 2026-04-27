@@ -258,13 +258,18 @@ def main_window(qtbot, tmp_path, monkeypatch):
 
 def test_main_window_starts_in_idle(main_window):
     assert main_window.state.state == AppState.IDLE
+    # Phase 5b: starts on the transcribe pane, not the editor.
+    assert main_window.transcribe_pane is not None
+    assert main_window.editor_pane is None
 
 
 def test_main_window_transcribe_disabled_until_file_loaded(main_window):
-    assert main_window.transcribe_btn.isEnabled() is False
+    pane = main_window.transcribe_pane
+    assert pane is not None
+    assert pane.transcribe_btn.isEnabled() is False
     main_window._handle_file_selected(SAMPLE)
     assert main_window.state.state == AppState.FILE_LOADED
-    assert main_window.transcribe_btn.isEnabled() is True
+    assert pane.transcribe_btn.isEnabled() is True
 
 
 def test_main_window_invalid_file_sets_transient_error(main_window, tmp_path):
@@ -276,6 +281,7 @@ def test_main_window_invalid_file_sets_transient_error(main_window, tmp_path):
 
 
 def test_main_window_pump_drives_done_event_to_complete(main_window, tmp_path):
+    """No document attached → COMPLETE, transcribe pane shows the result card."""
     main_window._handle_file_selected(SAMPLE)
     main_window.state.start_transcribing()
     main_window.event_queue.put(
@@ -284,11 +290,16 @@ def test_main_window_pump_drives_done_event_to_complete(main_window, tmp_path):
             info=SimpleNamespace(language="en"),
             output_files={"txt": tmp_path / "x.txt"},
             elapsed=0.4,
+            document=None,
         )
     )
     main_window.pump_once()
     assert main_window.state.state == AppState.COMPLETE
-    assert main_window.result_card._textbox.toPlainText() == "hello world"
+    pane = main_window.transcribe_pane
+    assert pane is not None
+    assert pane.result_card._textbox.toPlainText() == "hello world"
+    # Without a document, no editor swap.
+    assert main_window.editor_pane is None
 
 
 def test_main_window_progress_event_updates_bar(main_window):
@@ -297,22 +308,9 @@ def test_main_window_progress_event_updates_bar(main_window):
     main_window.event_queue.put(ProgressEvent(fraction=0.5))
     main_window.pump_once()
     assert main_window.state.progress == 0.5
-    assert main_window.progress_card._bar.value() == 500
-
-
-def test_main_window_result_card_after_complete(main_window, tmp_path):
-    main_window._handle_file_selected(SAMPLE)
-    main_window.state.start_transcribing()
-    main_window.event_queue.put(
-        DoneEvent(
-            segments=[SimpleNamespace(text="hi", start=0.0, end=0.5)],
-            info=SimpleNamespace(language="en"),
-            output_files={"txt": tmp_path / "out.txt"},
-            elapsed=0.2,
-        )
-    )
-    main_window.pump_once()
-    assert main_window._stack.currentWidget() is main_window.result_card
+    pane = main_window.transcribe_pane
+    assert pane is not None
+    assert pane.progress_card._bar.value() == 500
 
 
 def test_main_window_new_transcription_resets(main_window, tmp_path):
@@ -324,6 +322,7 @@ def test_main_window_new_transcription_resets(main_window, tmp_path):
             info=SimpleNamespace(language="en"),
             output_files={"txt": tmp_path / "x.txt"},
             elapsed=0.1,
+            document=None,
         )
     )
     main_window._handle_new_transcription()

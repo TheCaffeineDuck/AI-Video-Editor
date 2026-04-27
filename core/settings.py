@@ -99,7 +99,15 @@ class Settings:
         kwargs["output_formats"] = formats
         # Normalize layout: unknown value falls back to default rather than
         # propagating a typo into the editor's QSplitter orientation.
-        if kwargs.get("layout") not in LAYOUT_CHOICES:
+        raw_layout = kwargs.get("layout")
+        if raw_layout not in LAYOUT_CHOICES:
+            if raw_layout != DEFAULT_LAYOUT:
+                log.warning(
+                    "settings layout %r is not one of %s; falling back to %r",
+                    raw_layout,
+                    LAYOUT_CHOICES,
+                    DEFAULT_LAYOUT,
+                )
             kwargs["layout"] = DEFAULT_LAYOUT
         return cls(**kwargs)
 

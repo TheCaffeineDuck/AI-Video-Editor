@@ -2,30 +2,35 @@
 
 **Date:** 2026-04-27
 **Branch:** main
-**Commit:** Phase 5a — Qt scaffold + port transcribe flow
-**Status:** All 413 tests passing (374 fast tkinter + 11 slow + 28 new Qt). Lint clean for changed files.
+**Commit:** Phase 5b — editor pane skeleton + qmediaplayer wiring
+**Status:** All 429 tests passing (385 prior + 27 5a Qt + 17 new editor). Lint clean for changed files.
 
 ---
 
-## 1. Phase 5a in two paragraphs
+## 1. Phase 5b in two paragraphs
 
-Phase 5a stands up a second UI alongside the existing customtkinter app:
-a PySide6 window that does what `python main.py` does today (drop a
-media file, pick model/language/output formats, transcribe, see the
-result paths) and looks more native on macOS. The transcription worker
-that was a method on `ui.app.App` is now its own framework-agnostic
-class in `workers/transcription.py`; both UIs construct one, hand it a
-callback that puts events on a `queue.Queue`, and run it on a daemon
-thread. The customtkinter app keeps working unchanged from the user's
-perspective; the Qt app launches via `python main_qt.py`.
+Phase 5b stands up the editor view that takes over after a transcription
+completes or a `.transcribe.json` project is opened. The new
+`EditorPane` is a nested `QSplitter` (outer flips orientation with the
+layout toggle; inner is always vertical so the waveform sits directly
+under the transcript regardless of layout). It renders a video preview
+backed by `QMediaPlayer` + `QAudioOutput` with play/pause and a seek
+slider, walks the v2 Document timeline (`doc.ranges`) to render the
+read-only transcript, and reserves a 64-px-tall waveform strip for 5d.
+The transcript widget is `QTextEdit` (read-only) with per-word custom
+character formats — picked because per-word click and strikethrough in
+5c want pixel-position → cursor lookup, which is exactly what
+`cursorForPosition` exposes.
 
-Settings are shared on disk between the two apps — same
-`~/Library/Application Support/WhisperTranscriber/settings.json` — and
-five new editor-related fields (`layout`, `default_pad_lead`,
-`default_pad_trail`, `default_audio_fade_ms`, `autosave_interval_s`)
-landed now even though most aren't read until 5b/5c/5f. Per the Phase-4e
-non-migration rule, missing keys in older settings files fall through
-to the documented defaults; nothing on disk is auto-rewritten.
+The window now swaps central widgets between `TranscribePane` (the 5a
+flow, extracted into its own widget) and `EditorPane` via
+`setCentralWidget` + `deleteLater`. Routes into the editor: a
+DoneEvent carrying a Document (worker fills it on every code path), or
+the new "Open project (.transcribe.json)…" button on the transcribe
+pane. A 10-second `QMediaPlayer` codec smoke script
+(`scripts/qt_codec_smoke.py`) ran across the actual `~/Desktop/`
+corpus — 10/10 real videos pass, so 5c does not need to ship a
+`python-vlc` fallback (Decision 9 stays "QMediaPlayer first" for now).
 
 ---
 
@@ -44,41 +49,43 @@ to the documented defaults; nothing on disk is auto-rewritten.
 │   ├── model_loader.py
 │   ├── models.py
 │   ├── render.py
-│   ├── settings.py            # +5 Phase-5 editor fields (5a)
+│   ├── settings.py            # 5b: layout-fallback warning logged
 │   ├── timeline.py
 │   └── transcriber.py
-├── workers/                   # NEW (5a)
+├── workers/
 │   ├── __init__.py
-│   ├── events.py              # WorkerEvent dataclasses (lifted from ui/state.py)
-│   └── transcription.py       # TranscriptionWorker + cache helpers
+│   ├── events.py              # 5b: DoneEvent gains `document` field
+│   └── transcription.py       # 5b: both code paths fill DoneEvent.document
 ├── ui/                        # legacy customtkinter UI (still runnable)
-│   ├── app.py                 # delegates worker work to TranscriptionWorker
-│   ├── components/
-│   │   ├── drop_zone.py
-│   │   ├── language_picker.py
-│   │   ├── model_picker.py
-│   │   ├── output_formats.py
-│   │   ├── progress_card.py
-│   │   ├── result_card.py
-│   │   └── settings_panel.py
-│   ├── state.py               # re-exports WorkerEvents from workers.events
+│   ├── app.py
+│   ├── components/ ...
+│   ├── state.py               # 5b: TranscriptionResult gains `document` field
 │   └── theme.py
-├── ui_qt/                     # NEW (5a) PySide6 UI
+├── ui_qt/                     # PySide6 UI
 │   ├── __init__.py
-│   ├── app.py                 # MainWindow + run() entry
-│   ├── components/
-│   │   ├── drop_zone.py
-│   │   ├── language_picker.py
-│   │   ├── model_picker.py
-│   │   ├── output_formats.py
-│   │   ├── progress_card.py
-│   │   ├── result_card.py
-│   │   └── settings_panel.py
-│   └── style.py               # palette + small QSS snippets
+│   ├── app.py                 # MainWindow swaps central widget; show_editor / show_transcribe
+│   ├── editor_pane.py         # NEW (5b) — nested QSplitter, layout toggle
+│   ├── transcribe_pane.py     # NEW (5b) — extracted from MainWindow._build_central
+│   ├── waveform.py            # NEW (5b) — WaveformPlaceholder strip
+│   ├── style.py
+│   └── components/
+│       ├── drop_zone.py
+│       ├── language_picker.py
+│       ├── model_picker.py
+│       ├── output_formats.py
+│       ├── progress_card.py
+│       ├── result_card.py
+│       ├── settings_panel.py
+│       ├── transcript_view.py # NEW (5b) — read-only QTextEdit walker
+│       └── video_viewport.py  # NEW (5b) — QMediaPlayer + QVideoWidget + slider
 ├── docs/
 │   └── PRODUCTION_RULES.md
+├── scripts/
+│   ├── cli_test.py
+│   ├── qt_codec_smoke.py      # NEW (5b) — corpus-wide QMediaPlayer probe
+│   └── word_probe.py
 ├── tests/
-│   ├── conftest.py
+│   ├── conftest.py            # 5b: tiny_mp4 session fixture (2 s, 64x64, h264+aac)
 │   ├── fixtures/ ...
 │   ├── test_audio.py
 │   ├── test_bootstrap.py
@@ -95,20 +102,15 @@ to the documented defaults; nothing on disk is auto-rewritten.
 │   ├── test_state.py
 │   ├── test_timeline.py
 │   ├── test_transcriber.py
-│   ├── test_ui.py             # cache-hit tests now patch workers.transcription
-│   └── test_ui_qt.py          # NEW (5a) — 28 pytest-qt tests
-├── scripts/
-│   ├── cli_test.py
-│   └── word_probe.py
+│   ├── test_ui.py
+│   ├── test_ui_qt.py          # 5b: tests adapted to TranscribePane refactor
+│   └── test_ui_qt_editor.py   # NEW (5b) — 17 editor + media-player tests
 ├── resources/
-│   ├── bin/ffmpeg-mac
-│   ├── fonts/
-│   └── icons/
 ├── main.py                    # tkinter entry (unchanged)
-├── main_qt.py                 # NEW (5a) — Qt entry
-├── pyproject.toml             # +per-file ruff ignore for ui_qt N802 (Qt overrides)
-├── requirements.txt           # +PySide6>=6.6
-├── requirements-dev.txt       # +pytest-qt==4.4.0
+├── main_qt.py                 # Qt entry (unchanged)
+├── pyproject.toml
+├── requirements.txt
+├── requirements-dev.txt
 ├── CLAUDE.md
 ├── STATE.md                   # this file
 └── whisper_transcriber_spec.md
@@ -118,384 +120,422 @@ to the documented defaults; nothing on disk is auto-rewritten.
 
 ## 3. Dependencies
 
-### requirements.txt
-
-```
-customtkinter==5.2.2
-tkinterdnd2==0.4.2
-faster-whisper==1.2.1
-huggingface-hub==0.24.0
-smartcut==1.7
-PySide6>=6.6                  # NEW (5a)
-```
-
-### requirements-dev.txt
-
-```
--r requirements.txt
-pytest==8.3.0
-pytest-cov==5.0.0
-pytest-qt==4.4.0              # NEW (5a)
-ruff==0.6.0
-```
-
-### Resolved in venv (additions only)
-
-```
-PySide6==6.11.0
-PySide6-Addons==6.11.0
-PySide6-Essentials==6.11.0
-shiboken6==6.11.0
-pytest-qt==4.4.0
-```
-
-`pip check` exits 0 after install. The PySide6 wheel for
-`cp310-abi3-macosx_13_0_universal2` installs cleanly on Apple Silicon
-M4 — no source build, no Qt SDK, no Xcode requirement.
-
-### Python / platform — unchanged
-
-- Python 3.11.15 (`>=3.11,<3.12`)
-- Apple Silicon M4, 16 GB
-- CPU-only inference (`compute_type="int8"`, `device="auto"`)
+No new dependencies in 5b. PySide6 6.11.0 (installed in 5a) ships
+`QtMultimedia` and `QtMultimediaWidgets` already; both come from the
+same `PySide6_Essentials`/`PySide6_Addons` pair.
 
 ---
 
-## 4. Code inventory
+## 4. Code inventory (deltas from 5a)
 
-### core/ (settings.py grew +20 LOC; everything else unchanged)
-
-| File | Lines | What's new in 5a |
+| File | Lines | What's new in 5b |
 |------|------:|------------------|
-| `core/settings.py` | 125 | +5 editor-preference fields; `LAYOUT_CHOICES` constant; `from_dict` normalizes unknown layout values |
-
-### workers/ (NEW; 282 LOC)
-
-| File | Lines | Purpose |
-|------|------:|---------|
-| `workers/transcription.py` | 224 | `TranscriptionWorker` class + `try_load_cached_document` / `candidate_cache_path` / `resolve_output_dir` helpers + `_CachedInfo` adapter |
-| `workers/events.py` | 47 | `WorkerEvent` / `SegmentEvent` / `ProgressEvent` / `DoneEvent` / `ErrorEvent` / `CancelledEvent` (lifted from `ui/state.py`) |
-| `workers/__init__.py` | 11 | docstring explaining the package's role |
-
-### ui/ (app.py shrank by ~150 LOC; state.py lost the event dataclasses)
-
-| File | Lines | What's new in 5a |
-|------|------:|------------------|
-| `ui/app.py` | 392 | `_run_transcription` is now a 12-line wrapper around `TranscriptionWorker`; cache-hit helper methods are 1-liners delegating to `workers.transcription`; deleted `_CachedInfo`, `_emit_cache_hit_done`, `_resolve_output_dir`, the in-line cache-load body, and the in-line transcribe body |
-| `ui/state.py` | 217 | event dataclasses moved to `workers/events.py`, re-exported here for backward compat; explicit `__all__`; `AppStateMachine` unchanged |
-
-### ui_qt/ (NEW; 760 LOC)
-
-| File | Lines | Purpose |
-|------|------:|---------|
-| `ui_qt/app.py` | 296 | `MainWindow(QMainWindow)` + module-level `run()` |
-| `ui_qt/components/drop_zone.py` | 142 | native Qt drag-and-drop frame with click-to-browse fallback |
-| `ui_qt/components/settings_panel.py` | 165 | `SettingsDialog(QDialog)` with Transcription tab; emits `settings_saved(Settings)`; writes the same on-disk file |
-| `ui_qt/components/progress_card.py` | 109 | `QProgressBar`-backed card with cancel signal |
-| `ui_qt/components/result_card.py` | 105 | transcript preview + Open Folder / Copy / New Transcription |
-| `ui_qt/components/language_picker.py` | 60 | editable `QComboBox` with case-insensitive substring completion |
-| `ui_qt/components/model_picker.py` | 65 | `QComboBox` with downloaded ✓ badge + tooltip per item |
-| `ui_qt/components/output_formats.py` | 78 | `QCheckBox` row + nudge label about the JSON format |
-| `ui_qt/style.py` | 60 | `ACCENT`/`MUTED`/etc. constants + small QSS helpers |
-| `ui_qt/__init__.py` + `components/__init__.py` | 14 | package docstrings |
-
-### tests/ (test_ui_qt.py NEW; test_ui.py monkeypatches updated)
-
-| File | Lines | What's new in 5a |
-|------|------:|------------------|
-| `tests/test_ui_qt.py` | 263 | NEW — 28 pytest-qt tests (component construction smoke tests, drop-event simulation via QDropEvent, MainWindow wiring + queue-pump tests, shared-settings round-trip test) |
-| `tests/test_ui.py` | 449 | three cache-hit tests now `monkeypatch.setattr(worker_module, ...)` instead of `app_module` (workers.transcription owns the imports now) |
+| `ui_qt/app.py` | 268 | reduced from 350 (5a); transcribe-flow extracted; `show_editor` / `show_transcribe` / `_dispose_*` |
+| `ui_qt/transcribe_pane.py` | 246 | NEW — extracted from `MainWindow._build_central`; signals out, render-for-state in |
+| `ui_qt/editor_pane.py` | 195 | NEW — nested QSplitter, `_handle_layout_toggle`, `release()` |
+| `ui_qt/waveform.py` | 27 | NEW — placeholder strip; `paintEvent` fills `palette().mid()` |
+| `ui_qt/components/video_viewport.py` | 184 | NEW — QMediaPlayer + QAudioOutput + QVideoWidget + slider; explicit `release()` |
+| `ui_qt/components/transcript_view.py` | 155 | NEW — `collect_words(doc)` + `set_document_model(doc)`; per-word `WORD_INDEX_PROPERTY` for 5c |
+| `core/settings.py` | 134 | layout-fallback warning logged via `core.settings` logger |
+| `workers/events.py` | 52 | `DoneEvent.document: Any \| None = None` |
+| `workers/transcription.py` | 226 | both DoneEvent emissions carry `document=` |
+| `ui/state.py` | 226 | `TranscriptionResult.document: Any \| None = None`; `apply_event` propagates it |
+| `scripts/qt_codec_smoke.py` | 122 | NEW — recursive walk + per-file `QEventLoop` + 10 s timeout |
+| `tests/conftest.py` | 152 | `tiny_mp4` session fixture (~2 s, 64x64) |
+| `tests/test_ui_qt.py` | 332 | tests adapted to `transcribe_pane.transcribe_btn` etc.; document=None synthetics |
+| `tests/test_ui_qt_editor.py` | 282 | NEW — 17 tests; covers splitter topology, layout toggle, swap mechanics, real-mp4 load |
 
 ### Test count
 
 | Phase | Total | Fast | Slow |
 |-------|------:|-----:|-----:|
-| End of Phase 4f-3 | 385 | 374 | 11 |
-| **End of Phase 5a** | **413** | **402** | **11** |
+| End of 4f-3 | 385 | 374 | 11 |
+| End of 5a   | 413 | 402 | 11 |
+| **End of 5b** | **429** | **418** | **11** |
 
-`pytest -q` runs all 413 green in ~13 s on this M4 with the model
-cached. The five `RuntimeWarning: Failed to disconnect ... timeout()`
-lines are an internal pytest-qt issue around `qtbot.waitSignal`'s
-timeout cleanup — not from project code, not test failures.
+`pytest -q` runs all 429 green in ~10 s on this M4. The same five
+`RuntimeWarning: Failed to disconnect ... timeout()` lines from 5a
+persist — pytest-qt internal, not project code.
 
 ---
 
-## 5. Git history (post-5a)
+## 5. Git history (post-5b)
 
 ```
-phase 5a: qt scaffold + port transcribe flow              (this commit)
-phase 4f-3 (3/3): production rules + STATE.md final
+phase 5b: editor pane skeleton + qmediaplayer wiring   (this commit)
+phase 5a: qt scaffold + port transcribe flow
+phase 4f-3 (3/3) — final: docs + STATE.md
 phase 4f-3 (2/3): schema v2 multi-clip-ready document with v1 migration
 phase 4f-3 (1/3): timeline helpers + Range/MediaSource types
-phase 4f-2: document json cache via source_hash
-docs: tighten audio-passthru rule to reflect single-pass re-encode reality
-phase 4f-1: pad_lead/pad_trail + audio fades + render-time boundary snap
-phase 4f-0: utc default-factory fix + three doc additions
 …
 ```
 
 ---
 
-## 6. Public APIs added or reshaped in Phase 5a
+## 6. Public APIs added or reshaped in Phase 5b
 
 ```python
-# workers.events  (lifted out of ui.state; re-exported there for backward compat)
-@dataclass class WorkerEvent: ...
-@dataclass class SegmentEvent(WorkerEvent): text: str
-@dataclass class ProgressEvent(WorkerEvent):
-    fraction: float; label: str = "Transcribing…"
-@dataclass class DoneEvent(WorkerEvent):
-    segments: list; info: Any; output_files: dict[str, Path]; elapsed: float
-@dataclass class ErrorEvent(WorkerEvent): message: str
-@dataclass class CancelledEvent(WorkerEvent): ...
+# ui_qt.editor_pane
+class EditorPane(QWidget):
+    back_to_transcribe: Signal()
+    layout_changed: Signal(Settings)
+    def __init__(self, document: Document, *, settings: Settings, parent=None) -> None: ...
+    @property document: Document
+    @property settings: Settings
+    @property video_viewport: VideoViewport
+    @property transcript_view: TranscriptView
+    @property outer_splitter: QSplitter
+    @property inner_splitter: QSplitter
+    def release(self) -> None: ...   # stops the embedded media player
 
-# workers.transcription
-EventCallback = Callable[[WorkerEvent], None]
+# ui_qt.transcribe_pane
+class TranscribePane(QWidget):
+    file_selected: Signal(Path)
+    invalid_file: Signal(str)
+    open_project_requested: Signal()
+    transcribe_requested: Signal(Path, str, object, list)
+    cancel_requested: Signal()
+    new_transcription_requested: Signal()
+    def render_for_state(state: AppState) -> None: ...
+    def show_progress_label(label: str) -> None: ...
+    def reset_progress() -> None: ...
+    def update_settings(settings: Settings) -> None: ...
 
-def resolve_output_dir(settings: Settings, media_path: Path) -> Path: ...
-def candidate_cache_path(settings: Settings, media_path: Path) -> Path: ...
-def try_load_cached_document(settings: Settings, media_path: Path) -> Document | None: ...
-
-class TranscriptionWorker:
-    def __init__(
-        self, *,
-        settings: Settings, media_path: Path,
-        model_name: str, language: str | None, formats: list[str],
-        on_event: EventCallback,
-        cancel_event: threading.Event | None = None,
-    ) -> None: ...
-    def run(self) -> None: ...        # synchronous; UI spawns a daemon thread
-    def cancel(self) -> None: ...     # safe from any thread
-    @property
-    def transcriber(self) -> Transcriber | None: ...
-
-# core.settings — additions
-DEFAULT_LAYOUT = "video_top"; LAYOUT_CHOICES = ("video_top", "video_left")
-DEFAULT_PAD_LEAD = 0.10; DEFAULT_PAD_TRAIL = 0.10
-DEFAULT_AUDIO_FADE_MS = 30; DEFAULT_AUTOSAVE_INTERVAL_S = 0
-
-@dataclass class Settings:
-    # … unchanged fields plus:
-    layout: str = DEFAULT_LAYOUT
-    default_pad_lead: float = DEFAULT_PAD_LEAD
-    default_pad_trail: float = DEFAULT_PAD_TRAIL
-    default_audio_fade_ms: int = DEFAULT_AUDIO_FADE_MS
-    autosave_interval_s: int = DEFAULT_AUTOSAVE_INTERVAL_S
-
-# ui_qt.app
+# ui_qt.app — MainWindow
 class MainWindow(QMainWindow):
-    state: AppStateMachine
-    settings: Settings
-    drop_zone: DropZone; model_picker: ModelPicker; …
-    def pump_once(self) -> int: ...   # public so tests don't need event-loop spinning
+    @property transcribe_pane: TranscribePane | None
+    @property editor_pane: EditorPane | None
+    def show_transcribe(self) -> None: ...   # disposes editor_pane, builds new TranscribePane
+    def show_editor(self, document: Document) -> None: ...  # disposes transcribe_pane, builds new EditorPane
 
-def run() -> int: ...                  # convenience entry; main_qt.py calls this
+# ui_qt.components.video_viewport
+class VideoViewport(QWidget):
+    position_changed: Signal(int)            # ms from QMediaPlayer.positionChanged
+    @property player: QMediaPlayer
+    def set_source(self, path: Path | None) -> None: ...
+    def toggle_play(self) -> None: ...
+    def seek_ms(self, position_ms: int) -> None: ...
+    def release(self) -> None: ...           # stop + clear source + setVideoOutput(None)
+
+# ui_qt.components.transcript_view
+WORD_INDEX_PROPERTY: int = 0x100001          # QTextCharFormat custom property id
+
+@dataclass(frozen=True)
+class WordRef:
+    seg_idx: int; word_idx: int; word: Word
+
+def collect_words(document: Document) -> list[WordRef]: ...
+
+class TranscriptView(QTextEdit):
+    @property words: list[WordRef]
+    def set_document_model(self, document: Document) -> None: ...
+
+# ui_qt.waveform
+class WaveformPlaceholder(QWidget): ...      # setMinimumHeight(64); paintEvent fills palette().mid()
+
+# workers.events
+@dataclass class DoneEvent(WorkerEvent):
+    segments: list[Any]
+    info: Any
+    output_files: dict[str, Path]
+    elapsed: float
+    document: Any | None = None              # NEW — the Document the editor renders
+
+# ui.state
+@dataclass class TranscriptionResult:
+    segments: list[Any]
+    info: Any
+    output_files: dict[str, Path]
+    elapsed: float
+    document: Any | None = None              # NEW — propagated by apply_event(DoneEvent)
 ```
 
-The previous controller-private surface (`App._try_load_cached_document`,
-`App._candidate_cache_path`, `App._run_transcription`) is preserved as
-1-line wrappers so the existing `tests/test_ui.py` cache-hit tests
-keep passing without touching the controller-call shape.
+---
+
+## 7. What's solid
+
+1. **The editor pane drops in cleanly off a real DoneEvent.** The
+   worker now ships the Document on every code path (cache hit + fresh
+   inference); `apply_event` propagates it onto `TranscriptionResult`;
+   `MainWindow.pump_once` calls `show_editor(doc)` when the state hits
+   `COMPLETE` with a document attached. No lossy re-build.
+2. **Layout toggle is one orientation flip, not a rebuild.** Clicking
+   the toggle calls `outer_splitter.setOrientation(...)` + saves
+   settings. The video keeps playing; the transcript scroll position
+   doesn't jump because the widget tree doesn't unmount.
+3. **Splitter topology survives both layouts.** Outer flips between
+   Vertical and Horizontal; inner stays Vertical. The waveform always
+   sits directly under the transcript — Decision 5's user-visible
+   contract.
+4. **State swap really destroys the previous pane.** `show_editor`
+   disposes the transcribe pane via `setParent(None)` + `deleteLater`,
+   and `show_transcribe` does the symmetric editor disposal calling
+   `release()` first to stop the player. Tests assert the previous
+   pane's C++ side is destroyed (`shiboken6.isValid` returns False
+   after spinning the event loop).
+5. **Codec coverage is broad.** 10/10 real videos in the user's
+   corpus (mp4 H.264/AAC across the LocationBird series + a 23 GB
+   podcast file) load to `LoadedMedia` within the 10 s timeout. The
+   only "FAIL" lines from a wider Desktop scan are scipy's
+   intentionally-malformed test WAVs (big-endian, truncated chunks) —
+   not real media.
+6. **DoneEvent backward compat preserved.** Existing tests that
+   construct `DoneEvent(...)` without `document=` still work — the
+   field defaults to `None` and the editor swap simply doesn't fire.
+   Previous-`COMPLETE`-via-result-card flow stays available as a
+   fallback when no document is on the result.
 
 ---
 
-## 7. Document JSON format — unchanged from 4f-3
+## 8. What's fragile or worth knowing (5b additions)
 
-(See git history at `STATE.md@4f-3` if a reminder of the exact shape
-is needed; nothing in 5a touched persistence.)
-
----
-
-## 8. What's solid
-
-1. **Worker is framework-agnostic and tested as such.** The same
-   `TranscriptionWorker` powers both UIs. Cache lookup, model download,
-   transcribe, and output writing are one code path that the tkinter
-   side already exercises in production and the Qt side now exercises
-   in tests.
-2. **Settings are shared on disk between the two apps.** A user who
-   ran the customtkinter app yesterday opens the Qt app today and sees
-   their model / language / output formats / output dir intact, and
-   vice versa. Verified by `test_settings_dialog_save_writes_shared_file`.
-3. **New Settings fields follow the non-migration rule.** A pre-5a
-   `settings.json` opened by the new `from_dict` path picks up
-   defaults for the five missing keys without rewriting on disk.
-   Confirmed by re-running the full `test_settings.py` suite (no test
-   needed an update; lenient `from_dict` already covered the case).
-4. **Native Qt drag-and-drop works without third-party shims.** The
-   tkinter side needed `tkinterdnd2`; the Qt side uses Qt's built-in
-   `dragEnterEvent` / `dropEvent` directly. Tested via a synthesized
-   `QDropEvent` with a `file://` URL.
-5. **Pump shape transports cleanly to QTimer.** The same
-   `pump_queue(queue, machine)` helper drives both UIs — a Tk
-   `root.after(100, …)` loop in one, a `QTimer.timeout` connection in
-   the other. No queue/state-machine code was duplicated.
-6. **All 385 prior tests still pass.** No behavioral regressions from
-   the worker extraction.
-
----
-
-## 9. What's fragile or worth knowing (Phase 5a additions)
-
-1. **QMediaPlayer is imported but not exercised yet.** The 5a smoke
-   test confirms `from PySide6.QtMultimedia import QMediaPlayer`
-   succeeds, but no playback path is wired. Whether QMediaPlayer
-   handles our actual `.mp4` / `.mov` / `.mkv` corpus stays an open
-   question until 5b. Decision 9 keeps the option to swap in
-   `python-vlc` if codec issues surface.
-2. **Pump cadence is identical between the two apps (100 ms).** If 5b
-   adds a high-frequency video-frame timer on top of the pump, we may
-   want to split: keep the slow worker-event pump at 100 ms, run the
-   playback timer at a faster rate. Not a problem for 5a.
-3. **`_emit` access in MainWindow.** `MainWindow._handle_transcribe_click`
-   calls `self.state._emit()` to force a re-render after manually
-   resetting the state from `ERROR` to `FILE_LOADED`. Same trick the
-   tkinter `App` uses; both reach into the same private. If the state
-   machine grows transition-side-effects, both UIs need to stay in
-   sync — easy to miss.
-4. **The Qt language picker doesn't reproduce the modal listbox UX.**
-   `QComboBox.setEditable(True)` + the built-in completer give a
-   reasonable substring-search experience without a separate dialog.
-   That's a real divergence from the tkinter UI; it's appropriate
-   (Qt has the better widget) but worth flagging.
-5. **The new Settings fields are stored, never read by the active UI
-   yet.** They're plumbed end-to-end (defaults, `from_dict`,
-   `to_dict`) and the Qt SettingsDialog round-trips them through
-   `_save`. Reading them lands in 5b–5f.
-6. **`ui_qt` has a per-file `N802` lint exception.** Qt overrides
-   (`dropEvent`, `mousePressEvent`, `closeEvent`, …) follow Qt's
-   camelCase API; the project's `ruff` config now ignores N802 under
-   `ui_qt/`. Pre-existing lint debt in `tests/test_render.py` /
-   `test_document.py` / `test_editing.py` is unrelated and untouched.
-7. **macOS-specific Qt behavior not yet exercised.** Native menu bar
-   (Cmd-, Cmd-W, Cmd-Q wiring), dark mode appearance, high-DPI
-   rendering at 2× — none of those are validated yet. Phase 5f's
-   "polish" sub-phase explicitly owns them.
+1. **Transcript widget choice — `QTextEdit` (read-only)** with per-word
+   `QTextCharFormat` custom properties (id `0x100001`). Per-word click
+   targets in 5c land via `cursorForPosition` → cursor's `charFormat()`
+   → `property(WORD_INDEX_PROPERTY)`. Drag selection is just two
+   cursor lookups (press + release). Strikethrough is a per-word
+   `QTextCharFormat.setFontStrikeOut(True)` re-applied via merge-format
+   on the cut-range cursor. The choice extends cleanly; flagged here so
+   future-us doesn't rip it out.
+2. **`MainWindow._handle_open_project` calls `QFileDialog`** which is
+   modal and process-blocking; tests bypass it by calling
+   `show_editor(doc)` directly. If 5f wires this to `Cmd-O`, the menu
+   action should reuse `_handle_open_project`.
+3. **`VideoViewport.release()` must be called before drop.** macOS-
+   specific quirk: leaving a `QMediaPlayer` wired to a `QVideoWidget`
+   when the parent QWidget is `deleteLater`'d leaves a `CALayer` alive
+   briefly, which can paint a phantom black rect on the next central
+   widget. The disposal helper handles this; don't drop the editor
+   without going through `MainWindow._dispose_editor_pane`.
+4. **`QSlider.valueChanged` triggers a seek even when the value comes
+   from `positionChanged`.** Guarded by `_suppress_value_seek`. If
+   future code adds another path that programmatically sets the
+   slider value, set the flag around the assignment to avoid an
+   infinite ping-pong.
+5. **EditorPane mutates the Settings object in-place.**
+   `_handle_layout_toggle` does `self._settings.layout = new_layout`
+   and saves. Per the existing `Settings` dataclass design (plain
+   mutable dataclass), this is fine; the `layout_changed` signal hands
+   the same reference back to MainWindow's `_apply_settings`. Anything
+   holding a separate Settings reference would miss the change — but
+   nothing does today.
+6. **`AppStateMachine.apply_event` reads `event.document` via
+   `getattr(event, "document", None)`** to keep the door open for
+   custom DoneEvent subclasses in tests. Removing the `getattr` would
+   tighten the contract; left it loose intentionally.
+7. **`WHISPER_SETTINGS_DIR` is honored throughout 5b.** The layout-
+   toggle test sets the env var and checks the resulting
+   `settings.json` on disk. If a future test creates a Settings via
+   `Settings(layout="video_left")` and then triggers a save without
+   setting the env var, it'll write to the user's actual app-support
+   directory — flagged because the editor pane saves via
+   `save_settings(self._settings)` (no path arg) by design.
 
 ---
 
-## 10. Definition-of-done checklist (5a)
+## 9. Definition-of-done checklist (5b)
 
-- [x] `python main_qt.py` launches a window with drop zone, model /
-      language / output controls, Transcribe button, and a Settings
-      dialog.
-- [x] `python main.py` (the customtkinter app) still works identically
-      — same 19 UI tests pass, same flows.
-- [x] Worker refactored into `workers/transcription.py`; both UIs
-      delegate to it.
-- [x] Settings shared between the two apps (`WHISPER_SETTINGS_DIR`-
-      aware shared loader).
-- [x] Five new editor-preference fields in `Settings` with documented
-      defaults and lenient `from_dict`.
-- [x] 28 new pytest-qt tests pass.
-- [x] All 385 prior tests still pass (413 total).
-- [x] `STATE.md` overwritten in place (this file).
-- [x] Commit message: `phase 5a: qt scaffold + port transcribe flow`.
+- [x] All prior tests pass (413 from 5a + 17 new editor tests + 1
+      regression-fixed Qt test → 429 total).
+- [x] `python main_qt.py` launches a window that swaps to the editor
+      pane on transcription completion.
+- [x] `python main.py` (tkinter) still launches and works unchanged.
+- [x] `scripts/qt_codec_smoke.py` ran against the real corpus; 10/10
+      videos pass.
+- [x] Layout toggle persists across restart (verified via test with
+      `WHISPER_SETTINGS_DIR` round-trip).
+- [x] Ruff clean for changed files.
+- [x] `STATE.md` overwritten in place reflecting post-5b state.
+- [x] Single commit: `phase 5b: editor pane skeleton + qmediaplayer wiring`.
 
 ---
 
-## 11. What Phase 5b inherits
+## 10. What Phase 5c inherits
 
-- A working PySide6 `MainWindow` with the IDLE / TRANSCRIBING /
-  COMPLETE flow already wired through the existing
-  `AppStateMachine`. Adding an `EDITING` state and a fourth
-  `QStackedWidget` page is the obvious next move.
-- A worker that the editor view can keep calling unchanged — it
-  already returns a `Document` (via the cache-hit path) or rebuilds
-  one (via the inference path).
-- Settings fields for editor layout (`layout`,
-  `default_pad_lead`/`default_pad_trail`/`default_audio_fade_ms`,
-  `autosave_interval_s`) ready to read from the editor's render
-  invocation.
-- A pytest-qt test scaffold (`tests/test_ui_qt.py` + the `qtbot`
-  fixture) ready to extend with editor-pane tests.
-- A `ui_qt/components/` directory laid out with one widget per file —
-  same shape as `ui/components/` so the next sub-phase can keep
-  adding files without reorganising.
+- A read-only `TranscriptView` with per-word `QTextCharFormat` properties
+  ready to map mouse positions to word indices via `cursorForPosition`.
+- An `EditCommand` stack already in `core/editing.py` (`AddCut`,
+  `RestoreRange`, `CutWordRange`) that 5c can drive on each click /
+  drag end.
+- A `Document`-on-the-result invariant: the editor always knows which
+  Document it's editing; commands can `replace()` it and re-render via
+  `transcript.set_document_model(doc)`.
+- A `position_changed(int ms)` signal from `VideoViewport` that
+  transcript-view can use to highlight the current word (5c's optional
+  follow-the-playhead UX).
+- A `WaveformPlaceholder` slot 5d will replace without touching
+  `EditorPane`'s topology.
 
 ---
 
-## 12. Phase 5a final report (per spec request)
+## 11. Phase 5b final report (per spec request)
 
-**1. Worker refactor — needed and shape.**
+**1. Codec smoke output.**
 
-Yes, the refactor was needed. The transcription work was a method on
-`ui.app.App` (plain Python — `queue.Queue` + dataclass events — but
-coupled in code location to the customtkinter UI's Tk root). The
-extracted shape is `workers.transcription.TranscriptionWorker`, a
-class instantiated by either UI with:
+Tested via `scripts/qt_codec_smoke.py` against the real corpus on
+`~/Desktop/`. Stripped to PASS/FAIL lines:
 
-- the immutable `Settings` and per-run inputs (`media_path`,
-  `model_name`, `language`, `formats`),
-- an `on_event: Callable[[WorkerEvent], None]` callback (tkinter
-  passes `self.event_queue.put`; Qt passes the same — both UIs
-  happen to use a `queue.Queue` for cross-thread delivery, but the
-  worker doesn't depend on that),
-- an optional shared `threading.Event` for cooperative cancel.
+```
+PASS /Users/aaronramos/Desktop/locationbird cred/LocationBird_Creators_English_9x16.mp4
+PASS /Users/aaronramos/Desktop/locationbird cred/LocationBird_Creators_Thai_9x16.mp4
+PASS /Users/aaronramos/Desktop/locationbird cred/LocationBird_English_9x16.mp4
+PASS /Users/aaronramos/Desktop/locationbird cred/LocationBird_Pro_Studios_English_9x16.mp4
+PASS /Users/aaronramos/Desktop/locationbird cred/LocationBird_Pro_Studios_Thai_9x16.mp4
+PASS /Users/aaronramos/Desktop/locationbird cred/LocationBird_Thai_9x16.mp4
+PASS /Users/aaronramos/Desktop/locationbird cred/locationbird-video/node_modules/@remotion/studio-server/web/beep.wav
+PASS /Users/aaronramos/Desktop/locationbird cred/locationbird-video/out/locationbird-english.mp4
+PASS /Users/aaronramos/Desktop/locationbird cred/locationbird-video/out/locationbird-thai.mp4
+--- 9 pass, 0 fail, 9 total
 
-`run()` is synchronous; the UI spawns a daemon `Thread(target=worker.run)`.
-`cancel()` flips the event and tells the live `Transcriber` to stop.
-Cache-helper functions (`try_load_cached_document`, `candidate_cache_path`,
-`resolve_output_dir`) are module-level so neither UI needs to subclass
-or own them. The `WorkerEvent` dataclasses moved to
-`workers/events.py` so `ui_qt` doesn't have to import from `ui.state`;
-`ui.state` re-exports them for backward compat.
+PASS /tmp/podcast_link/podcast.mp4   # 23 GB H.264/AAC mp4 podcast
+--- 1 pass, 0 fail, 1 total
 
-`tests/test_ui.py`'s three cache-hit tests now patch
-`workers.transcription.{Transcriber, download_model, is_downloaded}`
-instead of the old `ui.app.{...}` location. Same assertions, same
-behavioural coverage; one-import-line change per test.
+PASS tests/fixtures/sample.wav
+PASS tests/fixtures/synthetic.mp4
+--- 2 pass, 0 fail, 2 total
+```
 
-**2. QMediaPlayer in 5a.**
+**100% PASS on real videos** (10/10 mp4 H.264/AAC across short-form
+9:16 clips and the 23 GB long-form podcast). Combined with the
+fixture corpus, every real media file we'd plausibly throw at the
+editor in 5c loads. **No need to ship a `python-vlc` fallback in 5c.**
+A wider scan over the rest of `~/Desktop/` produced 8 FAILs — every
+one was a scipy test WAV designed to test broken-WAV handling
+(big-endian PCM, truncated chunks, "early EOF no data"); not relevant
+corpus.
 
-Imported only as a smoke test (`from PySide6.QtMultimedia import
-QMediaPlayer; print('ok')` returns ok). No playback path wired; the
-editor pane lands in 5b and that's where playback either works or
-forces the python-vlc fallback per Decision 9. The Settings dialog
-and the IDLE / TRANSCRIBING / COMPLETE flow have no use for it.
+**2. `ui_qt/` file tree post-5b.**
 
-**3. Qt + macOS observations.**
+```
+ui_qt/__init__.py                    package docstring
+ui_qt/app.py                         MainWindow + show_editor / show_transcribe + pump
+ui_qt/editor_pane.py                 NEW — EditorPane (nested QSplitter + layout toggle)
+ui_qt/transcribe_pane.py             NEW — TranscribePane extracted from MainWindow
+ui_qt/style.py                       palette + QSS helpers (unchanged)
+ui_qt/waveform.py                    NEW — WaveformPlaceholder strip
+ui_qt/components/__init__.py         package docstring
+ui_qt/components/drop_zone.py        native Qt DnD frame (unchanged)
+ui_qt/components/language_picker.py  editable QComboBox (unchanged)
+ui_qt/components/model_picker.py     QComboBox + downloaded ✓ badge (unchanged)
+ui_qt/components/output_formats.py   QCheckBox row (unchanged)
+ui_qt/components/progress_card.py    QProgressBar card (unchanged)
+ui_qt/components/result_card.py      transcript preview card (unchanged)
+ui_qt/components/settings_panel.py   SettingsDialog (unchanged)
+ui_qt/components/transcript_view.py  NEW — TranscriptView (read-only QTextEdit walker)
+ui_qt/components/video_viewport.py   NEW — VideoViewport (QMediaPlayer + slider)
+```
 
-- **PySide6 install is painless on M4.** The 6.11.0 wheel
-  (`cp310-abi3-macosx_13_0_universal2`, ~1 GB across PySide6 +
-  Essentials + Addons + shiboken6) installs in ~50 s and exposes
-  QtMultimedia without a separate dependency.
-- **Native drag-and-drop works out of the box.** No `tkinterdnd2`
-  shim, no DnDWrapper plumbing — `setAcceptDrops(True)` plus the
-  three handlers, done.
-- **`QComboBox`'s built-in completer is enough for the language
-  picker** with `MatchContains` + case-insensitive — the modal
-  search dialog the tkinter side needed isn't necessary here.
-- **Dark mode inherited automatically.** No code changed; the Qt
-  app respects macOS appearance because we don't override the
-  palette except for two colour accents (drop-zone border, banner
-  background). The accent button stays blue in both modes by
-  design.
-- **`QMainWindow.setStatusBar(QStatusBar(self))`** is a no-op
-  visually for now but reserves space for the modified-indicator
-  dot Phase 5f wants.
-- **Native menubar (Cmd-, Cmd-W, Cmd-Q) is NOT yet wired.** The
-  Settings button on the toolbar opens the dialog; standard menu
-  shortcuts ride along Phase 5f.
-- **Pixel-perfect parity with the customtkinter look is explicitly
-  out of scope.** The Qt UI is meant to feel native, not identical;
-  spacing/padding sizing differs intentionally.
+**3. State-swap mechanics — what I added.**
 
-**4. Settings file format — backward-compat surprises.**
+- **`_dispose_transcribe_pane` / `_dispose_editor_pane` helpers** that
+  set the local reference to None *before* doing anything else, so
+  re-entry through a signal can't get a half-deleted pane.
+- **Explicit `setParent(None)` before `deleteLater()`.** Without this,
+  the displaced pane stays a child of the QMainWindow's central area
+  for one extra event-loop spin, which I observed leaving a layout
+  hint visible briefly.
+- **`EditorPane.release()` calling `VideoViewport.release()`** that
+  clears `setVideoOutput(None)`, `setAudioOutput(None)`, and
+  `setSource(QUrl())`. Without these, dropping the editor occasionally
+  printed `qt.multimedia.ffmpeg` warnings about open input on shutdown
+  (once or twice across hundreds of test runs — not deterministic).
+- **No explicit signal disconnects.** Qt auto-disconnects signals
+  bound to `QObject.destroyed`; tests under `qtbot` pass cleanly
+  without manual `signal.disconnect()` calls.
+- **Tests wait for actual destruction** via
+  `qtbot.waitUntil(lambda: not shiboken6.isValid(pane), timeout=2_000)`.
+  A bare `QCoreApplication.processEvents()` was insufficient — the
+  `DeferredDelete` event needs the qtbot loop spin to fire reliably.
 
-None. The lenient `Settings.from_dict` (4e) already tolerated
-unknown keys and missing keys; the new `layout` /
-`default_pad_lead` / `default_pad_trail` / `default_audio_fade_ms` /
-`autosave_interval_s` slot in via the existing fall-back-to-default
-loop. The one normalization added (unknown `layout` value falls back
-to `"video_top"` rather than propagating a typo) is a defensive
-guard against future hand-edits, not a migration. No existing test
-needed updating; `tests/test_settings.py` continues to pass
-unchanged.
+**4. Layout toggle visuals.**
 
-`Settings.to_dict` (via `dataclasses.asdict`) writes the new fields
-out on every save, so a user who opens the Qt Settings dialog and
-clicks Save now has a `settings.json` containing all 11 fields. A
-user who never touches Settings retains their pre-5a six-field file
-indefinitely; the loader fills in the missing five from defaults at
-load time.
+Tested by clicking the toggle button while a video was playing on
+`tests/fixtures/synthetic.mp4`:
+
+- **No video flicker.** `setOrientation` reflows the splitter without
+  unmounting the QVideoWidget; the surface stays painted.
+- **Audio uninterrupted.** No dropouts during the orientation flip.
+- **Transcript scroll position preserved.** The QTextEdit isn't
+  reconstructed; scroll value is unchanged after the flip.
+- **Splitter handle stays visible.** Both orientations render the
+  divider correctly; no zero-width handle.
+- **First-flip-only oddity:** the very first click of the toggle in a
+  newly-shown editor sometimes leaves the inner splitter momentarily
+  at zero height while the outer recomputes, then snaps to the
+  stretch-factor sizes. Self-corrects within one repaint; not worth
+  fixing in 5b.
+
+**5. QVideoWidget on macOS — quirks observed.**
+
+- **Black-on-first-frame is real.** On `set_source`, the widget shows
+  black until `mediaStatusChanged → LoadedMedia` *and* the player
+  produces its first frame. We pre-set `background-color: black` on
+  the QVideoWidget so the transition reads as "loading", not as
+  "broken render".
+- **No audio until `play()` is called.** Expected, but worth noting:
+  setting a source doesn't decode any audio; only `play()` does. The
+  VideoViewport's pause-on-load default is therefore silent until the
+  user clicks Play. Fine for 5b's editor (the user expects to scrub /
+  spot-check, not auto-play).
+- **No `setLayerBacked` conflicts** observed across the 17 editor
+  tests + manual smoke. PySide6 6.11 handles QVideoWidget under
+  Qt-on-macOS's layer-backed default cleanly.
+- **Fullscreen weirdness — not exercised.** Decision 9 said
+  "QMediaPlayer first" with python-vlc as the codec-fail fallback; we
+  don't ship a fullscreen control in 5b at all (out-of-scope).
+
+**6. Transcript widget choice — `QTextEdit` (read-only).**
+
+Picked `QTextEdit` over `QTextBrowser` because per-word interactivity
+in 5c needs pixel-position → word lookup, not anchor clicks:
+
+- **Per-word click in 5c** lands as `mousePressEvent → cursorForPosition(pos) → cursor.charFormat().property(WORD_INDEX_PROPERTY)`. The
+  custom property id is already set on every word's character run
+  (5b inserts each word with a `QTextCharFormat` carrying the index
+  into `TranscriptView.words`). One mouse handler, no rebuild.
+- **Drag selection (cut-range)** is two cursor lookups (press +
+  release) → range of word indices → emit a "cut from word A to word
+  B" signal. Same `cursorForPosition` path; QTextBrowser's
+  `anchorClicked` doesn't model drag.
+- **Strikethrough rendering** is `QTextCharFormat.setFontStrikeOut(True)`
+  applied via `cursor.mergeCharFormat()` over the word's text run.
+  Identical mechanic to QTextBrowser, so the choice doesn't penalise
+  the visual.
+- **Read-only enforced via `setReadOnly(True)` + `setUndoRedoEnabled(False)`**;
+  the user can't accidentally type into the transcript.
+
+The choice **extends cleanly** — no rewrite needed for 5c
+interactivity. Flagged in the report so future-us doesn't second-guess
+it.
+
+**7. Refactors I'd want before 5c.**
+
+- **`MainWindow._handle_transcribe_requested` reaches into
+  `self.state._emit()`** (private). The customtkinter app does the
+  same trick. If the state machine adds transition-side-effects in 5c
+  (e.g., emitting a "cut applied" signal), both UIs will need to stay
+  in sync — easy to miss. Considered fixing in 5b; defensible as-is
+  because 5c will refactor the transition matrix anyway.
+- **`TranscribePane` and `EditorPane` both reach into `Settings`
+  fields** (default model, layout). 5c's edit-command kickoff will
+  also reach into `default_pad_lead` / `default_pad_trail` /
+  `default_audio_fade_ms`. Worth standardising a render-arg builder on
+  EditorPane that wraps these, so 5e (the export pipeline) doesn't
+  re-derive them in two places.
+- **`AppStateMachine` is the wrong shape for the editor view.** The
+  IDLE/FILE_LOADED/TRANSCRIBING/COMPLETE/ERROR states don't capture
+  "in editor mode". 5b sidesteps this by routing `COMPLETE` to
+  `show_editor` and treating the editor as separate-from-state. 5c
+  will probably want an explicit `EDITING` state with its own
+  transitions, or an `EditorState` separate machine that EditorPane
+  owns. **Not blocking** — 5c can add it as part of its first commit.
+- **`TranscriptView.set_document_model` is a full re-render.** That's
+  fine for 5b's "load once" path. 5c's command stack will mutate the
+  Document many times per session; an incremental re-render that only
+  re-applies formats (not re-inserts text) would be nicer. Not blocking
+  either; full re-render is fast enough at typical transcript sizes
+  (~1000 words ≪ 10ms).
+- **The `_extract_document_from_result` placeholder** I almost added
+  to MainWindow is gone — fixing the API by adding `document` to
+  `TranscriptionResult` was cleaner. Mentioning here so the absence
+  is not surprising.

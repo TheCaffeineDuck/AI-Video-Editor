@@ -222,6 +222,7 @@ class TranscriptionWorker:
                     info=info,
                     output_files=files,
                     elapsed=elapsed,
+                    document=document,
                 )
             )
         except Exception as exc:  # noqa: BLE001
@@ -262,5 +263,6 @@ class TranscriptionWorker:
                 info=info,
                 output_files=files,
                 elapsed=elapsed,
+                document=cached,
             )
         )

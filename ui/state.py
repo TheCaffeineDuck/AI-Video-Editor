@@ -89,6 +89,10 @@ class TranscriptionResult:
     info: Any
     output_files: dict[str, Path]
     elapsed: float
+    # Phase 5b — the canonical Document carried through from the
+    # worker. Optional for tests that synthesize a TranscriptionResult
+    # without one; the worker always provides it.
+    document: Any | None = None
 
 
 @dataclass
@@ -196,6 +200,7 @@ class AppStateMachine:
                 info=event.info,
                 output_files=event.output_files,
                 elapsed=event.elapsed,
+                document=getattr(event, "document", None),
             )
             self.progress = 1.0
             self._go(AppState.COMPLETE)

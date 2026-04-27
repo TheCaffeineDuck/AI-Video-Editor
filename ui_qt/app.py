@@ -1,18 +1,25 @@
-"""PySide6 main window. Wires components, the worker thread, and the event pump.
+"""PySide6 main window. Owns settings, state machine, worker, and pane swap.
 
-The pump is a QTimer rather than ``root.after`` (Qt has no ``.after``) but
-the underlying queue and worker events are identical to the customtkinter
-side. The worker emits :class:`workers.events.WorkerEvent` values into a
-plain ``queue.Queue``; the timer drains it and dispatches to the state
-machine and the visible UI panes.
+Phase 5b restructured the window: the transcribe-flow widgets moved
+into :class:`ui_qt.transcribe_pane.TranscribePane`, and the new
+:class:`ui_qt.editor_pane.EditorPane` lives behind ``show_editor()``.
+The window swaps between the two via ``setCentralWidget`` (Decision 4
+— single window, state swap, no second window).
 
-State management piggy-backs on :class:`ui.state.AppStateMachine`. That
-class is framework-free; only the rendering side differs between the
-two UIs.
+The pump is a QTimer rather than ``root.after`` (Qt has no ``.after``)
+but the underlying queue and worker events are identical to the
+customtkinter side. The worker emits :class:`workers.events.WorkerEvent`
+values into a plain ``queue.Queue``; the timer drains it and
+dispatches to the state machine and the visible pane.
+
+State management piggy-backs on :class:`ui.state.AppStateMachine` —
+framework-free; only the rendering side differs between the two UIs.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import queue
 import threading
 from pathlib import Path
@@ -20,44 +27,38 @@ from pathlib import Path
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QApplication,
-    QLabel,
+    QFileDialog,
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QStackedWidget,
     QStatusBar,
     QToolBar,
-    QVBoxLayout,
     QWidget,
 )
 
-from core import audio
+from core.document import Document, UnsupportedSchemaError
 from core.settings import Settings, load_settings
 from ui.state import (
     AppState,
     AppStateMachine,
     pump_queue,
 )
-from ui_qt.components.drop_zone import DropZone
-from ui_qt.components.language_picker import LanguagePicker
-from ui_qt.components.model_picker import ModelPicker
-from ui_qt.components.output_formats import OutputFormatPicker
-from ui_qt.components.progress_card import ProgressCard
-from ui_qt.components.result_card import ResultCard
 from ui_qt.components.settings_panel import SettingsDialog
+from ui_qt.editor_pane import EditorPane
 from ui_qt.style import (
     WINDOW_DEFAULT_SIZE,
     WINDOW_MIN_SIZE,
     WINDOW_TITLE,
-    accent_button_qss,
 )
+from ui_qt.transcribe_pane import TranscribePane
 from workers.transcription import TranscriptionWorker
 
 PUMP_INTERVAL_MS = 100
+_LOG = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
-    """Top-level window. Owns settings, state, the worker, and the queue pump."""
+    """Top-level window. Owns settings, state, the worker, and the pane swap."""
 
     def __init__(self, *, settings: Settings | None = None) -> None:
         super().__init__()
@@ -72,152 +73,98 @@ class MainWindow(QMainWindow):
         self._worker_thread: threading.Thread | None = None
         self._cancel_requested = threading.Event()
 
+        self._transcribe_pane: TranscribePane | None = None
+        self._editor_pane: EditorPane | None = None
+
         self._build_toolbar()
-        self._build_central()
         self.setStatusBar(QStatusBar(self))
 
+        self.show_transcribe()
+
         self.state.on_change(self._render_for_state)
-        self._render_for_state(self.state.state)
 
         self._pump_timer = QTimer(self)
         self._pump_timer.setInterval(PUMP_INTERVAL_MS)
         self._pump_timer.timeout.connect(self.pump_once)
         self._pump_timer.start()
 
-    # ----- layout -----
+    # ----- accessors retained for tests + EditorPane swap detection -----
+
+    @property
+    def transcribe_pane(self) -> TranscribePane | None:
+        return self._transcribe_pane
+
+    @property
+    def editor_pane(self) -> EditorPane | None:
+        return self._editor_pane
+
+    # ----- toolbar -----
 
     def _build_toolbar(self) -> None:
         bar = QToolBar()
         bar.setMovable(False)
-        bar.addWidget(_spacer())
+        spacer = QWidget()
+        spacer.setSizePolicy(spacer.sizePolicy().horizontalPolicy(),
+                             spacer.sizePolicy().verticalPolicy())
+        bar.addWidget(spacer)
         gear = QPushButton("Settings")
         gear.setFlat(True)
         gear.clicked.connect(self._open_settings)
         bar.addWidget(gear)
         self.addToolBar(bar)
 
-    def _build_central(self) -> None:
-        central = QWidget()
-        outer = QVBoxLayout(central)
+    # ----- pane swap -----
 
-        self._error_banner = QLabel("")
-        self._error_banner.setWordWrap(True)
-        self._error_banner.setStyleSheet(
-            "background-color: #DC2626; color: white; padding: 8px;"
-            "border-radius: 4px;"
-        )
-        self._error_banner.hide()
-        outer.addWidget(self._error_banner)
+    def show_transcribe(self) -> None:
+        """Swap to a fresh TranscribePane. Releases any active editor first."""
+        self._dispose_editor_pane()
+        pane = TranscribePane(settings=self.settings, state=self.state)
+        pane.file_selected.connect(self._handle_file_selected)
+        pane.invalid_file.connect(self._handle_invalid_file)
+        pane.open_project_requested.connect(self._handle_open_project)
+        pane.transcribe_requested.connect(self._handle_transcribe_requested)
+        pane.cancel_requested.connect(self._handle_cancel)
+        pane.new_transcription_requested.connect(self._handle_new_transcription)
+        self._transcribe_pane = pane
+        self.setCentralWidget(pane)
+        self._render_for_state(self.state.state)
 
-        self._stack = QStackedWidget()
-        outer.addWidget(self._stack, stretch=1)
+    def show_editor(self, document: Document) -> None:
+        """Swap to a fresh EditorPane bound to ``document``."""
+        self._dispose_transcribe_pane()
+        editor = EditorPane(document, settings=self.settings)
+        editor.back_to_transcribe.connect(self._handle_back_from_editor)
+        editor.layout_changed.connect(self._apply_settings)
+        self._editor_pane = editor
+        self.setCentralWidget(editor)
 
-        # Idle / file-loaded view.
-        self._idle = QWidget()
-        idle_layout = QVBoxLayout(self._idle)
-        self.drop_zone = DropZone()
-        self.drop_zone.file_selected.connect(self._handle_file_selected)
-        self.drop_zone.invalid_file.connect(self._handle_invalid_file)
-        idle_layout.addWidget(self.drop_zone, stretch=1)
+    def _dispose_transcribe_pane(self) -> None:
+        if self._transcribe_pane is None:
+            return
+        old = self._transcribe_pane
+        self._transcribe_pane = None
+        old.setParent(None)
+        old.deleteLater()
 
-        self.model_picker = ModelPicker(initial=self.settings.default_model)
-        idle_layout.addWidget(self.model_picker)
-
-        self.language_picker = LanguagePicker(
-            initial_code=self.settings.default_language
-        )
-        idle_layout.addWidget(self.language_picker)
-
-        self.output_picker = OutputFormatPicker(initial=self.settings.output_formats)
-        self.output_picker.formats_changed.connect(self._handle_output_format_change)
-        idle_layout.addWidget(self.output_picker)
-
-        self.transcribe_btn = QPushButton("Transcribe")
-        self.transcribe_btn.setStyleSheet(accent_button_qss())
-        self.transcribe_btn.setMinimumHeight(44)
-        self.transcribe_btn.clicked.connect(self._handle_transcribe_click)
-        idle_layout.addWidget(self.transcribe_btn)
-
-        self._stack.addWidget(self._idle)
-
-        # Transcribing view.
-        self.progress_card = ProgressCard()
-        self.progress_card.cancel_requested.connect(self._handle_cancel)
-        self._stack.addWidget(self.progress_card)
-
-        # Complete view.
-        self.result_card = ResultCard()
-        self.result_card.new_transcription.connect(self._handle_new_transcription)
-        self._stack.addWidget(self.result_card)
-
-        self.setCentralWidget(central)
+    def _dispose_editor_pane(self) -> None:
+        if self._editor_pane is None:
+            return
+        old = self._editor_pane
+        self._editor_pane = None
+        # release() stops the player and clears its source — important on
+        # macOS to avoid a phantom video CALayer outliving the swap.
+        try:
+            old.release()
+        except RuntimeError:
+            pass
+        old.setParent(None)
+        old.deleteLater()
 
     # ----- state-driven rendering -----
 
     def _render_for_state(self, state: AppState) -> None:
-        if self.state.error_message:
-            self._error_banner.setText(f"⚠  {self.state.error_message}")
-            self._error_banner.show()
-        else:
-            self._error_banner.hide()
-
-        if state in (AppState.IDLE, AppState.FILE_LOADED, AppState.ERROR):
-            self._stack.setCurrentWidget(self._idle)
-            if state == AppState.FILE_LOADED and self.state.media_path:
-                self._show_loaded_preview(self.state.media_path)
-                self._refresh_transcribe_button("Transcribe")
-            elif state == AppState.ERROR and self.state.media_path:
-                self._show_loaded_preview(self.state.media_path)
-                self._refresh_transcribe_button("Retry")
-            else:
-                self.drop_zone.show_idle()
-                self.transcribe_btn.setText("Transcribe")
-                self.transcribe_btn.setEnabled(False)
-        elif state == AppState.TRANSCRIBING:
-            self._stack.setCurrentWidget(self.progress_card)
-            self.progress_card.set_progress(self.state.progress)
-            for line in self.state.streaming_text:
-                self.progress_card.append_stream(line)
-            self.state.streaming_text = []
-        elif state == AppState.COMPLETE:
-            self._show_result()
-            self._stack.setCurrentWidget(self.result_card)
-
-    def _refresh_transcribe_button(self, label: str) -> None:
-        if self.output_picker.has_selection:
-            self.transcribe_btn.setText(label)
-            self.transcribe_btn.setEnabled(True)
-        else:
-            self.transcribe_btn.setText(f"{label} (pick an output format)")
-            self.transcribe_btn.setEnabled(False)
-
-    def _handle_output_format_change(self, _formats: list[str]) -> None:
-        if self.state.state in (AppState.FILE_LOADED, AppState.ERROR):
-            label = "Retry" if self.state.state == AppState.ERROR else "Transcribe"
-            self._refresh_transcribe_button(label)
-
-    def _show_loaded_preview(self, path: Path) -> None:
-        try:
-            duration = audio.get_duration(path)
-        except Exception:  # noqa: BLE001
-            duration = 0.0
-        size = path.stat().st_size if path.is_file() else 0
-        self.drop_zone.show_loaded(
-            name=path.name, duration_seconds=duration, size_bytes=size
-        )
-
-    def _show_result(self) -> None:
-        result = self.state.result
-        if result is None:
-            return
-        transcript = " ".join(s.text.strip() for s in result.segments).strip()
-        language = getattr(result.info, "language", "") or "?"
-        self.result_card.show_result(
-            transcript=transcript,
-            output_files=result.output_files,
-            language=language,
-            elapsed_seconds=result.elapsed,
-        )
+        if self._transcribe_pane is not None:
+            self._transcribe_pane.render_for_state(state)
 
     # ----- user actions -----
 
@@ -237,7 +184,31 @@ class MainWindow(QMainWindow):
             self.state.error_message = None
             self._render_for_state(self.state.state)
 
-    def _handle_transcribe_click(self) -> None:
+    def _handle_open_project(self) -> None:
+        chosen, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open project",
+            "",
+            "Transcribe project (*.transcribe.json);;All files (*.*)",
+        )
+        if not chosen:
+            return
+        path = Path(chosen)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            doc = Document.from_json(data)
+        except (OSError, json.JSONDecodeError, UnsupportedSchemaError, KeyError, ValueError) as exc:
+            self._handle_invalid_file(f"Could not open {path.name}: {exc}")
+            return
+        self.show_editor(doc)
+
+    def _handle_transcribe_requested(
+        self,
+        media_path: Path,
+        model_name: str,
+        language: str | None,
+        formats: list,
+    ) -> None:
         if self.state.state == AppState.ERROR:
             self.state.error_message = None
             if self.state.media_path:
@@ -245,22 +216,17 @@ class MainWindow(QMainWindow):
                 self.state._emit()  # noqa: SLF001
         if self.state.state != AppState.FILE_LOADED:
             return
-        if not self.output_picker.has_selection:
-            self._handle_invalid_file("Select at least one output format.")
-            return
         self.state.start_transcribing()
-        self.progress_card.reset()
-        self.progress_card.set_label("Preparing…")
+        if self._transcribe_pane is not None:
+            self._transcribe_pane.reset_progress()
         self._cancel_requested.clear()
 
-        media_path = self.state.media_path
-        assert media_path is not None
         self._worker = TranscriptionWorker(
             settings=self.settings,
             media_path=media_path,
-            model_name=self.model_picker.value,
-            language=self.language_picker.selected_code,
-            formats=list(self.output_picker.formats),
+            model_name=model_name,
+            language=language,
+            formats=list(formats),
             on_event=self.event_queue.put,
             cancel_event=self._cancel_requested,
         )
@@ -279,6 +245,10 @@ class MainWindow(QMainWindow):
     def _handle_new_transcription(self) -> None:
         self.state.reset()
 
+    def _handle_back_from_editor(self) -> None:
+        self.state.reset()
+        self.show_transcribe()
+
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self, current=self.settings)
         dlg.settings_saved.connect(self._apply_settings)
@@ -286,24 +256,15 @@ class MainWindow(QMainWindow):
 
     def _apply_settings(self, new: Settings) -> None:
         self.settings = new
-        try:
-            self.model_picker.set_value(new.default_model)
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            self.language_picker.set_code(new.default_language)
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            self.output_picker.set_formats(new.output_formats)
-        except Exception:  # noqa: BLE001
-            pass
+        if self._transcribe_pane is not None:
+            self._transcribe_pane.update_settings(new)
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt API)
         self._cancel_requested.set()
         if self._worker is not None:
             self._worker.cancel()
         self._pump_timer.stop()
+        self._dispose_editor_pane()
         super().closeEvent(event)
 
     # ----- queue pump -----
@@ -311,34 +272,24 @@ class MainWindow(QMainWindow):
     def pump_once(self) -> int:
         """Drain pending events into the state machine; refresh views.
 
+        On a DoneEvent carrying a :class:`Document`, swap to the editor
+        pane. Synthetic DoneEvents in tests that pass ``document=None``
+        leave the transcribe pane's COMPLETE view visible as a fallback.
+
         Public so tests can call it without spinning the QTimer event loop.
         """
         n = pump_queue(self.event_queue, self.state)
         if n > 0:
             self._render_for_state(self.state.state)
-            if self.state.state == AppState.TRANSCRIBING:
-                self.progress_card.set_progress(
-                    self.state.progress,
-                    label=self.state.progress_label or "Transcribing…",
+            if self.state.state == AppState.TRANSCRIBING and self._transcribe_pane is not None:
+                self._transcribe_pane.show_progress_label(
+                    self.state.progress_label or "Transcribing…"
                 )
+            if self.state.state == AppState.COMPLETE and self.state.result is not None:
+                doc = getattr(self.state.result, "document", None)
+                if doc is not None:
+                    self.show_editor(doc)
         return n
-
-
-def _spacer() -> QWidget:
-    """A horizontal stretchable spacer for the toolbar."""
-    spacer = QWidget()
-    spacer.setSizePolicy(
-        spacer.sizePolicy().horizontalPolicy(),
-        spacer.sizePolicy().verticalPolicy(),
-    )
-    spacer.setMinimumWidth(0)
-    spacer.setStyleSheet("background: transparent;")
-    return spacer
-
-
-# Keep around in case tests want to assert on a notification path.
-def _notify_error(parent: QWidget, message: str) -> None:  # pragma: no cover - tiny
-    QMessageBox.critical(parent, "Transcription failed", message)
 
 
 def run() -> int:
@@ -347,3 +298,8 @@ def run() -> int:
     win = MainWindow()
     win.show()
     return app.exec()
+
+
+# Kept available for tests / future use.
+def _notify_error(parent: QWidget, message: str) -> None:  # pragma: no cover - tiny
+    QMessageBox.critical(parent, "Transcription failed", message)
