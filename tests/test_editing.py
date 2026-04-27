@@ -1,22 +1,37 @@
-"""Tests for core.editing — edit commands, immutability, command stack."""
+"""Tests for ``core.editing`` — v2 edit commands, immutability, command stack.
+
+Phase 4f-3 rewrote every edit command against the v2 keep-range model:
+
+- ``AddCut`` now subtracts an interval from ``doc.ranges`` instead of
+  appending a CutMark.
+- ``RestoreRange`` replaces v1's ``RemoveCut(index=…)`` (which indexed
+  into the cut list — a list that no longer exists in v2).
+- ``MergeAdjacentCuts`` is gone; v2 ranges are canonicalized at every
+  edit so the explicit "merge close cuts" command had no remaining job.
+- ``CutWordRange`` resolves a word range to ``(start, end)`` and calls
+  the same subtract path as ``AddCut``.
+
+All command tests below assert against ``doc.ranges`` rather than
+``doc.cuts``.
+"""
 
 from __future__ import annotations
 
 import dataclasses
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from core.document import CutMark, Document, Segment, Word
+from core.document import Document, MediaSource, Range, Segment, Word
 from core.editing import (
     AddCut,
     CommandStack,
     CutWordRange,
     EditCommand,
-    MergeAdjacentCuts,
-    RemoveCut,
+    RestoreRange,
 )
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -26,9 +41,10 @@ from core.editing import (
 def _doc(
     *,
     segments: list[Segment] | None = None,
-    cuts: list[CutMark] | None = None,
+    ranges: list[Range] | None = None,
+    duration: float = 5.0,
 ) -> Document:
-    """A minimal Document for command tests."""
+    """A minimal v2 Document for command tests."""
     if segments is None:
         segments = [
             Segment(
@@ -44,27 +60,27 @@ def _doc(
                 ),
             ),
         ]
+    if ranges is None:
+        ranges = [Range(source_id="src0", start=0.0, end=duration)]
     return Document(
-        media_path=Path("/tmp/test.wav"),
-        duration=5.0,
-        language="en",
+        sources={"src0": MediaSource(id="src0", path=Path("/tmp/test.wav"), duration=duration)},
         segments=segments,
-        cuts=list(cuts) if cuts is not None else [],
-        created_at=datetime(2026, 4, 26, 10, 0, 0),
+        ranges=list(ranges),
+        language="en",
+        created_at=datetime(2026, 4, 26, 10, 0, 0, tzinfo=UTC),
         model_name="tiny",
     )
 
 
 # ---------------------------------------------------------------------------
-# Document immutability — Phase 4c contract
+# Document immutability
 # ---------------------------------------------------------------------------
 
 
 def test_document_is_frozen():
-    """Reassigning a frozen Document field must raise."""
     d = _doc()
     with pytest.raises(dataclasses.FrozenInstanceError):
-        d.cuts = []  # type: ignore[misc]
+        d.ranges = []  # type: ignore[misc]
 
 
 def test_document_segments_is_frozen():
@@ -73,24 +89,13 @@ def test_document_segments_is_frozen():
         d.segments = []  # type: ignore[misc]
 
 
-def test_apply_does_not_mutate_original_cuts_list():
-    """The original Document's cuts list is never the same object as the new one's."""
-    d1 = _doc(cuts=[CutMark(0.0, 0.5, "x")])
-    cmd = AddCut(start=2.0, end=2.5, reason="y")
+def test_apply_does_not_mutate_original_ranges_list():
+    d1 = _doc()
+    cmd = AddCut(start=2.0, end=2.5)
     d2 = cmd.apply(d1)
-    assert d1.cuts is not d2.cuts
-    # And mutating d2.cuts must not affect d1.cuts.
-    d2.cuts.append(CutMark(99.0, 100.0))
-    assert len(d1.cuts) == 1
-    assert d1.cuts[0] == CutMark(0.0, 0.5, "x")
-
-
-def test_remove_cut_does_not_mutate_original():
-    d1 = _doc(cuts=[CutMark(0.0, 0.5), CutMark(1.0, 1.5)])
-    d2 = RemoveCut(index=0).apply(d1)
-    assert d1.cuts is not d2.cuts
-    assert len(d1.cuts) == 2  # unchanged
-    assert len(d2.cuts) == 1
+    assert d1.ranges is not d2.ranges
+    d2.ranges.append(Range(source_id="src0", start=99.0, end=100.0))
+    assert all(r.start < 99.0 for r in d1.ranges)
 
 
 # ---------------------------------------------------------------------------
@@ -98,169 +103,93 @@ def test_remove_cut_does_not_mutate_original():
 # ---------------------------------------------------------------------------
 
 
-def test_add_cut_appends():
+def test_add_cut_subtracts_from_full_range():
+    d2 = AddCut(start=1.0, end=2.0).apply(_doc())
+    assert d2.ranges == [
+        Range(source_id="src0", start=0.0, end=1.0),
+        Range(source_id="src0", start=2.0, end=5.0),
+    ]
+
+
+def test_add_cut_round_trip_restores_original_ranges():
     d1 = _doc()
-    d2 = AddCut(start=1.0, end=2.0, reason="filler").apply(d1)
-    assert len(d2.cuts) == 1
-    assert d2.cuts[0] == CutMark(start=1.0, end=2.0, reason="filler")
+    cmd = AddCut(start=2.0, end=3.0)
+    d2 = cmd.apply(d1)
+    d3 = cmd.revert(d2)
+    assert d3 == d1
+
+
+def test_add_cut_revert_before_apply_raises():
+    with pytest.raises(RuntimeError, match="before apply"):
+        AddCut(start=10.0, end=11.0).revert(_doc())
 
 
 def test_add_cut_default_reason_is_manual():
-    d2 = AddCut(start=0.0, end=1.0).apply(_doc())
-    assert d2.cuts[0].reason == "manual"
-
-
-def test_add_cut_round_trip():
-    d1 = _doc(cuts=[CutMark(0.0, 0.5, "existing")])
-    cmd = AddCut(start=2.0, end=3.0, reason="filler")
-    d2 = cmd.apply(d1)
-    d3 = cmd.revert(d2)
-    assert d3 == d1
-
-
-def test_add_cut_revert_when_target_missing_raises():
-    cmd = AddCut(start=10.0, end=11.0, reason="manual")
-    with pytest.raises(ValueError, match="no matching cut"):
-        cmd.revert(_doc())  # never applied — there's nothing to remove
+    """Reason is informational on the command instance; it doesn't have
+    to land anywhere visible since v2 reasons live on Range objects."""
+    cmd = AddCut(start=0.0, end=1.0)
+    assert cmd.reason == "manual"
 
 
 def test_add_cut_description():
-    cmd = AddCut(start=1.234, end=2.345, reason="manual")
+    cmd = AddCut(start=1.234, end=2.345)
     assert "1.23" in cmd.description and "2.35" in cmd.description
 
 
+def test_add_cut_on_already_partial_timeline():
+    """Subtract from a non-trivial starting timeline."""
+    d1 = _doc(
+        ranges=[
+            Range(source_id="src0", start=0.0, end=2.0),
+            Range(source_id="src0", start=3.0, end=5.0),
+        ]
+    )
+    d2 = AddCut(start=0.5, end=1.0).apply(d1)
+    assert d2.ranges == [
+        Range(source_id="src0", start=0.0, end=0.5),
+        Range(source_id="src0", start=1.0, end=2.0),
+        Range(source_id="src0", start=3.0, end=5.0),
+    ]
+
+
 # ---------------------------------------------------------------------------
-# RemoveCut
+# RestoreRange
 # ---------------------------------------------------------------------------
 
 
-def test_remove_cut_removes_at_index():
-    d1 = _doc(cuts=[
-        CutMark(0.0, 0.5, "a"),
-        CutMark(1.0, 1.5, "b"),
-        CutMark(2.0, 2.5, "c"),
-    ])
-    d2 = RemoveCut(index=1).apply(d1)
-    assert [c.reason for c in d2.cuts] == ["a", "c"]
+def test_restore_range_into_gap_unions_back():
+    d1 = _doc(
+        ranges=[
+            Range(source_id="src0", start=0.0, end=2.0),
+            Range(source_id="src0", start=3.0, end=5.0),
+        ]
+    )
+    d2 = RestoreRange(start=2.0, end=3.0).apply(d1)
+    # Touching adjacents merge into a single full-duration range.
+    assert d2.ranges == [Range(source_id="src0", start=0.0, end=5.0)]
 
 
-def test_remove_cut_invalid_index_raises():
-    d1 = _doc(cuts=[CutMark(0.0, 0.5)])
-    with pytest.raises(IndexError):
-        RemoveCut(index=5).apply(d1)
-
-
-def test_remove_cut_revert_before_apply_raises():
-    cmd = RemoveCut(index=0)
-    with pytest.raises(RuntimeError, match="before apply"):
-        cmd.revert(_doc())
-
-
-def test_remove_cut_round_trip_preserves_position():
-    d1 = _doc(cuts=[
-        CutMark(0.0, 0.5, "a"),
-        CutMark(1.0, 1.5, "b"),
-        CutMark(2.0, 2.5, "c"),
-    ])
-    cmd = RemoveCut(index=1)
+def test_restore_range_round_trip():
+    d1 = _doc(
+        ranges=[
+            Range(source_id="src0", start=0.0, end=2.0),
+            Range(source_id="src0", start=3.0, end=5.0),
+        ]
+    )
+    cmd = RestoreRange(start=2.0, end=3.0)
     d2 = cmd.apply(d1)
     d3 = cmd.revert(d2)
     assert d3 == d1
-    # And specifically, "b" went back into the middle, not the end.
-    assert [c.reason for c in d3.cuts] == ["a", "b", "c"]
 
 
-# ---------------------------------------------------------------------------
-# MergeAdjacentCuts
-# ---------------------------------------------------------------------------
-
-
-def test_merge_adjacent_cuts_three_cuts_partial_merge():
-    """A and B merge (gap 0.1s); C is far enough away to stay separate."""
-    cuts = [
-        CutMark(0.0, 1.0, "a"),
-        CutMark(1.1, 2.0, "b"),    # gap 0.1s — merges with A
-        CutMark(5.0, 6.0, "c"),    # gap 3.0s — stays separate
-    ]
-    d2 = MergeAdjacentCuts(threshold_seconds=0.30).apply(_doc(cuts=cuts))
-    assert len(d2.cuts) == 2
-    assert d2.cuts[0] == CutMark(0.0, 2.0, "a")  # A's reason wins
-    assert d2.cuts[1] == CutMark(5.0, 6.0, "c")
-
-
-def test_merge_is_order_independent():
-    forward = [
-        CutMark(0.0, 1.0, "a"),
-        CutMark(1.1, 2.0, "b"),
-        CutMark(5.0, 6.0, "c"),
-    ]
-    reversed_input = list(reversed(forward))
-    out_a = MergeAdjacentCuts(0.30).apply(_doc(cuts=forward)).cuts
-    out_b = MergeAdjacentCuts(0.30).apply(_doc(cuts=reversed_input)).cuts
-    assert out_a == out_b
-
-
-def test_merge_overlapping_cuts_always_merge_regardless_of_threshold():
-    """Overlap (B.start < A.end) must merge even when threshold is 0."""
-    cuts = [
-        CutMark(0.0, 2.0, "a"),
-        CutMark(1.0, 3.0, "b"),  # overlaps A
-    ]
-    d2 = MergeAdjacentCuts(threshold_seconds=0.0).apply(_doc(cuts=cuts))
-    assert len(d2.cuts) == 1
-    assert d2.cuts[0] == CutMark(0.0, 3.0, "a")
-
-
-def test_merge_overlap_keeps_max_end():
-    """If B is wholly inside A, merged.end stays at A.end (not B.end)."""
-    cuts = [
-        CutMark(0.0, 5.0, "outer"),
-        CutMark(1.0, 2.0, "inner"),  # wholly inside outer
-    ]
-    d2 = MergeAdjacentCuts(threshold_seconds=0.0).apply(_doc(cuts=cuts))
-    assert len(d2.cuts) == 1
-    assert d2.cuts[0] == CutMark(0.0, 5.0, "outer")
-
-
-def test_merge_threshold_zero_only_merges_exact_touch():
-    """gap == 0 (touching) merges; gap == 0.001 doesn't."""
-    touching = MergeAdjacentCuts(0.0).apply(_doc(cuts=[
-        CutMark(0.0, 1.0, "a"),
-        CutMark(1.0, 2.0, "b"),  # touches A exactly
-    ])).cuts
-    assert len(touching) == 1
-
-    not_touching = MergeAdjacentCuts(0.0).apply(_doc(cuts=[
-        CutMark(0.0, 1.0, "a"),
-        CutMark(1.001, 2.0, "b"),
-    ])).cuts
-    assert len(not_touching) == 2
-
-
-def test_merge_round_trip_preserves_original_cuts():
-    cuts = [
-        CutMark(0.0, 1.0, "a"),
-        CutMark(1.1, 2.0, "b"),
-        CutMark(5.0, 6.0, "c"),
-    ]
-    d1 = _doc(cuts=cuts)
-    cmd = MergeAdjacentCuts(threshold_seconds=0.30)
-    d2 = cmd.apply(d1)
-    d3 = cmd.revert(d2)
-    assert d3 == d1
-    # Order preserved (we captured the original list, not a sorted view).
-    assert d3.cuts == cuts
-
-
-def test_merge_revert_before_apply_raises():
+def test_restore_range_revert_before_apply_raises():
     with pytest.raises(RuntimeError, match="before apply"):
-        MergeAdjacentCuts(0.5).revert(_doc())
+        RestoreRange(start=0.0, end=1.0).revert(_doc())
 
 
-def test_merge_empty_cuts_is_noop():
-    d1 = _doc(cuts=[])
-    d2 = MergeAdjacentCuts(1.0).apply(d1)
-    assert d2.cuts == []
+def test_restore_range_description():
+    cmd = RestoreRange(start=1.0, end=2.0)
+    assert "1.00" in cmd.description and "2.00" in cmd.description
 
 
 # ---------------------------------------------------------------------------
@@ -269,38 +198,37 @@ def test_merge_empty_cuts_is_noop():
 
 
 def test_cut_word_range_single_word():
-    """start == end picks exactly one word."""
     d2 = CutWordRange(seg_idx=0, word_start_idx=2, word_end_idx=2).apply(_doc())
-    assert len(d2.cuts) == 1
-    # Word "foo" at 2.0-3.0
-    assert d2.cuts[0].start == pytest.approx(2.0)
-    assert d2.cuts[0].end == pytest.approx(3.0)
+    # Word "foo" at 2.0–3.0; subtracted from full range.
+    assert d2.ranges == [
+        Range(source_id="src0", start=0.0, end=2.0),
+        Range(source_id="src0", start=3.0, end=5.0),
+    ]
 
 
 def test_cut_word_range_first_word():
     d2 = CutWordRange(seg_idx=0, word_start_idx=0, word_end_idx=0).apply(_doc())
-    assert d2.cuts[0].start == pytest.approx(0.0)
-    assert d2.cuts[0].end == pytest.approx(1.0)
+    assert d2.ranges == [Range(source_id="src0", start=1.0, end=5.0)]
 
 
 def test_cut_word_range_last_word():
     d2 = CutWordRange(seg_idx=0, word_start_idx=4, word_end_idx=4).apply(_doc())
-    assert d2.cuts[0].start == pytest.approx(4.0)
-    assert d2.cuts[0].end == pytest.approx(5.0)
+    assert d2.ranges == [Range(source_id="src0", start=0.0, end=4.0)]
 
 
 def test_cut_word_range_all_words():
     d2 = CutWordRange(seg_idx=0, word_start_idx=0, word_end_idx=4).apply(_doc())
-    assert d2.cuts[0].start == pytest.approx(0.0)
-    assert d2.cuts[0].end == pytest.approx(5.0)
+    # Subtracting (0, 5) from (0, 5) leaves an empty timeline.
+    assert d2.ranges == []
 
 
 def test_cut_word_range_inclusive_endpoints():
-    """words 1..3 must span words 1, 2, AND 3 (inclusive)."""
     d2 = CutWordRange(seg_idx=0, word_start_idx=1, word_end_idx=3).apply(_doc())
-    # Spans "world" (1-2), "foo" (2-3), "bar" (3-4) → 1.0..4.0.
-    assert d2.cuts[0].start == pytest.approx(1.0)
-    assert d2.cuts[0].end == pytest.approx(4.0)
+    # Spans words "world" (1–2), "foo" (2–3), "bar" (3–4) → cut (1, 4).
+    assert d2.ranges == [
+        Range(source_id="src0", start=0.0, end=1.0),
+        Range(source_id="src0", start=4.0, end=5.0),
+    ]
 
 
 def test_cut_word_range_invalid_seg_idx_raises():
@@ -314,7 +242,6 @@ def test_cut_word_range_word_idx_out_of_range_raises():
 
 
 def test_cut_word_range_inverted_range_raises():
-    """end < start is invalid."""
     with pytest.raises(ValueError, match="word range"):
         CutWordRange(seg_idx=0, word_start_idx=3, word_end_idx=1).apply(_doc())
 
@@ -339,16 +266,18 @@ def test_cut_word_range_round_trip():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("cmd", [
-    AddCut(start=0.0, end=1.0),
-    RemoveCut(index=0),
-    MergeAdjacentCuts(threshold_seconds=0.5),
-    CutWordRange(seg_idx=0, word_start_idx=0, word_end_idx=0),
-])
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        AddCut(start=0.0, end=1.0),
+        RestoreRange(start=0.0, end=1.0),
+        CutWordRange(seg_idx=0, word_start_idx=0, word_end_idx=0),
+    ],
+)
 def test_command_satisfies_protocol(cmd):
     assert isinstance(cmd, EditCommand)
     assert isinstance(cmd.description, str)
-    assert cmd.description  # non-empty
+    assert cmd.description
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +286,7 @@ def test_command_satisfies_protocol(cmd):
 
 
 def _push(stack: CommandStack, cmd: EditCommand, before: Document) -> Document:
-    """Helper: apply, push, return the new doc."""
+    """Apply, push, return the new doc."""
     after = cmd.apply(before)
     stack.push(cmd, before, after)
     return after
@@ -392,8 +321,8 @@ def test_stack_undo_then_redo():
 def test_stack_two_pushes_undo_undo_redo():
     s = CommandStack()
     d0 = _doc()
-    d1 = _push(s, AddCut(0.0, 1.0, "a"), d0)
-    d2 = _push(s, AddCut(2.0, 3.0, "b"), d1)
+    d1 = _push(s, AddCut(0.0, 0.5), d0)
+    d2 = _push(s, AddCut(2.0, 2.5), d1)
     assert s.undo() == d1
     assert s.undo() == d0
     assert s.redo() == d1
@@ -405,17 +334,14 @@ def test_stack_fork_discards_redo_branch():
     """User does A→B→C, undoes back to A, then does D — B and C are gone forever."""
     s = CommandStack()
     d0 = _doc()
-    d1 = _push(s, AddCut(0.0, 1.0, "A"), d0)
-    d2 = _push(s, AddCut(1.0, 2.0, "B"), d1)
-    _push(s, AddCut(2.0, 3.0, "C"), d2)
-    # Undo back to d1 (after A, before B).
+    d1 = _push(s, AddCut(0.0, 0.5), d0)
+    d2 = _push(s, AddCut(1.0, 1.5), d1)
+    _push(s, AddCut(2.0, 2.5), d2)
     assert s.undo() == d2
     assert s.undo() == d1
     assert s.can_redo
-    # New command D pushed — redo branch must be wiped.
-    _push(s, AddCut(10.0, 11.0, "D"), d1)
+    _push(s, AddCut(3.0, 3.5), d1)
     assert not s.can_redo, "fork must discard redo stack"
-    # And we cannot redo our way to B or C — only undo back to d1, then d0.
     assert s.undo() == d1
     assert s.undo() == d0
     assert s.undo() is None
@@ -423,17 +349,20 @@ def test_stack_fork_discards_redo_branch():
 
 def test_stack_max_depth_enforced():
     s = CommandStack(max_depth=3)
-    d0 = _doc()
+    d0 = _doc(duration=10.0)
     docs = [d0]
     for i in range(5):
-        new = _push(s, AddCut(float(i), float(i) + 0.5, f"c{i}"), docs[-1])
+        new = _push(
+            s,
+            AddCut(start=float(i) * 1.5, end=float(i) * 1.5 + 0.5),
+            docs[-1],
+        )
         docs.append(new)
-    # Only the last 3 entries are kept; we can undo 3 times max.
     assert s.undo_depth == 3
-    assert s.undo() == docs[4]  # transitions back from d5 to d4
+    assert s.undo() == docs[4]
     assert s.undo() == docs[3]
     assert s.undo() == docs[2]
-    assert s.undo() is None  # the older two transitions were dropped
+    assert s.undo() is None
 
 
 def test_stack_max_depth_must_be_positive():
@@ -456,21 +385,21 @@ def test_stack_clear_drops_both_branches():
 
 
 def test_stack_undo_redo_works_with_mixed_commands():
-    """A realistic sequence: AddCut, RemoveCut, MergeAdjacentCuts."""
+    """A realistic sequence: AddCut, AddCut, RestoreRange (undoes the second cut)."""
     s = CommandStack()
     d0 = _doc()
-    add1 = AddCut(0.0, 1.0, "a")
-    add2 = AddCut(1.1, 2.0, "b")
-    merge = MergeAdjacentCuts(0.2)
+    add1 = AddCut(0.0, 1.0)
+    add2 = AddCut(2.0, 3.0)
+    restore = RestoreRange(2.0, 3.0)
 
     d1 = _push(s, add1, d0)
     d2 = _push(s, add2, d1)
-    d3 = _push(s, merge, d2)
-    assert len(d3.cuts) == 1  # merged
+    d3 = _push(s, restore, d2)
+    assert d3.ranges == d1.ranges  # restore undid the second cut
 
-    assert s.undo() == d2  # un-merged
-    assert s.undo() == d1  # un-added second
-    assert s.undo() == d0  # back to start
+    assert s.undo() == d2  # un-restore (cut is back)
+    assert s.undo() == d1
+    assert s.undo() == d0
     assert s.redo() == d1
     assert s.redo() == d2
     assert s.redo() == d3

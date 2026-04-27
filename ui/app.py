@@ -485,7 +485,8 @@ class App:
         if "json" in formats:
             files["json"] = self._candidate_cache_path(media_path)
         elapsed = time.monotonic() - start
-        info = _CachedInfo(language=cached.language, duration=cached.duration)
+        primary_source = next(iter(cached.sources.values()))
+        info = _CachedInfo(language=cached.language, duration=primary_source.duration)
         self.event_queue.put(
             DoneEvent(
                 segments=list(cached.segments),

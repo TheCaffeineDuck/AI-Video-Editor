@@ -250,7 +250,7 @@ def test_end_to_end_writes_loadable_transcribe_json(tmp_path: Path):
     import shutil
 
     from core import exporters
-    from core.document import Document, build_document
+    from core.document import Document, Range, build_document
 
     # Copy the fixture into tmp so we write its outputs alongside without
     # polluting the repo.
@@ -281,11 +281,15 @@ def test_end_to_end_writes_loadable_transcribe_json(tmp_path: Path):
     assert json_path.is_file()
 
     restored = Document.from_json(json.loads(json_path.read_text()))
-    assert restored.media_path == src
+    src_entry = restored.sources["src0"]
+    assert src_entry.path == src
+    assert src_entry.duration == pytest.approx(info.duration, abs=0.05)
     assert restored.language == info.language
-    assert restored.duration == pytest.approx(info.duration, abs=0.05)
     assert restored.model_name == "tiny"
-    assert restored.cuts == []
+    # Initial timeline is one full-duration keep-range — no edits applied.
+    assert restored.ranges == [
+        Range(source_id="src0", start=0.0, end=src_entry.duration),
+    ]
     # Word-level data flows through end-to-end:
     flat_words = [w for s in restored.segments for w in s.words]
     assert flat_words, "expected word-level timestamps to round-trip through JSON"

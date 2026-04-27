@@ -1,21 +1,35 @@
-"""Edit operations and undo/redo command stack for transcript Documents.
+"""Edit operations and undo/redo command stack for v2 transcript Documents.
+
+A v2 :class:`~core.document.Document` stores ``ranges`` — what to KEEP —
+not ``cuts`` — what to remove. Phase 4f-3 rewrote every edit command
+against this model. Each command now reduces to a single call to one of
+the helpers in :mod:`core.timeline`:
+
+- :class:`AddCut` (remove an interval) → :func:`~core.timeline.subtract_interval`
+- :class:`RestoreRange` (re-insert a previously-removed interval) → :func:`~core.timeline.union_interval`
+- :class:`CutWordRange` (word-bounded :class:`AddCut`) → :func:`~core.timeline.subtract_interval`
+
+The ``apply``/``revert`` symmetry is preserved by capturing the prior
+``ranges`` list on apply and restoring it on revert. This is simpler and
+more obviously-correct than computing inverses of the timeline math.
+
+``MergeAdjacentCuts`` from v1 is **gone**, not renamed. v1 used it
+internally to canonicalize the cut list before render; v2's timeline is
+canonicalized on every edit (the helpers always produce sorted,
+non-overlapping output), and the render-time "absorb sub-merge_gap
+gaps" behavior moved into :mod:`core.render` as a non-command helper.
+The phase 4f-3 final report explains the choice.
 
 Documents are immutable from the operations' perspective: every
-``apply`` / ``revert`` returns a *new* :class:`~core.document.Document`
-via :func:`dataclasses.replace`, and the ``cuts`` / ``segments`` fields
-are always rebuilt as fresh lists rather than mutated in place. The
-Document itself is ``frozen=True`` (see :mod:`core.document`), which
-prevents accidental ``doc.cuts = [...]`` reassignment but does *not*
-prevent ``doc.cuts.append(...)`` — every command in this module is
-responsible for never appending to an existing Document's lists.
+``apply`` / ``revert`` returns a *new* Document via
+:func:`dataclasses.replace`. The ``ranges`` / ``segments`` fields are
+always rebuilt as fresh lists rather than mutated in place.
 
-Command stack semantics — fork discards redo:
-
-When the user does A → B → C, undoes back to A, then performs a new
-command D, the redo branch (B, C) is discarded permanently. This is the
-standard behavior of every text editor and browser; users can't redo
-their way back to an abandoned timeline. Implemented explicitly here so
-nobody is tempted to "preserve" the redo branch on push.
+Command stack semantics — fork discards redo: when the user does
+A → B → C, undoes back to A, then performs a new command D, the redo
+branch (B, C) is discarded permanently. Standard text-editor /
+browser behavior. Implemented explicitly so nobody is tempted to
+"preserve" the redo branch on push.
 """
 
 from __future__ import annotations
@@ -24,7 +38,10 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from typing import Protocol, runtime_checkable
 
-from core.document import CutMark, Document
+from core.document import Document, Range
+from core.timeline import subtract_interval, union_interval
+
+_DEFAULT_SOURCE_ID = "src0"
 
 
 @runtime_checkable
@@ -43,137 +60,107 @@ class EditCommand(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# Cut-list commands
+# Range-based commands
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class AddCut:
-    """Append a new :class:`CutMark` with the given range and reason."""
+    """Remove the interval ``[start, end]`` from the timeline.
+
+    Reduces to :func:`~core.timeline.subtract_interval`. The legacy v1
+    name is preserved so callers (and undo-history descriptions) read
+    the same; the implementation now operates on keep-ranges instead of
+    appending a CutMark.
+
+    ``revert`` restores the pre-apply ``ranges`` list verbatim (captured
+    on apply) — simpler and obviously-correct than inverting the
+    subtraction in the multi-range / split case.
+    """
 
     start: float
     end: float
     reason: str = "manual"
+    source_id: str = _DEFAULT_SOURCE_ID
+    _captured: list[Range] | None = field(default=None, repr=False, compare=False)
 
     @property
     def description(self) -> str:
         return f"Add cut [{self.start:.2f}–{self.end:.2f}]"
 
-    def _target(self) -> CutMark:
-        return CutMark(start=self.start, end=self.end, reason=self.reason)
-
     def apply(self, doc: Document) -> Document:
-        return replace(doc, cuts=[*doc.cuts, self._target()])
-
-    def revert(self, doc: Document) -> Document:
-        target = self._target()
-        new_cuts = list(doc.cuts)
-        for i in range(len(new_cuts) - 1, -1, -1):
-            if new_cuts[i] == target:
-                new_cuts.pop(i)
-                return replace(doc, cuts=new_cuts)
-        raise ValueError(f"AddCut.revert: no matching cut to remove ({target!r})")
-
-
-@dataclass
-class RemoveCut:
-    """Remove the :class:`CutMark` at ``index`` and remember it for revert.
-
-    ``revert`` re-inserts the captured cut at its original index, so a
-    round-trip ``apply → revert`` produces an equal Document.
-    """
-
-    index: int
-    _captured: CutMark | None = field(default=None, repr=False, compare=False)
-
-    @property
-    def description(self) -> str:
-        return f"Remove cut #{self.index}"
-
-    def apply(self, doc: Document) -> Document:
-        if not (0 <= self.index < len(doc.cuts)):
-            raise IndexError(
-                f"cut index {self.index} out of range (have {len(doc.cuts)} cuts)"
-            )
-        self._captured = doc.cuts[self.index]
-        new_cuts = [c for i, c in enumerate(doc.cuts) if i != self.index]
-        return replace(doc, cuts=new_cuts)
+        self._captured = list(doc.ranges)
+        new_ranges = subtract_interval(
+            doc.ranges, (self.start, self.end), self.source_id
+        )
+        return replace(doc, ranges=new_ranges)
 
     def revert(self, doc: Document) -> Document:
         if self._captured is None:
-            raise RuntimeError("RemoveCut.revert called before apply")
-        new_cuts = list(doc.cuts)
-        new_cuts.insert(self.index, self._captured)
-        return replace(doc, cuts=new_cuts)
+            raise RuntimeError("AddCut.revert called before apply")
+        return replace(doc, ranges=list(self._captured))
 
 
 @dataclass
-class MergeAdjacentCuts:
-    """Collapse cuts that are within ``threshold_seconds`` of each other.
+class RestoreRange:
+    """Re-insert the interval ``[start, end]`` into the timeline.
 
-    Mergeability rule (deterministic, order-independent):
+    The inverse of :class:`AddCut` for the case where a user un-cuts
+    something. Reduces to :func:`~core.timeline.union_interval`. The
+    captured pre-apply ``ranges`` drives ``revert``.
 
-    * Sort all cuts by ``start`` time first.
-    * For consecutive cuts ``A`` (already in the merged list) and ``B``
-      (next in sorted order), they merge iff ``B.start - A.end <= threshold``.
-    * Overlapping cuts (``B.start < A.end``) always merge — the gap is
-      negative, which is ``<= threshold`` for any non-negative threshold.
-    * Merged cut: ``start = A.start``, ``end = max(A.end, B.end)``,
-      ``reason = A.reason`` (the first cut's reason wins, deterministically).
-
-    Captures the pre-apply ``cuts`` list so ``revert`` can restore it
-    exactly. (We can't recompute the inverse — merging is destructive.)
+    Replaces v1's ``RemoveCut(index=…)``. v1 indexed into the cut list;
+    v2 has no cut list, so the API is now interval-based — same shape as
+    :class:`AddCut`, opposite operation.
     """
 
-    threshold_seconds: float
-    _captured: list[CutMark] | None = field(default=None, repr=False, compare=False)
+    start: float
+    end: float
+    source_id: str = _DEFAULT_SOURCE_ID
+    _captured: list[Range] | None = field(default=None, repr=False, compare=False)
 
     @property
     def description(self) -> str:
-        return f"Merge cuts within {self.threshold_seconds:.2f}s"
+        return f"Restore range [{self.start:.2f}–{self.end:.2f}]"
 
     def apply(self, doc: Document) -> Document:
-        self._captured = list(doc.cuts)
-        sorted_cuts = sorted(doc.cuts, key=lambda c: c.start)
-        merged: list[CutMark] = []
-        for cut in sorted_cuts:
-            if merged:
-                last = merged[-1]
-                gap = cut.start - last.end
-                if gap <= self.threshold_seconds:
-                    merged[-1] = CutMark(
-                        start=last.start,
-                        end=max(last.end, cut.end),
-                        reason=last.reason,
-                    )
-                    continue
-            merged.append(cut)
-        return replace(doc, cuts=merged)
+        self._captured = list(doc.ranges)
+        new_ranges = union_interval(
+            doc.ranges, (self.start, self.end), self.source_id
+        )
+        return replace(doc, ranges=new_ranges)
 
     def revert(self, doc: Document) -> Document:
         if self._captured is None:
-            raise RuntimeError("MergeAdjacentCuts.revert called before apply")
-        return replace(doc, cuts=list(self._captured))
+            raise RuntimeError("RestoreRange.revert called before apply")
+        return replace(doc, ranges=list(self._captured))
 
 
 @dataclass
 class CutWordRange:
-    """Add a :class:`CutMark` spanning a range of words within a single segment.
+    """Cut a range of words within a single segment.
 
     Indexing rule — INCLUSIVE on both ends:
         Cutting words 3..5 of a segment removes words 3, 4, AND 5.
-        ``CutMark.start = segments[seg_idx].words[word_start_idx].start``
-        ``CutMark.end   = segments[seg_idx].words[word_end_idx].end``
+        Removed interval start = ``segments[seg_idx].words[word_start_idx].start``
+        Removed interval end   = ``segments[seg_idx].words[word_end_idx].end``
 
     Cross-segment ranges raise :class:`ValueError` — a future
     ``CutWordRangeMultiSegment`` command will handle that case once the
     editor view requires it.
+
+    The "Never cut inside a word" rule is enforced two ways: this command
+    constructs intervals on word boundaries by definition, and
+    :func:`core.render._snap_cuts_to_word_boundaries` snaps low-level
+    callers' boundaries at render-time so neither path can violate it.
     """
 
     seg_idx: int
     word_start_idx: int
     word_end_idx: int
     reason: str = "manual"
+    source_id: str = _DEFAULT_SOURCE_ID
+    _captured: list[Range] | None = field(default=None, repr=False, compare=False)
 
     @property
     def description(self) -> str:
@@ -182,7 +169,7 @@ class CutWordRange:
             f"of segment {self.seg_idx}"
         )
 
-    def _resolve(self, doc: Document) -> CutMark:
+    def _resolve_interval(self, doc: Document) -> tuple[float, float]:
         if not (0 <= self.seg_idx < len(doc.segments)):
             raise ValueError(
                 f"seg_idx {self.seg_idx} out of range "
@@ -199,24 +186,21 @@ class CutWordRange:
                 f"word range [{self.word_start_idx}, {self.word_end_idx}] "
                 f"out of segment {self.seg_idx} (which has {n_words} words)"
             )
-        return CutMark(
-            start=seg.words[self.word_start_idx].start,
-            end=seg.words[self.word_end_idx].end,
-            reason=self.reason,
+        return (
+            seg.words[self.word_start_idx].start,
+            seg.words[self.word_end_idx].end,
         )
 
     def apply(self, doc: Document) -> Document:
-        cut = self._resolve(doc)
-        return replace(doc, cuts=[*doc.cuts, cut])
+        interval = self._resolve_interval(doc)
+        self._captured = list(doc.ranges)
+        new_ranges = subtract_interval(doc.ranges, interval, self.source_id)
+        return replace(doc, ranges=new_ranges)
 
     def revert(self, doc: Document) -> Document:
-        cut = self._resolve(doc)
-        new_cuts = list(doc.cuts)
-        for i in range(len(new_cuts) - 1, -1, -1):
-            if new_cuts[i] == cut:
-                new_cuts.pop(i)
-                return replace(doc, cuts=new_cuts)
-        raise ValueError(f"CutWordRange.revert: cut not found ({cut!r})")
+        if self._captured is None:
+            raise RuntimeError("CutWordRange.revert called before apply")
+        return replace(doc, ranges=list(self._captured))
 
 
 # ---------------------------------------------------------------------------

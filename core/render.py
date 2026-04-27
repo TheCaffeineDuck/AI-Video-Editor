@@ -1,29 +1,29 @@
-"""Render a cut Document to a media file via smartcut.
+"""Render a v2 Document to a media file via smartcut.
 
 Pipeline:
 
-1. Empty-cuts shortcut: if ``doc.cuts`` is empty, ``shutil.copy2`` the
-   source. Smartcut is never invoked.
-2. Snap each cut's boundaries to the nearest word boundary (Phase 4f-1
-   C). Cuts that don't overlap any word — pure-silence cuts between
-   segments — pass through unchanged.
-3. Pre-merge cuts using :class:`~core.editing.MergeAdjacentCuts` with
-   ``threshold=merge_gap``. This absorbs cuts that are within
-   ``merge_gap`` of each other AND collapses any tiny keep-range
-   sandwiched between two close cuts.
-4. Invert merged cuts to keep-ranges across ``[0, duration]``.
+1. Pick the Document's source. Phase 4f-3 supports single-source
+   documents only at render time — multi-source compositing is Phase 5+.
+   The source is looked up by ``Range.source_id`` (all ranges must agree)
+   in ``doc.sources``.
+2. Empty-ranges → :class:`ValueError`. ``ranges == []`` means "nothing
+   kept"; we don't write a zero-length file.
+3. Full-coverage shortcut: if ``doc.ranges`` covers ``[0, duration]``
+   contiguously with no gaps, ``shutil.copy2`` the source. The invariant
+   "no edit ⇒ no transcoding" still holds; the detection logic just
+   checks gap-free total coverage rather than ``len(cuts) == 0``.
+4. Snap each range's boundaries to the nearest word boundary (Phase 4f-1
+   C). For a keep-range the snap direction is OUTWARD (earlier word
+   start, later word end) — preserve more, cut less, consistent with the
+   pad rationale. Ranges that don't overlap any word pass through.
 5. Pad each keep-range by ``pad_lead`` on the start side and
-   ``pad_trail`` on the end side (Phase 4f-1 A; asymmetric pads enable
-   different leading/trailing breath defaults), clamped to
-   ``[0, duration]``.
-6. Merge keep-ranges that overlap or touch after padding.
-7. If the final keep-ranges list is empty (cuts covered the entire
-   media), raise :class:`ValueError`. We don't write a zero-length file.
-8. Convert keep-ranges to :class:`~fractions.Fraction`
+   ``pad_trail`` on the end side; clamp to ``[0, duration]``; merge any
+   ranges that overlap or touch after padding.
+6. Convert keep-ranges to :class:`~fractions.Fraction`
    (``limit_denominator=1000``; millisecond precision matches Whisper
    word timestamp resolution) and hand to
    ``smartcut.cut_video.smart_cut`` with audio passthru.
-9. If ``audio_fade_ms > 0`` and the output has internal joins
+7. If ``audio_fade_ms > 0`` and the output has internal joins
    (i.e., more than one keep-range), post-process via ffmpeg to apply a
    linear ``afade`` of ``audio_fade_ms`` milliseconds on each side of
    every join. Smartcut has no native fade option (verified at Phase
@@ -44,13 +44,11 @@ import shutil
 import subprocess
 import warnings
 from collections.abc import Callable
-from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
 
 from core.audio import get_ffmpeg_path
-from core.document import CutMark, Document, Segment
-from core.editing import MergeAdjacentCuts
+from core.document import Document, MediaSource, Range, Segment
 
 _LOG = logging.getLogger(__name__)
 
@@ -65,29 +63,55 @@ def _to_fraction_seconds(value: float) -> Fraction:
     return Fraction(value).limit_denominator(1000)
 
 
-def _invert_cuts_to_keep_ranges(
-    cuts: list[CutMark], duration: float
-) -> list[tuple[float, float]]:
-    """Compute the complement of ``cuts`` over ``[0, duration]``.
+def _select_single_source(doc: Document) -> MediaSource:
+    """Phase 4f-3 renders single-source Documents only.
 
-    ``cuts`` must already be sorted by ``start`` and free of overlap
-    (use :class:`~core.editing.MergeAdjacentCuts` first to guarantee that).
-    Cuts beyond ``duration`` are clamped. Returns a list of
-    ``(start, end)`` keep-ranges with ``end > start``.
+    All ranges must share a ``source_id`` that resolves to one of
+    ``doc.sources``. Multi-source composition is Phase 5+ work and will
+    require a different render path.
     """
-    keeps: list[tuple[float, float]] = []
-    cursor = 0.0
-    for c in cuts:
-        cs = max(0.0, min(duration, c.start))
-        ce = max(0.0, min(duration, c.end))
-        if cs > cursor:
-            keeps.append((cursor, cs))
-        cursor = max(cursor, ce)
-        if cursor >= duration:
-            break
-    if cursor < duration:
-        keeps.append((cursor, duration))
-    return keeps
+    if not doc.sources:
+        raise ValueError("Document has no sources to render")
+    source_ids = {r.source_id for r in doc.ranges}
+    if len(source_ids) > 1:
+        raise ValueError(
+            f"Document references multiple sources {source_ids!r}; "
+            "render_cut supports single-source documents in Phase 4f"
+        )
+    if not source_ids:
+        # No ranges yet — caller will hit the empty-ranges error below;
+        # but if there's exactly one source registered, fall back to it
+        # so error messages reference the right path.
+        if len(doc.sources) == 1:
+            return next(iter(doc.sources.values()))
+        raise ValueError(
+            "Document has no ranges and multiple sources; "
+            "cannot determine which source to render"
+        )
+    sid = next(iter(source_ids))
+    if sid not in doc.sources:
+        raise ValueError(
+            f"Range references source_id={sid!r} not in doc.sources "
+            f"({list(doc.sources)!r})"
+        )
+    return doc.sources[sid]
+
+
+def _is_full_coverage(ranges: list[Range], duration: float) -> bool:
+    """Return True iff ``ranges`` (sorted, non-overlapping) cover
+    ``[0.0, duration]`` contiguously with no gaps.
+    """
+    if not ranges:
+        return False
+    sorted_ranges = sorted(ranges, key=lambda r: r.start)
+    if sorted_ranges[0].start > 0.0:
+        return False
+    cursor = sorted_ranges[0].start
+    for r in sorted_ranges:
+        if r.start > cursor:
+            return False
+        cursor = max(cursor, r.end)
+    return cursor >= duration
 
 
 def _pad_and_merge_keep_ranges(
@@ -122,16 +146,22 @@ def _pad_and_merge_keep_ranges(
     return merged
 
 
-def _snap_cuts_to_word_boundaries(
-    cuts: list[CutMark], segments: list[Segment]
-) -> list[CutMark]:
-    """Snap each cut's start/end to the nearest word start/end boundary.
+def _snap_ranges_to_word_boundaries(
+    ranges: list[Range], segments: list[Segment]
+) -> list[Range]:
+    """Snap each keep-range's start/end OUTWARD to the nearest word
+    boundary.
 
-    A cut that doesn't overlap any word's ``[start, end]`` interval is
-    left untouched (e.g. pure-silence cuts between segments). For overlapping
-    cuts, ``cut.start`` snaps to the nearest word start and ``cut.end`` to
-    the nearest word end. On ties, snap outward (smaller start, larger end)
-    so we err on cutting more, never less.
+    For a keep-range, "outward" means: ``range.start`` snaps to a word
+    start at or before the current value (preserve the leading edge of
+    the first word), and ``range.end`` snaps to a word end at or after
+    the current value (preserve the trailing edge of the last word).
+    This is the opposite direction from cuts (Phase 4f-1's snap was
+    inward to remove more); for ranges we want to preserve more. The
+    invariant — "Never cut inside a word" — holds either way.
+
+    A range that doesn't overlap any word is left untouched (silence
+    between segments has no boundary to snap to).
     """
     word_starts: list[float] = []
     word_ends: list[float] = []
@@ -143,49 +173,53 @@ def _snap_cuts_to_word_boundaries(
             word_intervals.append((w.start, w.end))
 
     if not word_intervals:
-        return list(cuts)
+        return list(ranges)
 
-    out: list[CutMark] = []
-    for c in cuts:
+    out: list[Range] = []
+    for r in ranges:
         overlaps = any(
-            ws <= c.end and we >= c.start for (ws, we) in word_intervals
+            ws <= r.end and we >= r.start for (ws, we) in word_intervals
         )
         if not overlaps:
-            out.append(c)
+            out.append(r)
             continue
-        snapped_start = _snap_to_word_start(c.start, word_starts)
-        snapped_end = _snap_to_word_end(c.end, word_ends)
+        snapped_start = _snap_outward_start(r.start, word_starts)
+        snapped_end = _snap_outward_end(r.end, word_ends)
         if snapped_end <= snapped_start:
-            # Pathological snap: leave the cut untouched rather than emit
-            # a degenerate range that the inverter would silently drop.
-            out.append(c)
+            out.append(r)
             continue
-        out.append(CutMark(start=snapped_start, end=snapped_end, reason=c.reason))
+        out.append(
+            Range(
+                source_id=r.source_id,
+                start=snapped_start,
+                end=snapped_end,
+                reason=r.reason,
+            )
+        )
     return out
 
 
-def _snap_to_word_start(value: float, word_starts: list[float]) -> float:
-    """Snap a cut start to the nearest word start; tie → earlier (cut more)."""
-    best = word_starts[0]
-    best_dist = abs(best - value)
-    for s in word_starts[1:]:
-        d = abs(s - value)
-        if d < best_dist or (d == best_dist and s < best):
-            best = s
-            best_dist = d
-    return best
+def _snap_outward_start(value: float, word_starts: list[float]) -> float:
+    """Snap a keep-range start to the nearest word start ≤ value (preserve more).
+
+    If no word start is ≤ value, falls back to the smallest word start
+    (this happens when the range starts before any word in the segment).
+    """
+    candidates_le = [s for s in word_starts if s <= value]
+    if candidates_le:
+        return max(candidates_le)
+    return min(word_starts)
 
 
-def _snap_to_word_end(value: float, word_ends: list[float]) -> float:
-    """Snap a cut end to the nearest word end; tie → later (cut more)."""
-    best = word_ends[0]
-    best_dist = abs(best - value)
-    for e in word_ends[1:]:
-        d = abs(e - value)
-        if d < best_dist or (d == best_dist and e > best):
-            best = e
-            best_dist = d
-    return best
+def _snap_outward_end(value: float, word_ends: list[float]) -> float:
+    """Snap a keep-range end to the nearest word end ≥ value (preserve more).
+
+    If no word end is ≥ value, falls back to the largest word end.
+    """
+    candidates_ge = [e for e in word_ends if e >= value]
+    if candidates_ge:
+        return min(candidates_ge)
+    return max(word_ends)
 
 
 class _ProgressAdapter:
@@ -231,18 +265,48 @@ def _resolve_keep_ranges(
 ) -> list[tuple[float, float]]:
     """The full keep-range computation, factored out for direct testing.
 
-    Snaps cuts to word boundaries before inversion (Phase 4f-1 C) so the
-    "Never cut inside a word" invariant holds even for low-level callers
-    that bypass :class:`~core.editing.CutWordRange`.
+    Snaps each Range to word boundaries (Phase 4f-1 C, recast for the v2
+    keep-range model), pads each side independently, merges any ranges
+    that overlap or touch after padding, then absorbs cross-range gaps
+    smaller than ``merge_gap``. The result is a list of ``(start, end)``
+    intervals in source time, ready for smartcut.
     """
-    if not doc.cuts:
-        return [(0.0, doc.duration)]
-    snapped = _snap_cuts_to_word_boundaries(doc.cuts, doc.segments)
-    pre_merged = MergeAdjacentCuts(merge_gap).apply(
-        replace(doc, cuts=sorted(snapped, key=lambda c: c.start))
+    if not doc.ranges:
+        return []
+    source = _select_single_source(doc)
+    snapped = _snap_ranges_to_word_boundaries(doc.ranges, doc.segments)
+    raw_keeps = sorted(
+        ((r.start, r.end) for r in snapped), key=lambda t: t[0]
     )
-    keeps = _invert_cuts_to_keep_ranges(pre_merged.cuts, doc.duration)
-    return _pad_and_merge_keep_ranges(keeps, pad_lead, pad_trail, doc.duration)
+    padded = _pad_and_merge_keep_ranges(
+        raw_keeps, pad_lead, pad_trail, source.duration
+    )
+    if merge_gap > 0:
+        padded = _merge_close_keep_ranges(padded, merge_gap)
+    return padded
+
+
+def _merge_close_keep_ranges(
+    keeps: list[tuple[float, float]], merge_gap: float
+) -> list[tuple[float, float]]:
+    """Absorb gaps smaller than ``merge_gap`` between consecutive keeps.
+
+    A gap of exactly ``merge_gap`` does NOT merge — strict less-than. This
+    matches the v1 :class:`~core.editing.MergeAdjacentCuts` semantics that
+    the v1 render pipeline used; the behavior moved here in 4f-3 because
+    v2 ranges are canonicalized at every edit (no need for an explicit
+    edit command anymore).
+    """
+    if not keeps:
+        return []
+    out = [keeps[0]]
+    for s, e in keeps[1:]:
+        ls, le = out[-1]
+        if s - le < merge_gap:
+            out[-1] = (ls, max(le, e))
+        else:
+            out.append((s, e))
+    return out
 
 
 def _join_times_in_output(keeps: list[tuple[float, float]]) -> list[float]:
@@ -325,31 +389,28 @@ def render_cut(
     audio_fade_ms: int = 30,
     pad: float | None = None,
 ) -> Path:
-    """Render ``doc`` with its cuts applied to ``output_path``.
+    """Render ``doc`` with its keep-ranges to ``output_path``.
 
-    ``pad_lead`` widens each kept range on its start side; ``pad_trail`` on
-    its end side. Both default to 100ms. The asymmetric defaults are
+    ``pad_lead`` widens each kept range on its start side; ``pad_trail``
+    on its end side. Both default to 100ms. The asymmetric defaults are
     intentional: leading time before a kept range is "breath before the
-    next word" (too much drags pacing), trailing time is "decay of the
-    previous word" (too little clips consonants). Phase 4f-1 surfaces them
-    independently so per-project tuning is possible.
+    next word" (too much drags pacing); trailing time is "decay of the
+    previous word" (too little clips consonants). Phase 4f-1 surfaces
+    them independently so per-project tuning is possible.
 
     ``audio_fade_ms`` (default 30) controls a linear ``afade`` applied at
-    every internal segment join, fade-out before the join and fade-in
-    after. 30ms is below conscious "fade" perception but above the
-    threshold needed to suppress click/pop discontinuities at sample
-    boundaries. Values >50 are flagged with a warning ("audible as a
-    dissolve, not a click suppressor"). 0 disables fades entirely.
+    every internal segment join. 30ms is below conscious "fade"
+    perception but above the threshold needed to suppress click/pop
+    discontinuities at sample boundaries. Values >50 are flagged with a
+    warning. 0 disables fades entirely.
 
     ``pad`` is deprecated as of Phase 4f-1: passing a non-``None`` value
-    sets both ``pad_lead`` and ``pad_trail`` to it and emits a
+    sets both ``pad_lead`` and ``pad_trail`` and emits a
     :class:`DeprecationWarning`.
 
-    Empty cuts → byte-for-byte copy of the source. All cuts covering
-    the full duration → ``ValueError``. Otherwise, hand the merged +
-    padded keep-ranges to smartcut, which stream-copies most frames
-    and re-encodes only at cut boundaries; then optionally apply audio
-    fades via a second ffmpeg pass.
+    Empty ``doc.ranges`` → :class:`ValueError` ("nothing to render").
+    Ranges that fully cover the source duration → byte-for-byte copy
+    (no edit ⇒ no transcoding). Otherwise smartcut + optional fade pass.
     """
     if pad is not None:
         warnings.warn(
@@ -370,15 +431,19 @@ def render_cut(
             audio_fade_ms,
         )
 
-    if not doc.media_path.is_file():
+    if not doc.ranges:
+        raise ValueError("Document has no ranges to render")
+
+    source = _select_single_source(doc)
+    if not source.path.is_file():
         raise FileNotFoundError(
-            f"Document.media_path does not exist: {doc.media_path}"
+            f"MediaSource path does not exist: {source.path}"
         )
 
     output_path = Path(output_path)
 
-    if not doc.cuts:
-        shutil.copy2(doc.media_path, output_path)
+    if _is_full_coverage(doc.ranges, source.duration):
+        shutil.copy2(source.path, output_path)
         if on_progress is not None:
             on_progress(1.0)
         return output_path
@@ -388,7 +453,7 @@ def render_cut(
     )
     if not final_keeps:
         raise ValueError(
-            "Cuts cover the entire media duration; nothing to render"
+            "Ranges + padding produced no keep-range to render"
         )
 
     # Smartcut imports are deferred so importing core.render is cheap in
@@ -403,7 +468,7 @@ def render_cut(
     )
     from smartcut.media_container import MediaContainer
 
-    container = MediaContainer(str(doc.media_path))
+    container = MediaContainer(str(source.path))
     audio_settings = [
         AudioExportSettings(codec="passthru") for _ in container.audio_tracks
     ]

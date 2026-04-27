@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from core.document import Document, Segment, Word, build_document
+from core.document import Document, MediaSource, Range, Segment, Word, build_document
 from core.exporters import (
     SimpleSegment,
     format_srt_timestamp,
@@ -412,15 +412,15 @@ def test_each_fixture_yields_three_cues(fixture):
 
 
 def _example_doc(media_path: Path) -> Document:
+    src = MediaSource(id="src0", path=media_path, duration=2.0)
     return Document(
-        media_path=media_path,
-        duration=2.0,
-        language="en",
+        sources={"src0": src},
         segments=[
             Segment("Hello", 0.0, 1.0, words=(Word("Hello", 0.0, 1.0, 0.95),)),
             Segment("world", 1.0, 2.0),
         ],
-        cuts=[],
+        ranges=[Range(source_id="src0", start=0.0, end=2.0)],
+        language="en",
         created_at=datetime(2026, 4, 27, 10, 0, 0, tzinfo=UTC),
         model_name="tiny",
     )
@@ -438,7 +438,7 @@ def test_write_outputs_json_writes_loadable_document(tmp_path: Path):
     doc = _example_doc(src)
     written = write_outputs(src, doc.segments, ["json"], document=doc)
     data = json.loads(written["json"].read_text())
-    assert data["schema_version"] == 1
+    assert data["schema_version"] == 2
     restored = Document.from_json(data)
     assert restored == doc
 
