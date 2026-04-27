@@ -99,7 +99,7 @@ If a rule looks wrong while you're modifying code that touches it, change the ru
 
 **Rule.** smartcut is invoked with `audio_settings=AudioExportSettings(codec="passthru")`. The only audio post-process applied is the 30ms fade at cut boundaries (Phase 4f-1).
 
-**Why.** Re-encoding audio for any other reason — bitrate normalization, format conversion, loudness — is out of scope for the renderer. Each re-encode is a generation-loss step; lossless concat-with-fades is the contract.
+**Why.** Two stages, two contracts. Stage 1 — smartcut's concat — is genuinely passthru and lossless: every frame from the kept ranges is stream-copied. Stage 2 — the fade post-process — is a full audio re-encode, because ffmpeg's `afade` filter graph operates on the whole stream, not just the fade windows; samples far from any cut still pass through the encoder once. The load-bearing invariant is therefore "at most one generation of audio re-encode per render," not "lossless throughout." Within that budget, fades are the only added processing. Re-encoding audio for any other reason — bitrate normalization, format conversion, loudness — is out of scope; each additional re-encode is another generation-loss step and a future drift point.
 
 **Status.** `PASS` — `core/[render.py](http://render.py):197-200`. (Will remain PASS after 4f-1 because fades are the only added processing.)
 
