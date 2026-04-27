@@ -225,3 +225,225 @@ def test_app_new_transcription_resets(app):
     app._handle_new_transcription()
     assert app.state.state == AppState.IDLE
     assert app.state.media_path is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 4f-2 — Document JSON cache (source_hash)
+# ---------------------------------------------------------------------------
+
+
+def _write_cache_file(
+    *,
+    media_path: Path,
+    cache_path: Path,
+    source_hash: str | None,
+    segment_text: str = "cached hello",
+) -> None:
+    """Write a synthetic Document JSON sidecar that the cache lookup will find."""
+    import json as _json
+
+    payload = {
+        "schema_version": 1,
+        "media_path": str(media_path),
+        "duration": 1.0,
+        "language": "en",
+        "model_name": "tiny",
+        "created_at": "2026-04-26T10:00:00",
+        "segments": [
+            {"text": segment_text, "start": 0.0, "end": 1.0, "words": []}
+        ],
+        "cuts": [],
+    }
+    if source_hash is not None:
+        payload["source_hash"] = source_hash
+    cache_path.write_text(_json.dumps(payload), encoding="utf-8")
+
+
+def _media_fixture(tmp_path: Path) -> Path:
+    media = tmp_path / "media.wav"
+    media.write_bytes(b"fake media bytes")
+    return media
+
+
+def test_try_load_cached_document_returns_none_when_no_file(app, tmp_path):
+    media = _media_fixture(tmp_path)
+    # Force the lookup to land in tmp_path even though the default settings
+    # would write next to the source — they're equal here, but be explicit.
+    app.settings.output_dir = str(tmp_path)
+    assert app._try_load_cached_document(media) is None
+
+
+def test_try_load_cached_document_returns_doc_when_hash_matches(app, tmp_path):
+    from core.cache import cache_key
+
+    media = _media_fixture(tmp_path)
+    app.settings.output_dir = str(tmp_path)
+    key = cache_key(media)
+    _write_cache_file(
+        media_path=media,
+        cache_path=app._candidate_cache_path(media),
+        source_hash=key,
+    )
+    doc = app._try_load_cached_document(media)
+    assert doc is not None
+    assert doc.source_hash == key
+    assert doc.segments[0].text == "cached hello"
+
+
+def test_try_load_cached_document_misses_on_hash_mismatch(app, tmp_path):
+    media = _media_fixture(tmp_path)
+    app.settings.output_dir = str(tmp_path)
+    _write_cache_file(
+        media_path=media,
+        cache_path=app._candidate_cache_path(media),
+        source_hash="0" * 64,  # not the real hash
+    )
+    assert app._try_load_cached_document(media) is None
+
+
+def test_try_load_cached_document_misses_when_source_hash_absent(app, tmp_path):
+    """Pre-Phase-4f-2 cache files have no ``source_hash`` and must miss."""
+    media = _media_fixture(tmp_path)
+    app.settings.output_dir = str(tmp_path)
+    _write_cache_file(
+        media_path=media,
+        cache_path=app._candidate_cache_path(media),
+        source_hash=None,
+    )
+    assert app._try_load_cached_document(media) is None
+
+
+def test_try_load_cached_document_misses_on_corrupt_json(app, tmp_path):
+    media = _media_fixture(tmp_path)
+    app.settings.output_dir = str(tmp_path)
+    app._candidate_cache_path(media).write_text(
+        "{ this is not valid json", encoding="utf-8"
+    )
+    assert app._try_load_cached_document(media) is None
+
+
+def test_run_transcription_cache_hit_skips_inference(app, tmp_path, monkeypatch):
+    """Cache hit must not construct Transcriber or call download_model;
+    the worker emits a DoneEvent built from the cached Document."""
+    from core.cache import cache_key
+    from ui import app as app_module
+
+    media = _media_fixture(tmp_path)
+    app.settings.output_dir = str(tmp_path)
+    key = cache_key(media)
+    _write_cache_file(
+        media_path=media,
+        cache_path=app._candidate_cache_path(media),
+        source_hash=key,
+    )
+
+    def _boom_transcriber(*a, **kw):
+        raise AssertionError("Transcriber must not be constructed on cache hit")
+
+    def _boom_download(*a, **kw):
+        raise AssertionError("download_model must not be called on cache hit")
+
+    monkeypatch.setattr(app_module, "Transcriber", _boom_transcriber)
+    monkeypatch.setattr(app_module, "download_model", _boom_download)
+    monkeypatch.setattr(app_module, "is_downloaded", lambda *_a, **_kw: True)
+
+    app._run_transcription(media, "tiny", "en", ["txt"])
+
+    events = []
+    while not app.event_queue.empty():
+        events.append(app.event_queue.get_nowait())
+    progress = [e for e in events if isinstance(e, ProgressEvent)]
+    done = [e for e in events if isinstance(e, DoneEvent)]
+    assert len(done) == 1
+    assert any("cached" in (e.label or "").lower() for e in progress)
+    assert done[0].segments[0].text == "cached hello"
+    # Derivative output (.txt) was written; the cache file is unchanged.
+    assert (tmp_path / "media.txt").is_file()
+
+
+def test_run_transcription_cache_hit_reports_existing_json_path(
+    app, tmp_path, monkeypatch
+):
+    """When the user requests ``json``, the cache hit reports the existing
+    sidecar path rather than writing a numbered-suffix duplicate."""
+    from core.cache import cache_key
+    from ui import app as app_module
+
+    media = _media_fixture(tmp_path)
+    app.settings.output_dir = str(tmp_path)
+    key = cache_key(media)
+    cache_path = app._candidate_cache_path(media)
+    _write_cache_file(media_path=media, cache_path=cache_path, source_hash=key)
+    cache_bytes_before = cache_path.read_bytes()
+
+    monkeypatch.setattr(
+        app_module,
+        "Transcriber",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("Transcriber must not run")
+        ),
+    )
+    monkeypatch.setattr(app_module, "is_downloaded", lambda *_a, **_kw: True)
+
+    app._run_transcription(media, "tiny", "en", ["txt", "json"])
+
+    events = list(_drain_queue(app.event_queue))
+    done = next(e for e in events if isinstance(e, DoneEvent))
+    assert done.output_files["json"] == cache_path
+    # Cache file was not rewritten or duplicated.
+    assert cache_path.read_bytes() == cache_bytes_before
+    assert not (tmp_path / "media_1.transcribe.json").exists()
+
+
+def test_run_transcription_mtime_change_invalidates_cache(
+    app, tmp_path, monkeypatch
+):
+    """Bumping the file's mtime changes the cache key, so a stale cache is
+    not used and a fresh transcription path runs."""
+    import os as _os
+
+    from core.cache import cache_key
+    from ui import app as app_module
+
+    media = _media_fixture(tmp_path)
+    app.settings.output_dir = str(tmp_path)
+    stale_key = cache_key(media)
+    _write_cache_file(
+        media_path=media,
+        cache_path=app._candidate_cache_path(media),
+        source_hash=stale_key,
+    )
+
+    # Bump mtime: cache key now differs from what's stored.
+    st = media.stat()
+    _os.utime(media, (st.st_atime, st.st_mtime + 100.0))
+    assert cache_key(media) != stale_key
+
+    transcriber_calls: list[str] = []
+
+    class _FakeTranscriber:
+        def __init__(self, *_a, **_kw):
+            transcriber_calls.append("init")
+
+        def transcribe(self, _media, **_kw):
+            transcriber_calls.append("transcribe")
+            from core.document import Segment
+
+            return [Segment(text="fresh", start=0.0, end=1.0)], SimpleNamespace(
+                language="en", duration=1.0
+            )
+
+        def cancel(self) -> None:
+            pass
+
+    monkeypatch.setattr(app_module, "Transcriber", _FakeTranscriber)
+    monkeypatch.setattr(app_module, "is_downloaded", lambda *_a, **_kw: True)
+
+    app._run_transcription(media, "tiny", "en", ["txt"])
+
+    assert transcriber_calls == ["init", "transcribe"]
+
+
+def _drain_queue(q):
+    while not q.empty():
+        yield q.get_nowait()

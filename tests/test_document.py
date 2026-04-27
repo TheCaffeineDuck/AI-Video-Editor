@@ -305,6 +305,53 @@ def test_build_document_default_no_cuts_serialized():
     assert doc.to_json()["cuts"] == []
 
 
+def test_document_source_hash_defaults_to_none():
+    doc = Document(
+        media_path=Path("/tmp/x.wav"),
+        duration=1.0,
+        language=None,
+        segments=[Segment("x", 0.0, 1.0)],
+    )
+    assert doc.source_hash is None
+    # Omitted from JSON when None — pre-Phase-4f-2 byte-identical compatibility.
+    assert "source_hash" not in doc.to_json()
+
+
+def test_document_with_source_hash_round_trips():
+    h = "a" * 64
+    doc = Document(
+        media_path=Path("/tmp/x.wav"),
+        duration=1.0,
+        language="en",
+        segments=[Segment("x", 0.0, 1.0)],
+        created_at=datetime(2026, 4, 27, tzinfo=UTC),
+        model_name="tiny",
+        source_hash=h,
+    )
+    payload = doc.to_json()
+    assert payload["source_hash"] == h
+    restored = Document.from_json(payload)
+    assert restored.source_hash == h
+
+
+def test_document_v1_without_source_hash_loads_with_none():
+    """v1 JSON files written before Phase 4f-2 (no ``source_hash`` field)
+    must still load cleanly — schema version stays at 1, the field is purely
+    additive."""
+    payload = {
+        "schema_version": 1,
+        "media_path": "/tmp/x.wav",
+        "duration": 1.0,
+        "language": "en",
+        "model_name": "tiny",
+        "created_at": "2026-04-26T10:00:00",
+        "segments": [],
+        "cuts": [],
+    }
+    doc = Document.from_json(payload)
+    assert doc.source_hash is None
+
+
 def test_document_direct_construction_created_at_is_utc():
     """Constructing Document(...) directly (not via build_document) still
     yields a tz-aware UTC ``created_at`` — guards against a regression where

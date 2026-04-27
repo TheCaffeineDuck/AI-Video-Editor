@@ -135,9 +135,9 @@ If a rule looks wrong while you're modifying code that touches it, change the ru
 
 **Why.** Whisper inference is non-deterministic: re-transcribing the same file produces slightly different word timestamps each run. Variance is small but non-zero — enough to break edit reproducibility across sessions. If a user opens a project on Tuesday whose timestamps were set on Monday, every cut they made Monday sits in a slightly different place — sometimes mid-word, sometimes off by a beat. Caching the Document means timestamps are immutable for the life of the project, which is what an editor needs. The Document JSON is already on disk as the editable artifact; doubling it as the cache eliminates a class of synchronization bugs.
 
-**Status.** `GAP` — currently re-transcribes every time. Phase 4f-2 adds the cache lookup.
+**Status.** `PASS` — Phase 4f-2 added the cache. `Document` carries an optional `source_hash`; `App._try_load_cached_document` is called before model download and before transcribe; on hit, the cached Document drives the result and `Transcriber` is never constructed. Derivative outputs (txt/srt/vtt) are still re-rendered from cached segments because the user clicked Transcribe and expects current files; the JSON sidecar itself is not rewritten on hit (no numbered-suffix duplicate). On miss with an existing-but-stale sidecar, the new transcription writes a numbered-suffix file rather than overwriting — the user's old artifact stays put.
 
-**Where.** `core/[cache.py](http://cache.py)` (new, Phase 4f-2); transcription flow in `ui/[app.py](http://app.py)` (modified, Phase 4f-2).
+**Where.** `core/[cache.py](http://cache.py):cache_key`; `core/[document.py](http://document.py):Document.source_hash`; `ui/[app.py](http://app.py):App._try_load_cached_document` and `App._emit_cache_hit_done`.
 
 ### Cache key: sha256 of path + mtime + size
 
@@ -145,9 +145,9 @@ If a rule looks wrong while you're modifying code that touches it, change the ru
 
 **Why.** A full content hash is too slow for large media files. Path+mtime+size is the standard "is this the same file" heuristic — wrong only if a user replaces the file in-place with the exact same byte count and mtime, an edge case where requiring an explicit re-transcribe is acceptable. Including the absolute path means renaming or moving the file invalidates the cache, which is correct: a moved file is a different project context.
 
-**Status.** `GAP` — Phase 4f-2.
+**Status.** `PASS` — Phase 4f-2.
 
-**Where.** `core/[cache.py](http://cache.py):cache_key` (new).
+**Where.** `core/[cache.py](http://cache.py):cache_key`.
 
 ---
 

@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import json
 import queue
 import threading
 import time
 import tkinter as tk
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 
 import customtkinter as ctk
 
 from core import audio, exporters
-from core.document import build_document
+from core.cache import cache_key
+from core.document import Document, UnsupportedSchemaError, build_document
 from core.model_loader import download_model
 from core.models import is_downloaded
 from core.settings import Settings, load_settings
@@ -36,6 +39,19 @@ from ui.state import (
 )
 
 PUMP_INTERVAL_MS = 100
+
+
+@dataclass
+class _CachedInfo:
+    """Stand-in for ``faster_whisper`` ``TranscriptionInfo`` on cache hits.
+
+    The UI only reads ``.language`` and ``.duration`` off the info object
+    (see :func:`App._show_result`), so a small dataclass is enough to
+    avoid plumbing optionality through the result-rendering code path.
+    """
+
+    language: str | None
+    duration: float
 
 
 def _make_root() -> tk.Tk:
@@ -321,6 +337,47 @@ class App:
 
     # ----- worker thread -----
 
+    def _resolve_output_dir(self, media_path: Path) -> Path:
+        """Mirror the writer's choice of output directory."""
+        if self.settings.output_dir:
+            return Path(self.settings.output_dir)
+        return media_path.parent
+
+    def _candidate_cache_path(self, media_path: Path) -> Path:
+        """The unsuffixed path where a cached Document JSON would live.
+
+        The post-transcription writer appends numbered suffixes on collision,
+        but cache lookup only considers the unsuffixed path. A numbered file
+        like ``sample_1.transcribe.json`` came from a different prior run
+        (different mtime/size) and isn't a valid cache hit.
+        """
+        return self._resolve_output_dir(media_path) / (
+            media_path.stem + ".transcribe.json"
+        )
+
+    def _try_load_cached_document(self, media_path: Path) -> Document | None:
+        """Return the cached Document iff it exists and ``source_hash`` matches.
+
+        Any failure (missing file, JSON parse error, schema mismatch, missing
+        or non-matching source_hash) returns ``None`` and the caller falls
+        through to a fresh transcription.
+        """
+        candidate = self._candidate_cache_path(media_path)
+        if not candidate.is_file():
+            return None
+        try:
+            key = cache_key(media_path)
+        except FileNotFoundError:
+            return None
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+            doc = Document.from_json(data)
+        except (OSError, json.JSONDecodeError, UnsupportedSchemaError, KeyError, ValueError):
+            return None
+        if doc.source_hash != key:
+            return None
+        return doc
+
     def _run_transcription(
         self,
         media_path: Path,
@@ -330,6 +387,13 @@ class App:
     ) -> None:
         start = time.monotonic()
         try:
+            cached = self._try_load_cached_document(media_path)
+            if cached is not None:
+                self._emit_cache_hit_done(
+                    media_path, formats, cached, start
+                )
+                return
+
             # First-run: download model with real progress.
             if not is_downloaded(model_name):
                 def on_dl(fraction: float, label: str) -> None:
@@ -363,19 +427,20 @@ class App:
             if self._cancel_requested.is_set():
                 return
 
-            output_dir = (
-                Path(self.settings.output_dir)
-                if self.settings.output_dir
-                else media_path.parent
-            )
+            output_dir = self._resolve_output_dir(media_path)
             output_dir.mkdir(parents=True, exist_ok=True)
             output_base = output_dir / media_path.name
+            try:
+                source_hash = cache_key(media_path)
+            except FileNotFoundError:
+                source_hash = None
             document = build_document(
                 media_path=media_path,
                 duration=float(getattr(info, "duration", 0.0) or 0.0),
                 language=getattr(info, "language", None),
                 segments=segments,
                 model_name=model_name,
+                source_hash=source_hash,
             )
             files = exporters.write_outputs(
                 output_base, segments, formats, document=document
@@ -388,6 +453,47 @@ class App:
             traceback.print_exc()
             if not self._cancel_requested.is_set():
                 self.event_queue.put(ErrorEvent(message=str(exc)))
+
+    def _emit_cache_hit_done(
+        self,
+        media_path: Path,
+        formats: list[str],
+        cached: Document,
+        start: float,
+    ) -> None:
+        """Cache-hit fast path: write derivative outputs, skip inference.
+
+        ``txt``/``srt``/``vtt`` are re-rendered from the cached segments
+        because the user clicked Transcribe and expects current output
+        files. The ``json`` format is special-cased — we don't re-write
+        the cache file (that would create a numbered-suffix duplicate
+        sitting next to the original); instead the existing cache path is
+        reported back as the json output so the result card can link to it.
+        """
+        self.event_queue.put(
+            ProgressEvent(fraction=1.0, label="Loaded cached transcript")
+        )
+        derivative_formats = [f for f in formats if f != "json"]
+        output_dir = self._resolve_output_dir(media_path)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_base = output_dir / media_path.name
+        files = (
+            exporters.write_outputs(output_base, cached.segments, derivative_formats)
+            if derivative_formats
+            else {}
+        )
+        if "json" in formats:
+            files["json"] = self._candidate_cache_path(media_path)
+        elapsed = time.monotonic() - start
+        info = _CachedInfo(language=cached.language, duration=cached.duration)
+        self.event_queue.put(
+            DoneEvent(
+                segments=list(cached.segments),
+                info=info,
+                output_files=files,
+                elapsed=elapsed,
+            )
+        )
 
     # ----- queue pump (UI thread) -----
 

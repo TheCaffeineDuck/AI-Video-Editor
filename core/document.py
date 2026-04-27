@@ -93,6 +93,7 @@ class Document:
     cuts: list[CutMark] = field(default_factory=list)
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     model_name: str = ""
+    source_hash: str | None = None
 
     SCHEMA_VERSION: ClassVar[int] = 1
 
@@ -100,8 +101,10 @@ class Document:
         """Return a plain-dict representation safe for ``json.dumps``.
 
         Always emits ``schema_version`` matching :attr:`SCHEMA_VERSION`.
+        ``source_hash`` is omitted from the output when ``None`` so the
+        on-disk format for pre-Phase-4f-2 Documents stays byte-identical.
         """
-        return {
+        out: dict[str, Any] = {
             "schema_version": self.SCHEMA_VERSION,
             "media_path": str(self.media_path),
             "duration": self.duration,
@@ -130,6 +133,9 @@ class Document:
                 for c in self.cuts
             ],
         }
+        if self.source_hash is not None:
+            out["source_hash"] = self.source_hash
+        return out
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> Document:
@@ -193,6 +199,7 @@ class Document:
             cuts=cuts,
             created_at=datetime.fromisoformat(data["created_at"]),
             model_name=data.get("model_name", ""),
+            source_hash=data.get("source_hash"),
         )
 
 
@@ -203,12 +210,17 @@ def build_document(
     language: str | None,
     segments: Iterable[Segment],
     model_name: str,
+    source_hash: str | None = None,
 ) -> Document:
     """Assemble a freshly-transcribed :class:`Document` from core types.
 
     ``cuts`` is always empty for a brand-new transcription. ``created_at``
     is captured at call time as a UTC ``datetime`` — never local time, so
     the serialized artifact is portable across machines and time zones.
+
+    ``source_hash`` is the cache key produced by
+    :func:`core.cache.cache_key`. Pass it through so the JSON sidecar
+    can be reused as the cache on subsequent runs against the same file.
     """
     return Document(
         media_path=Path(media_path),
@@ -218,4 +230,5 @@ def build_document(
         cuts=[],
         created_at=datetime.now(UTC),
         model_name=model_name,
+        source_hash=source_hash,
     )
