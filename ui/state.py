@@ -3,6 +3,10 @@
 Kept Tk-free so tests can exercise transitions, validation, and queue pumping
 without instantiating widgets. The widget layer in ``ui.app`` owns an
 :class:`AppStateMachine` and reacts to its ``on_change`` notifications.
+
+Worker-event dataclasses moved to :mod:`workers.events` in Phase 5a so the
+PySide6 UI can import them without depending on this (tkinter-flavored)
+module. They're re-exported here for backward compatibility.
 """
 
 from __future__ import annotations
@@ -13,6 +17,31 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+from workers.events import (
+    CancelledEvent,
+    DoneEvent,
+    ErrorEvent,
+    ProgressEvent,
+    SegmentEvent,
+    WorkerEvent,
+)
+
+__all__ = [
+    "AppState",
+    "AppStateMachine",
+    "CancelledEvent",
+    "DoneEvent",
+    "ErrorEvent",
+    "InvalidTransitionError",
+    "ProgressEvent",
+    "SegmentEvent",
+    "SUPPORTED_EXTENSIONS",
+    "TranscriptionResult",
+    "WorkerEvent",
+    "is_supported_media",
+    "pump_queue",
+]
 
 
 class AppState(str, Enum):
@@ -47,45 +76,6 @@ SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
 
 def is_supported_media(path: str | Path) -> bool:
     return Path(path).suffix.lower() in SUPPORTED_EXTENSIONS
-
-
-# ---------------------------------------------------------------------------
-# Worker → UI events
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class WorkerEvent:
-    pass
-
-
-@dataclass
-class SegmentEvent(WorkerEvent):
-    text: str
-
-
-@dataclass
-class ProgressEvent(WorkerEvent):
-    fraction: float
-    label: str = "Transcribing…"
-
-
-@dataclass
-class DoneEvent(WorkerEvent):
-    segments: list[Any]
-    info: Any
-    output_files: dict[str, Path]
-    elapsed: float
-
-
-@dataclass
-class ErrorEvent(WorkerEvent):
-    message: str
-
-
-@dataclass
-class CancelledEvent(WorkerEvent):
-    pass
 
 
 # ---------------------------------------------------------------------------

@@ -326,7 +326,7 @@ def test_run_transcription_cache_hit_skips_inference(app, tmp_path, monkeypatch)
     """Cache hit must not construct Transcriber or call download_model;
     the worker emits a DoneEvent built from the cached Document."""
     from core.cache import cache_key
-    from ui import app as app_module
+    from workers import transcription as worker_module
 
     media = _media_fixture(tmp_path)
     app.settings.output_dir = str(tmp_path)
@@ -343,9 +343,9 @@ def test_run_transcription_cache_hit_skips_inference(app, tmp_path, monkeypatch)
     def _boom_download(*a, **kw):
         raise AssertionError("download_model must not be called on cache hit")
 
-    monkeypatch.setattr(app_module, "Transcriber", _boom_transcriber)
-    monkeypatch.setattr(app_module, "download_model", _boom_download)
-    monkeypatch.setattr(app_module, "is_downloaded", lambda *_a, **_kw: True)
+    monkeypatch.setattr(worker_module, "Transcriber", _boom_transcriber)
+    monkeypatch.setattr(worker_module, "download_model", _boom_download)
+    monkeypatch.setattr(worker_module, "is_downloaded", lambda *_a, **_kw: True)
 
     app._run_transcription(media, "tiny", "en", ["txt"])
 
@@ -367,7 +367,7 @@ def test_run_transcription_cache_hit_reports_existing_json_path(
     """When the user requests ``json``, the cache hit reports the existing
     sidecar path rather than writing a numbered-suffix duplicate."""
     from core.cache import cache_key
-    from ui import app as app_module
+    from workers import transcription as worker_module
 
     media = _media_fixture(tmp_path)
     app.settings.output_dir = str(tmp_path)
@@ -377,13 +377,13 @@ def test_run_transcription_cache_hit_reports_existing_json_path(
     cache_bytes_before = cache_path.read_bytes()
 
     monkeypatch.setattr(
-        app_module,
+        worker_module,
         "Transcriber",
         lambda *a, **kw: (_ for _ in ()).throw(
             AssertionError("Transcriber must not run")
         ),
     )
-    monkeypatch.setattr(app_module, "is_downloaded", lambda *_a, **_kw: True)
+    monkeypatch.setattr(worker_module, "is_downloaded", lambda *_a, **_kw: True)
 
     app._run_transcription(media, "tiny", "en", ["txt", "json"])
 
@@ -403,7 +403,7 @@ def test_run_transcription_mtime_change_invalidates_cache(
     import os as _os
 
     from core.cache import cache_key
-    from ui import app as app_module
+    from workers import transcription as worker_module
 
     media = _media_fixture(tmp_path)
     app.settings.output_dir = str(tmp_path)
@@ -436,8 +436,8 @@ def test_run_transcription_mtime_change_invalidates_cache(
         def cancel(self) -> None:
             pass
 
-    monkeypatch.setattr(app_module, "Transcriber", _FakeTranscriber)
-    monkeypatch.setattr(app_module, "is_downloaded", lambda *_a, **_kw: True)
+    monkeypatch.setattr(worker_module, "Transcriber", _FakeTranscriber)
+    monkeypatch.setattr(worker_module, "is_downloaded", lambda *_a, **_kw: True)
 
     app._run_transcription(media, "tiny", "en", ["txt"])
 

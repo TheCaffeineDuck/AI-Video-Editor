@@ -2,24 +2,15 @@
 
 from __future__ import annotations
 
-import json
 import queue
 import threading
-import time
 import tkinter as tk
-import traceback
-from dataclasses import dataclass
 from pathlib import Path
 
 import customtkinter as ctk
 
-from core import audio, exporters
-from core.cache import cache_key
-from core.document import Document, UnsupportedSchemaError, build_document
-from core.model_loader import download_model
-from core.models import is_downloaded
+from core import audio
 from core.settings import Settings, load_settings
-from core.transcriber import Transcriber
 from ui import theme
 from ui.components.drop_zone import DropZone
 from ui.components.language_picker import LanguagePicker
@@ -31,27 +22,15 @@ from ui.components.settings_panel import open_settings
 from ui.state import (
     AppState,
     AppStateMachine,
-    DoneEvent,
-    ErrorEvent,
-    ProgressEvent,
-    SegmentEvent,
     pump_queue,
+)
+from workers.transcription import (
+    TranscriptionWorker,
+    candidate_cache_path,
+    try_load_cached_document,
 )
 
 PUMP_INTERVAL_MS = 100
-
-
-@dataclass
-class _CachedInfo:
-    """Stand-in for ``faster_whisper`` ``TranscriptionInfo`` on cache hits.
-
-    The UI only reads ``.language`` and ``.duration`` off the info object
-    (see :func:`App._show_result`), so a small dataclass is enough to
-    avoid plumbing optionality through the result-rendering code path.
-    """
-
-    language: str | None
-    duration: float
 
 
 def _make_root() -> tk.Tk:
@@ -87,8 +66,8 @@ class App:
         self.settings = settings or load_settings()
         self.state = AppStateMachine()
         self.event_queue: queue.Queue = queue.Queue()
-        self._transcriber: Transcriber | None = None
-        self._worker: threading.Thread | None = None
+        self._worker_thread: threading.Thread | None = None
+        self._worker: TranscriptionWorker | None = None
         self._cancel_requested = threading.Event()
 
         self._build()
@@ -292,17 +271,17 @@ class App:
         language = self.language_picker.selected_code
         formats = list(self.output_picker.formats)
         assert media_path is not None
-        self._worker = threading.Thread(
+        self._worker_thread = threading.Thread(
             target=self._run_transcription,
             args=(media_path, model_name, language, formats),
             daemon=True,
         )
-        self._worker.start()
+        self._worker_thread.start()
 
     def _handle_cancel(self) -> None:
         self._cancel_requested.set()
-        if self._transcriber is not None:
-            self._transcriber.cancel()
+        if self._worker is not None:
+            self._worker.cancel()
         # Snap UI to idle immediately; worker drains in background.
         if self.state.state == AppState.TRANSCRIBING:
             self.state.cancel()
@@ -312,8 +291,8 @@ class App:
 
     def _on_close(self) -> None:
         self._cancel_requested.set()
-        if self._transcriber is not None:
-            self._transcriber.cancel()
+        if self._worker is not None:
+            self._worker.cancel()
         self.root.destroy()
 
     def _open_settings(self) -> None:
@@ -337,46 +316,13 @@ class App:
 
     # ----- worker thread -----
 
-    def _resolve_output_dir(self, media_path: Path) -> Path:
-        """Mirror the writer's choice of output directory."""
-        if self.settings.output_dir:
-            return Path(self.settings.output_dir)
-        return media_path.parent
-
     def _candidate_cache_path(self, media_path: Path) -> Path:
-        """The unsuffixed path where a cached Document JSON would live.
+        """Cache-path helper kept on the controller for tests/back-compat."""
+        return candidate_cache_path(self.settings, media_path)
 
-        The post-transcription writer appends numbered suffixes on collision,
-        but cache lookup only considers the unsuffixed path. A numbered file
-        like ``sample_1.transcribe.json`` came from a different prior run
-        (different mtime/size) and isn't a valid cache hit.
-        """
-        return self._resolve_output_dir(media_path) / (
-            media_path.stem + ".transcribe.json"
-        )
-
-    def _try_load_cached_document(self, media_path: Path) -> Document | None:
-        """Return the cached Document iff it exists and ``source_hash`` matches.
-
-        Any failure (missing file, JSON parse error, schema mismatch, missing
-        or non-matching source_hash) returns ``None`` and the caller falls
-        through to a fresh transcription.
-        """
-        candidate = self._candidate_cache_path(media_path)
-        if not candidate.is_file():
-            return None
-        try:
-            key = cache_key(media_path)
-        except FileNotFoundError:
-            return None
-        try:
-            data = json.loads(candidate.read_text(encoding="utf-8"))
-            doc = Document.from_json(data)
-        except (OSError, json.JSONDecodeError, UnsupportedSchemaError, KeyError, ValueError):
-            return None
-        if doc.source_hash != key:
-            return None
-        return doc
+    def _try_load_cached_document(self, media_path: Path):
+        """Cache-lookup helper kept on the controller for tests/back-compat."""
+        return try_load_cached_document(self.settings, media_path)
 
     def _run_transcription(
         self,
@@ -385,116 +331,22 @@ class App:
         language: str | None,
         formats: list[str],
     ) -> None:
-        start = time.monotonic()
-        try:
-            cached = self._try_load_cached_document(media_path)
-            if cached is not None:
-                self._emit_cache_hit_done(
-                    media_path, formats, cached, start
-                )
-                return
+        """Spin up a :class:`TranscriptionWorker` and run it on this thread.
 
-            # First-run: download model with real progress.
-            if not is_downloaded(model_name):
-                def on_dl(fraction: float, label: str) -> None:
-                    if self._cancel_requested.is_set():
-                        return
-                    self.event_queue.put(ProgressEvent(fraction=fraction, label=label))
-                download_model(model_name, on_progress=on_dl)
-                if self._cancel_requested.is_set():
-                    return
-
-            self._transcriber = Transcriber(
-                model_name,
-                device=self.settings.compute_device,
-                compute_type=self.settings.compute_type,
-            )
-
-            def on_segment(text: str) -> None:
-                if self._cancel_requested.is_set():
-                    return
-                self.event_queue.put(SegmentEvent(text=text))
-
-            def on_progress(fraction: float) -> None:
-                if self._cancel_requested.is_set():
-                    return
-                self.event_queue.put(ProgressEvent(fraction=fraction, label="Transcribing…"))
-
-            segments, info = self._transcriber.transcribe(
-                media_path, language=language, on_segment=on_segment, on_progress=on_progress
-            )
-
-            if self._cancel_requested.is_set():
-                return
-
-            output_dir = self._resolve_output_dir(media_path)
-            output_dir.mkdir(parents=True, exist_ok=True)
-            output_base = output_dir / media_path.name
-            try:
-                source_hash = cache_key(media_path)
-            except FileNotFoundError:
-                source_hash = None
-            document = build_document(
-                media_path=media_path,
-                duration=float(getattr(info, "duration", 0.0) or 0.0),
-                language=getattr(info, "language", None),
-                segments=segments,
-                model_name=model_name,
-                source_hash=source_hash,
-            )
-            files = exporters.write_outputs(
-                output_base, segments, formats, document=document
-            )
-            elapsed = time.monotonic() - start
-            self.event_queue.put(
-                DoneEvent(segments=segments, info=info, output_files=files, elapsed=elapsed)
-            )
-        except Exception as exc:  # noqa: BLE001
-            traceback.print_exc()
-            if not self._cancel_requested.is_set():
-                self.event_queue.put(ErrorEvent(message=str(exc)))
-
-    def _emit_cache_hit_done(
-        self,
-        media_path: Path,
-        formats: list[str],
-        cached: Document,
-        start: float,
-    ) -> None:
-        """Cache-hit fast path: write derivative outputs, skip inference.
-
-        ``txt``/``srt``/``vtt`` are re-rendered from the cached segments
-        because the user clicked Transcribe and expects current output
-        files. The ``json`` format is special-cased — we don't re-write
-        the cache file (that would create a numbered-suffix duplicate
-        sitting next to the original); instead the existing cache path is
-        reported back as the json output so the result card can link to it.
+        Called from a daemon thread by :meth:`_handle_transcribe_click`.
+        The worker emits :class:`workers.events.WorkerEvent` values into
+        the same :class:`queue.Queue` the UI thread already polls.
         """
-        self.event_queue.put(
-            ProgressEvent(fraction=1.0, label="Loaded cached transcript")
+        self._worker = TranscriptionWorker(
+            settings=self.settings,
+            media_path=media_path,
+            model_name=model_name,
+            language=language,
+            formats=formats,
+            on_event=self.event_queue.put,
+            cancel_event=self._cancel_requested,
         )
-        derivative_formats = [f for f in formats if f != "json"]
-        output_dir = self._resolve_output_dir(media_path)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output_base = output_dir / media_path.name
-        files = (
-            exporters.write_outputs(output_base, cached.segments, derivative_formats)
-            if derivative_formats
-            else {}
-        )
-        if "json" in formats:
-            files["json"] = self._candidate_cache_path(media_path)
-        elapsed = time.monotonic() - start
-        primary_source = next(iter(cached.sources.values()))
-        info = _CachedInfo(language=cached.language, duration=primary_source.duration)
-        self.event_queue.put(
-            DoneEvent(
-                segments=list(cached.segments),
-                info=info,
-                output_files=files,
-                elapsed=elapsed,
-            )
-        )
+        self._worker.run()
 
     # ----- queue pump (UI thread) -----
 

@@ -29,6 +29,17 @@ DEFAULT_LANGUAGE: str | None = None
 DEFAULT_DEVICE = "auto"
 DEFAULT_COMPUTE_TYPE = "int8"  # spec note: int8 on this CPU-only platform
 
+# Phase 5 editor defaults (surfaced in 5a even though most aren't read until
+# 5b/5c/5f). Following the settings non-migration rule (4e): existing users
+# keep what they had; new fields appear with these documented defaults when
+# absent from disk.
+DEFAULT_LAYOUT = "video_top"  # editor pane orientation; "video_top" | "video_left"
+LAYOUT_CHOICES = ("video_top", "video_left")
+DEFAULT_PAD_LEAD = 0.10
+DEFAULT_PAD_TRAIL = 0.10
+DEFAULT_AUDIO_FADE_MS = 30
+DEFAULT_AUTOSAVE_INTERVAL_S = 0  # 0 = autosave OFF
+
 
 def settings_dir() -> Path:
     """Return the per-user app-support directory for settings."""
@@ -60,6 +71,14 @@ class Settings:
     compute_device: str = DEFAULT_DEVICE
     compute_type: str = DEFAULT_COMPUTE_TYPE
 
+    # Phase 5 editor preferences. Read from disk when present; missing keys
+    # in older settings.json files fall back to the defaults below.
+    layout: str = DEFAULT_LAYOUT
+    default_pad_lead: float = DEFAULT_PAD_LEAD
+    default_pad_trail: float = DEFAULT_PAD_TRAIL
+    default_audio_fade_ms: int = DEFAULT_AUDIO_FADE_MS
+    autosave_interval_s: int = DEFAULT_AUTOSAVE_INTERVAL_S
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -78,6 +97,10 @@ class Settings:
         if not isinstance(formats, list) or not all(isinstance(x, str) for x in formats):
             formats = list(DEFAULT_OUTPUT_FORMATS)
         kwargs["output_formats"] = formats
+        # Normalize layout: unknown value falls back to default rather than
+        # propagating a typo into the editor's QSplitter orientation.
+        if kwargs.get("layout") not in LAYOUT_CHOICES:
+            kwargs["layout"] = DEFAULT_LAYOUT
         return cls(**kwargs)
 
 
