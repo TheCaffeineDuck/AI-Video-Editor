@@ -303,3 +303,19 @@ def test_build_document_default_no_cuts_serialized():
         model_name="tiny",
     )
     assert doc.to_json()["cuts"] == []
+
+
+def test_document_direct_construction_created_at_is_utc():
+    """Constructing Document(...) directly (not via build_document) still
+    yields a tz-aware UTC ``created_at`` — guards against a regression where
+    the default factory drops back to naive local time."""
+    from datetime import timedelta
+
+    doc = Document(
+        media_path=Path("/tmp/x.wav"),
+        duration=1.0,
+        language=None,
+        segments=[Segment("x", 0.0, 1.0)],
+    )
+    assert doc.created_at.tzinfo is not None
+    assert doc.created_at.utcoffset() == timedelta(0)

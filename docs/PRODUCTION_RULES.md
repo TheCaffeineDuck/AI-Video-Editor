@@ -85,6 +85,36 @@ If a rule looks wrong while you're modifying code that touches it, change the ru
 
 **Where.** TBD.
 
+### Empty-cuts render is a byte-for-byte copy
+
+**Rule.** When `doc.cuts` is empty, `render_cut` does a `shutil.copy2` of the source rather than routing through smartcut.
+
+**Why.** The invariant "no edit ⇒ no transcoding" matters because (a) lossless preservation is the user's expectation when they hit Render on an unedited project, and (b) smartcut may re-mux or container-fixup in ways that surprise downstream tooling. Future "consistency" refactors that route everything through smartcut would silently break this.
+
+**Status.** `PASS` — `core/[render.py](http://render.py):172-176` (the `if not doc.cuts:` shortcut).
+
+**Where.** `core/[render.py](http://render.py):render_cut`
+
+### Audio is passthru except at fade boundaries
+
+**Rule.** smartcut is invoked with `audio_settings=AudioExportSettings(codec="passthru")`. The only audio post-process applied is the 30ms fade at cut boundaries (Phase 4f-1).
+
+**Why.** Re-encoding audio for any other reason — bitrate normalization, format conversion, loudness — is out of scope for the renderer. Each re-encode is a generation-loss step; lossless concat-with-fades is the contract.
+
+**Status.** `PASS` — `core/[render.py](http://render.py):197-200`. (Will remain PASS after 4f-1 because fades are the only added processing.)
+
+**Where.** `core/[render.py](http://render.py):render_cut`
+
+### Cut timestamps quantize to 1ms
+
+**Rule.** `Fraction.limit_denominator(1000)` constrains every timestamp handed to smartcut to 1ms precision.
+
+**Why.** Whisper's word timestamps are 20-50ms-grain in practice; sub-ms precision is noise. Smartcut's bookkeeping benefits from rational denominators ≤1000 for frame-rate math. A future change that drops `limit_denominator` (e.g., to "preserve precision") would expose smartcut to fractions whose denominator equals the audio sample rate — a known footgun in the smartcut codebase.
+
+**Status.** `PASS` — `core/[render.py](http://render.py):_to_fraction_seconds` (line 49).
+
+**Where.** `core/[render.py](http://render.py):_to_fraction_seconds`
+
 ### Smartcut's `emit()` is non-monotonic; wrap it
 
 **Rule.** Smartcut's progress callbacks emit non-uniform increments and can briefly exceed the announced total. Any progress signal piped to the UI must be clamped to `[0, 1]` and made monotonic by an adapter, never trusted raw.

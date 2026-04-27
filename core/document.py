@@ -91,7 +91,7 @@ class Document:
     language: str | None
     segments: list[Segment]
     cuts: list[CutMark] = field(default_factory=list)
-    created_at: datetime = field(default_factory=datetime.now)
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     model_name: str = ""
 
     SCHEMA_VERSION: ClassVar[int] = 1
