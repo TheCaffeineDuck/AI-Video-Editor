@@ -15,12 +15,14 @@ from pathlib import Path
 
 import pytest
 
-from core.document import CutMark, Document, Segment
+from core.document import CutMark, Document, Segment, Word
 from core.render import (
     _invert_cuts_to_keep_ranges,
+    _join_times_in_output,
     _pad_and_merge_keep_ranges,
     _ProgressAdapter,
     _resolve_keep_ranges,
+    _snap_cuts_to_word_boundaries,
     _to_fraction_seconds,
     render_cut,
 )
@@ -110,18 +112,22 @@ def test_invert_two_separated_cuts():
 
 def test_pad_clamps_to_zero_at_start():
     """Pad must not push start below 0."""
-    out = _pad_and_merge_keep_ranges([(0.05, 10.0)], pad=0.10, duration=30.0)
+    out = _pad_and_merge_keep_ranges(
+        [(0.05, 10.0)], pad_lead=0.10, pad_trail=0.10, duration=30.0
+    )
     assert out == [(0.0, 10.10)]
 
 
 def test_pad_clamps_to_duration_at_end():
-    out = _pad_and_merge_keep_ranges([(20.0, 29.95)], pad=0.10, duration=30.0)
+    out = _pad_and_merge_keep_ranges(
+        [(20.0, 29.95)], pad_lead=0.10, pad_trail=0.10, duration=30.0
+    )
     assert out == [(19.90, 30.0)]
 
 
 def test_pad_no_overlap_keeps_separate():
     out = _pad_and_merge_keep_ranges(
-        [(0.0, 10.0), (20.0, 30.0)], pad=0.10, duration=30.0
+        [(0.0, 10.0), (20.0, 30.0)], pad_lead=0.10, pad_trail=0.10, duration=30.0
     )
     assert out == [(0.0, 10.10), (19.90, 30.0)]
 
@@ -129,23 +135,47 @@ def test_pad_no_overlap_keeps_separate():
 def test_pad_causing_overlap_merges_ranges():
     """After padding, two adjacent keep-ranges overlap → merge them."""
     out = _pad_and_merge_keep_ranges(
-        [(0.0, 10.0), (10.05, 30.0)], pad=0.10, duration=30.0
+        [(0.0, 10.0), (10.05, 30.0)], pad_lead=0.10, pad_trail=0.10, duration=30.0
     )
     assert out == [(0.0, 30.0)]
 
 
 def test_pad_zero_is_noop():
-    out = _pad_and_merge_keep_ranges([(0.0, 10.0)], pad=0.0, duration=30.0)
+    out = _pad_and_merge_keep_ranges(
+        [(0.0, 10.0)], pad_lead=0.0, pad_trail=0.0, duration=30.0
+    )
     assert out == [(0.0, 10.0)]
 
 
-def test_pad_negative_raises():
-    with pytest.raises(ValueError, match="pad"):
-        _pad_and_merge_keep_ranges([(0.0, 10.0)], pad=-0.1, duration=30.0)
+def test_pad_lead_negative_raises():
+    with pytest.raises(ValueError, match="pad_lead"):
+        _pad_and_merge_keep_ranges(
+            [(0.0, 10.0)], pad_lead=-0.1, pad_trail=0.1, duration=30.0
+        )
+
+
+def test_pad_trail_negative_raises():
+    with pytest.raises(ValueError, match="pad_trail"):
+        _pad_and_merge_keep_ranges(
+            [(0.0, 10.0)], pad_lead=0.1, pad_trail=-0.1, duration=30.0
+        )
+
+
+def test_pad_asymmetric_uses_each_side_independently():
+    """pad_lead=0.05 widens start by 0.05; pad_trail=0.20 widens end by 0.20."""
+    out = _pad_and_merge_keep_ranges(
+        [(5.0, 10.0)], pad_lead=0.05, pad_trail=0.20, duration=30.0
+    )
+    assert out == [(4.95, 10.20)]
 
 
 def test_pad_empty_input_returns_empty():
-    assert _pad_and_merge_keep_ranges([], pad=0.1, duration=30.0) == []
+    assert (
+        _pad_and_merge_keep_ranges(
+            [], pad_lead=0.1, pad_trail=0.1, duration=30.0
+        )
+        == []
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +187,9 @@ def test_resolve_no_cuts_yields_full_range(tmp_path: Path):
     media = tmp_path / "x.mp4"
     media.write_bytes(b"fake")
     doc = _doc(media)
-    assert _resolve_keep_ranges(doc, pad=0.1, merge_gap=0.3) == [(0.0, 30.0)]
+    assert _resolve_keep_ranges(
+        doc, pad_lead=0.1, pad_trail=0.1, merge_gap=0.3
+    ) == [(0.0, 30.0)]
 
 
 def test_resolve_two_cuts_with_sub_merge_gap_keep_range_absorbed(tmp_path: Path):
@@ -173,7 +205,9 @@ def test_resolve_two_cuts_with_sub_merge_gap_keep_range_absorbed(tmp_path: Path)
     media = tmp_path / "x.mp4"
     media.write_bytes(b"fake")
     doc = _doc(media, cuts=[CutMark(10.0, 12.0), CutMark(12.1, 14.0)])
-    out = _resolve_keep_ranges(doc, pad=0.10, merge_gap=0.30)
+    out = _resolve_keep_ranges(
+        doc, pad_lead=0.10, pad_trail=0.10, merge_gap=0.30
+    )
     assert out == [(0.0, 10.10), (13.90, 30.0)]
 
 
@@ -181,7 +215,9 @@ def test_resolve_full_duration_cut_yields_empty(tmp_path: Path):
     media = tmp_path / "x.mp4"
     media.write_bytes(b"fake")
     doc = _doc(media, cuts=[CutMark(0.0, 30.0)])
-    assert _resolve_keep_ranges(doc, pad=0.10, merge_gap=0.30) == []
+    assert _resolve_keep_ranges(
+        doc, pad_lead=0.10, pad_trail=0.10, merge_gap=0.30
+    ) == []
 
 
 def test_resolve_handles_unsorted_cuts(tmp_path: Path):
@@ -190,7 +226,9 @@ def test_resolve_handles_unsorted_cuts(tmp_path: Path):
     media.write_bytes(b"fake")
     cuts = [CutMark(20.0, 25.0), CutMark(5.0, 10.0)]
     doc = _doc(media, cuts=cuts)
-    assert _resolve_keep_ranges(doc, pad=0.0, merge_gap=0.0) == [
+    assert _resolve_keep_ranges(
+        doc, pad_lead=0.0, pad_trail=0.0, merge_gap=0.0
+    ) == [
         (0.0, 5.0), (10.0, 20.0), (25.0, 30.0),
     ]
 
@@ -382,3 +420,250 @@ def test_render_cut_progress_reaches_one_and_is_monotonic(
     assert progress[-1] == 1.0
     assert all(0.0 <= p <= 1.0 for p in progress)
     assert progress == sorted(progress), "progress went backwards"
+
+
+# ---------------------------------------------------------------------------
+# Phase 4f-1 — pad_lead / pad_trail asymmetric pad
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_render_cut_asymmetric_pad(
+    synthetic_video: Path, probe_duration, is_playable, tmp_path: Path
+):
+    """pad_lead=0.05, pad_trail=0.20 on a 1s cut [12, 13]: keeps become
+    [(0, 12.20), (12.95, 30)] → output ≈ 12.20 + 17.05 = 29.25s, i.e.
+    source - cut + pad_lead + pad_trail = 30 - 1 + 0.05 + 0.20."""
+    doc = _doc_for_video(synthetic_video, cuts=[CutMark(12.0, 13.0)])
+    out = tmp_path / "out.mp4"
+    render_cut(
+        doc,
+        out,
+        pad_lead=0.05,
+        pad_trail=0.20,
+        audio_fade_ms=0,
+    )
+    assert is_playable(out)
+    src_dur = probe_duration(synthetic_video)
+    expected = src_dur - 1.0 + 0.05 + 0.20
+    assert probe_duration(out) == pytest.approx(expected, abs=0.5)
+
+
+@pytest.mark.slow
+def test_render_cut_pad_kwarg_is_deprecated_but_works(
+    synthetic_video: Path, probe_duration, is_playable, tmp_path: Path
+):
+    """The legacy ``pad=`` kwarg emits DeprecationWarning and matches the
+    symmetric pad_lead=pad_trail=pad behavior."""
+    doc = _doc_for_video(synthetic_video, cuts=[CutMark(12.0, 18.0)])
+    out = tmp_path / "out.mp4"
+    with pytest.warns(DeprecationWarning, match="pad_lead"):
+        render_cut(doc, out, pad=0.10, audio_fade_ms=0)
+    assert is_playable(out)
+    src_dur = probe_duration(synthetic_video)
+    # Identical to default-pad path: 30 - 6 + 0.20 = 24.20s.
+    assert probe_duration(out) == pytest.approx(src_dur - 5.8, abs=0.5)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4f-1 — _join_times_in_output
+# ---------------------------------------------------------------------------
+
+
+def test_join_times_single_keep_has_no_joins():
+    assert _join_times_in_output([(0.0, 30.0)]) == []
+
+
+def test_join_times_two_keeps_one_join():
+    """Output time of the join = length of first keep-range."""
+    assert _join_times_in_output([(0.0, 10.0), (15.0, 30.0)]) == [10.0]
+
+
+def test_join_times_three_keeps_two_joins():
+    out = _join_times_in_output([(0.0, 5.0), (10.0, 12.0), (20.0, 30.0)])
+    assert out == [5.0, 7.0]
+
+
+# ---------------------------------------------------------------------------
+# Phase 4f-1 — audio fade envelope (slow)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_render_cut_audio_fade_attenuates_envelope_around_join(
+    synthetic_video: Path, tmp_path: Path
+):
+    """A 30ms fade on either side of an internal join must produce a V-shaped
+    amplitude envelope: max-abs samples in the 30ms before the join and the
+    30ms after both attenuate toward t_join. Use pad=0 so the join sits at
+    a known output time and a continuous-tone (440Hz, 0–10s segment of
+    the synthetic video) lets us compare envelopes without conflating the
+    fade with a frequency change.
+    """
+    import av
+    import numpy as np
+
+    # Cut [2.5, 3.5] inside the 0–10s 440Hz tone segment. With pad=0 the
+    # join sits at output t=2.5 and source 440Hz tone continues either side.
+    doc = _doc_for_video(synthetic_video, cuts=[CutMark(2.5, 3.5)])
+    out = tmp_path / "out.mp4"
+    render_cut(
+        doc,
+        out,
+        pad_lead=0.0,
+        pad_trail=0.0,
+        audio_fade_ms=30,
+    )
+
+    join_t = 2.5
+    samples_l: list[np.ndarray] = []
+    sample_rate: int | None = None
+    with av.open(str(out)) as container:
+        a_stream = container.streams.audio[0]
+        sample_rate = int(a_stream.rate)
+        for frame in container.decode(audio=0):
+            arr = frame.to_ndarray()
+            if arr.ndim == 2:
+                arr = arr.mean(axis=0)
+            samples_l.append(arr.astype(np.float32))
+    assert sample_rate is not None
+    samples = np.concatenate(samples_l)
+
+    def envelope(t_start: float, t_end: float) -> float:
+        i = int(round(t_start * sample_rate))
+        j = int(round(t_end * sample_rate))
+        i = max(0, min(len(samples), i))
+        j = max(0, min(len(samples), j))
+        if j <= i:
+            return 0.0
+        return float(np.max(np.abs(samples[i:j])))
+
+    # Reference window well outside the fade: full-amplitude 440Hz tone.
+    ref = envelope(join_t - 0.500, join_t - 0.450)
+    assert ref > 0.05, f"reference envelope unexpectedly low: {ref}"
+
+    # The amplitude in a 4ms window centered on the join must be a small
+    # fraction of the reference — linear afade brings gain to 0 at the join.
+    near_join = envelope(join_t - 0.002, join_t + 0.002)
+    assert near_join < ref * 0.20, (
+        f"near-join envelope must be heavily attenuated: "
+        f"near_join={near_join}, ref={ref}"
+    )
+
+    # Outside the 30ms fade window the signal must be at full amplitude.
+    pre_outside = envelope(join_t - 0.060, join_t - 0.040)
+    post_outside = envelope(join_t + 0.040, join_t + 0.060)
+    assert pre_outside > ref * 0.5, (
+        f"signal outside fade window (pre) should be near reference: "
+        f"pre_outside={pre_outside}, ref={ref}"
+    )
+    assert post_outside > ref * 0.5, (
+        f"signal outside fade window (post) should be near reference: "
+        f"post_outside={post_outside}, ref={ref}"
+    )
+
+    # Monotonic-ish attenuation toward the join: a window 20ms before the
+    # join is louder than a window 5ms before. Same on the post side.
+    pre_far = envelope(join_t - 0.025, join_t - 0.020)
+    pre_near = envelope(join_t - 0.005, join_t - 0.000)
+    assert pre_far > pre_near, (
+        f"pre-join envelope must attenuate toward the join: "
+        f"pre_far={pre_far}, pre_near={pre_near}"
+    )
+    post_near = envelope(join_t + 0.000, join_t + 0.005)
+    post_far = envelope(join_t + 0.020, join_t + 0.025)
+    assert post_far > post_near, (
+        f"post-join envelope must recover away from the join: "
+        f"post_near={post_near}, post_far={post_far}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 4f-1 — _snap_cuts_to_word_boundaries
+# ---------------------------------------------------------------------------
+
+
+def _seg_with_words(words: list[tuple[float, float]]) -> Segment:
+    """Build a Segment whose words have the given (start, end) intervals."""
+    word_objs = tuple(
+        Word(text=f"w{i}", start=s, end=e) for i, (s, e) in enumerate(words)
+    )
+    if not word_objs:
+        return Segment(text="", start=0.0, end=0.0, words=())
+    return Segment(
+        text=" ".join(w.text for w in word_objs),
+        start=word_objs[0].start,
+        end=word_objs[-1].end,
+        words=word_objs,
+    )
+
+
+def test_snap_mid_word_cut_pulls_to_word_boundaries():
+    seg = _seg_with_words([(1.0, 1.3), (1.5, 1.9), (2.1, 2.5)])
+    cuts = [CutMark(1.15, 1.95)]
+    out = _snap_cuts_to_word_boundaries(cuts, [seg])
+    # start 1.15 → nearest word start (1.0); end 1.95 → nearest word end (1.9).
+    assert out == [CutMark(1.0, 1.9)]
+
+
+def test_snap_pure_silence_cut_passes_through():
+    """A cut that doesn't overlap any word's [start, end] interval is left
+    untouched — there's no word boundary to snap to and the cut is in
+    silence between segments."""
+    seg = _seg_with_words([(1.0, 1.3), (1.5, 1.9), (2.1, 2.5)])
+    cuts = [CutMark(1.95, 2.05)]
+    out = _snap_cuts_to_word_boundaries(cuts, [seg])
+    assert out == [CutMark(1.95, 2.05)]
+
+
+def test_snap_preserves_reason():
+    seg = _seg_with_words([(1.0, 1.3), (1.5, 1.9)])
+    cuts = [CutMark(1.15, 1.45, reason="filler")]
+    out = _snap_cuts_to_word_boundaries(cuts, [seg])
+    assert out[0].reason == "filler"
+
+
+def test_snap_empty_words_leaves_cuts_unchanged():
+    """No words in any segment → nothing to snap to."""
+    seg = Segment(text="x", start=0.0, end=10.0, words=())
+    cuts = [CutMark(2.0, 4.0)]
+    out = _snap_cuts_to_word_boundaries(cuts, [seg])
+    assert out == [CutMark(2.0, 4.0)]
+
+
+def test_snap_tie_breaks_outward():
+    """Cut start equidistant from two word starts → snap to the smaller.
+    Cut end equidistant from two word ends → snap to the larger."""
+    # Words: starts {0.0, 1.0, 2.0}, ends {0.3, 1.3, 2.3}.
+    # Cut start 0.5 is tied between 0.0 and 1.0 (both at distance 0.5);
+    # outward → 0.0.
+    # Cut end 1.8 is tied between 1.3 and 2.3 (both at distance 0.5);
+    # outward → 2.3.
+    # The cut must overlap at least one word to be eligible for snapping;
+    # [0.5, 1.8] ∩ [1.0, 1.3] is non-empty.
+    seg = _seg_with_words([(0.0, 0.3), (1.0, 1.3), (2.0, 2.3)])
+    cuts = [CutMark(0.5, 1.8)]
+    out = _snap_cuts_to_word_boundaries(cuts, [seg])
+    assert out == [CutMark(0.0, 2.3)]
+
+
+def test_resolve_snaps_before_inverting(tmp_path: Path):
+    """End-to-end: a sub-word cut handed to _resolve_keep_ranges is snapped,
+    then inverted into keep-ranges that respect word boundaries."""
+    media = tmp_path / "x.mp4"
+    media.write_bytes(b"fake")
+    seg = _seg_with_words([(1.0, 1.3), (1.5, 1.9), (2.1, 2.5)])
+    doc = Document(
+        media_path=media,
+        duration=5.0,
+        language="en",
+        segments=[seg],
+        cuts=[CutMark(1.15, 1.95)],
+        created_at=datetime(2026, 4, 27),
+        model_name="tiny",
+    )
+    keeps = _resolve_keep_ranges(
+        doc, pad_lead=0.0, pad_trail=0.0, merge_gap=0.0
+    )
+    # Snap → cut becomes (1.0, 1.9). Invert → keeps [(0.0, 1.0), (1.9, 5.0)].
+    assert keeps == [(0.0, 1.0), (1.9, 5.0)]

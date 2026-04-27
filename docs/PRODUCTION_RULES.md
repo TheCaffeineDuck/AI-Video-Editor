@@ -29,11 +29,11 @@ If a rule looks wrong while you're modifying code that touches it, change the ru
 
 **Rule.** Cut boundaries always sit on word boundaries — never mid-word.
 
-**Why.** Cutting mid-word produces an audible glitch that no fade can rescue, and there's no use case where it's the right thing to do. A user who selects part of a word in the editor means "cut the whole word" — not "cut a fraction of the audio."
+**Why.** Cutting mid-word produces an audible glitch that no fade can rescue, and there's no use case where it's the right thing to do. A user who selects part of a word in the editor means "cut the whole word" — not "cut a fraction of the audio." Two layers of enforcement matter: high-level callers using `CutWordRange` are blocked at construction time, but the renderer also accepts low-level `AddCut(start, end)` operations whose boundaries may land mid-word; snapping at render ingest catches those without making `AddCut` itself rejecting (filler-removal heuristics that operate on time-only intervals stay simple).
 
-**Status.** `PASS` — enforced at construction time in `CutWordRange`. Constructing one whose boundaries don't match a word's start/end raises `ValueError`.
+**Status.** `PASS` — enforced at TWO points. (1) At construction in `CutWordRange`: building one whose boundaries don't match a word's start/end raises `ValueError`. (2) At render ingest: `_resolve_keep_ranges` calls `_snap_cuts_to_word_boundaries` on `doc.cuts` before inversion, snapping each cut's start/end to the nearest word boundary across all segments. Cuts that don't overlap any word (e.g. pure-silence cuts between segments) pass through unchanged. Tie-break: snap outward, erring on cutting more.
 
-**Where.** `core/[editing.py](http://editing.py):CutWordRange`
+**Where.** `core/[editing.py](http://editing.py):CutWordRange` (construction-time check); `core/[render.py](http://render.py):_snap_cuts_to_word_boundaries` (render-ingest snap, Phase 4f-1).
 
 ### Pad direction expands keep-ranges
 
@@ -51,9 +51,9 @@ If a rule looks wrong while you're modifying code that touches it, change the ru
 
 **Why.** Leading and trailing time around a cut serve different purposes. Leading is "breath before the next word" — too much and pacing drags. Trailing is "decay of the previous word + breath" — too little and consonants clip, too much and the dead air signals "this was edited." Symmetric `pad=0.10` is a fine starting point but the right defaults for emotional weight are typically asymmetric (less lead, more trail). Surfacing them separately is what makes that tunable.
 
-**Status.** `GAP` — current implementation uses a single symmetric `pad`. Phase 4f-1 will split into `pad_lead` / `pad_trail`, both defaulting to 0.10 (preserves existing test behavior).
+**Status.** `PASS` — Phase 4f-1 split `pad` into `pad_lead` and `pad_trail`, both defaulting to 0.10. The legacy `pad` keyword is retained as a deprecated parameter that emits `DeprecationWarning` and applies symmetrically.
 
-**Where.** `core/[render.py](http://render.py):render_cut` (current); modified in Phase 4f-1.
+**Where.** `core/[render.py](http://render.py):render_cut`.
 
 ### 30ms audio fades at every segment boundary
 
@@ -61,9 +61,9 @@ If a rule looks wrong while you're modifying code that touches it, change the ru
 
 **Why.** Hard cuts at arbitrary samples produce a discontinuity in the waveform — a click or pop, depending on amplitude at the cut point. 30ms is below the threshold of conscious perception of "fade" but above the threshold needed to avoid the discontinuity. Smartcut's frame-accurate cutting solves the visual side; the audio still needs this even on per-frame-aligned cuts because audio samples don't align to frame boundaries.
 
-**Status.** `GAP` — currently no fade is applied. Smartcut may already handle this via its audio export options; investigate before reimplementing. If it doesn't, post-process the concatenated output with ffmpeg's `afade` at the joins. Phase 4f-1.
+**Status.** `PASS` — Phase 4f-1 added `audio_fade_ms` (default 30). Investigation confirmed smartcut has no native fade option (`AudioExportSettings` only exposes codec/channels/bitrate/sample_rate/denoise; no `fade` references anywhere in the package). Implementation: after smartcut writes the cut output, a second ffmpeg pass with `-c:v copy -af "afade=t=out:...:enable='between(t,...)',afade=t=in:...:enable='between(t,...)'"` applies the fades only at internal segment joins (not the file's outer boundaries). The `enable=` gating is mandatory: a bare `afade=t=out` silences everything past `st+d`, so an unguarded chain of fade-in/out pairs silences the entire track. Values >50 emit a logger warning.
 
-**Where.** `core/[render.py](http://render.py):render_cut` (modified in Phase 4f-1).
+**Where.** `core/[render.py](http://render.py):_apply_audio_fades` and `core/[render.py](http://render.py):render_cut`.
 
 ### Subtitles render last in the filter chain
 
