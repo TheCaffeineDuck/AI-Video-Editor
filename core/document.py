@@ -61,8 +61,51 @@ class CutMark:
     ``reason`` is a free-form tag we expect callers to populate with values
     like ``"manual"``, ``"filler"``, ``"silence"`` — not enforced as an enum
     so future kinds of cuts don't require schema bumps.
+
+    Phase 4f-3 retired ``CutMark`` from the live Document model — v2
+    Documents store keep-ranges instead. The class stays defined as a
+    handy intermediate for the v1→v2 migration code in
+    :meth:`Document.from_json`.
     """
 
+    start: float
+    end: float
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class MediaSource:
+    """A single piece of source media referenced by a v2 Document.
+
+    Phase 4f-3 introduced the multi-source model: a Document may compose
+    spans from any number of media files. Each file gets a ``MediaSource``
+    entry with a stable ``id`` (``"src0"``, ``"src1"``, …) used by
+    :class:`Range` to point back to it.
+
+    ``hash`` is the cache key from :func:`core.cache.cache_key` — kept on
+    the source for self-describing JSON sidecars. It's redundant with the
+    Document-level ``source_hash`` for single-source projects, but makes
+    multi-source caches well-defined when one of several sources changes.
+    """
+
+    id: str
+    path: Path
+    duration: float
+    hash: str = ""
+
+
+@dataclass(frozen=True)
+class Range:
+    """A KEEP-range on the editable timeline.
+
+    A v2 Document's ``ranges`` list is the timeline: an ordered sequence
+    of these. Each range names which source it samples from and which
+    ``[start, end]`` interval (in source time, not output time). Reasons
+    are inherited from the v1 cut they came from when migrating, or set
+    by edit commands going forward.
+    """
+
+    source_id: str
     start: float
     end: float
     reason: str = ""
