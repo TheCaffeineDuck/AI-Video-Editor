@@ -290,6 +290,10 @@ class MainWindow(QMainWindow):
         self.settings = new
         if self._transcribe_pane is not None:
             self._transcribe_pane.update_settings(new)
+        if self._editor_pane is not None:
+            # Layout flip and autosave-interval changes propagate live;
+            # the rest take effect on the next render or save.
+            self._editor_pane.apply_settings(new)
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt API)
         self._cancel_requested.set()

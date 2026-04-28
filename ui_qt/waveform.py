@@ -42,7 +42,18 @@ from PySide6.QtWidgets import QWidget
 
 from core.document import Range
 
-_DIM_OVERLAY = QColor(0, 0, 0, 130)  # ~50% black, reads as "muted"
+# 5d shipped a translucent black overlay. Real-content check in 5e
+# (synthetic.mp4 + dark-mode offscreen palette) showed it disappears
+# against a dark base — black-on-black is invisible regardless of
+# alpha. The replacement is a translucent neutral gray plus a thin
+# diagonal hatch:
+#  - solid gray @ ~50% alpha reads as "dim" on light bases (lifts
+#    toward gray) AND on dark bases (lifts toward gray).
+#  - the diagonal lines guarantee visual distinction in either theme,
+#    even on a peak strip whose underlying ink is already gray.
+_DIM_OVERLAY = QColor(128, 128, 128, 130)
+_DIM_HATCH = QColor(128, 128, 128, 180)
+_DIM_HATCH_SPACING = 6  # pixels between hatch lines
 _LOADING_BG = QColor(60, 60, 60)
 _LOADING_TEXT = QColor(220, 220, 220)
 _PEAK_FALLBACK = QColor(160, 160, 160)
@@ -260,10 +271,26 @@ class WaveformStrip(QWidget):
         x1 = self._x_for_seconds(rect, end_s)
         if x1 <= x0:
             return
-        painter.fillRect(
-            QRectF(x0, rect.y(), x1 - x0, rect.height()),
-            _DIM_OVERLAY,
-        )
+        seg_rect = QRectF(x0, rect.y(), x1 - x0, rect.height())
+        painter.fillRect(seg_rect, _DIM_OVERLAY)
+        # Diagonal cross-hatch on top — guarantees visual distinction
+        # against any palette (the solid overlay alone disappears in
+        # dark mode). Cheap: O(width / spacing) line draws.
+        painter.save()
+        painter.setClipRect(seg_rect)
+        painter.setPen(QPen(_DIM_HATCH, 1))
+        height = rect.height()
+        # Span so each line of slope +1 covers the whole rect height as
+        # the rect scans across x. Lines start at x = (some negative
+        # offset) and run to x + height.
+        start_xx = int(seg_rect.left()) - height
+        end_xx = int(seg_rect.right())
+        for xx in range(start_xx, end_xx, _DIM_HATCH_SPACING):
+            painter.drawLine(
+                QPointF(xx, rect.y() + height),
+                QPointF(xx + height, rect.y()),
+            )
+        painter.restore()
 
     def _paint_playhead(self, painter: QPainter, rect: QRect) -> None:
         if self._duration_s <= 0:

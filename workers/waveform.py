@@ -43,6 +43,15 @@ _LOG = logging.getLogger(__name__)
 
 _SAMPLE_RATE = 22_050
 _DEFAULT_BUCKETS = 4000
+
+# Peaks-cache schema version. Bump this whenever the on-disk layout
+# changes — for example: switching from ``(min, max)`` pairs to
+# ``abs_max`` scalars, changing the default bucket count, or adding a
+# field that older readers must regenerate to honor. Mismatched
+# ``schema_version`` makes :func:`load_peaks_cache` return ``None`` so
+# the controller falls through to a fresh generation. This is the same
+# code path as a ``source_hash`` mismatch — there's no migration; we
+# just regenerate.
 _PEAKS_SCHEMA_VERSION = 1
 PEAKS_SUFFIX = ".peaks.npz"
 

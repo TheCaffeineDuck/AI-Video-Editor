@@ -1,10 +1,26 @@
 """Settings dialog for the Qt UI.
 
-Phase 5a ships the Transcription tab only — model, language, output
-directory, device/precision. The Editor and Advanced tabs land in
-Phase 5f. The dialog reads/writes the same settings.json file the
-customtkinter app uses, so launching the Qt app on an existing install
-preserves the user's choices.
+Phase 5e completes the dialog from 5a's stub: three tabs
+(Transcription / Editor / Advanced) covering every Settings field
+that the UI is expected to expose. The dialog reads/writes the same
+``settings.json`` file the customtkinter app uses, so launching the
+Qt app on an existing install preserves the user's choices.
+
+Tab placement (Decision 6):
+
+- **Transcription**: model, language passthrough, output dir, device,
+  precision, model-cache controls.
+- **Editor**: layout (video on top / left), default pad-lead, pad-trail,
+  audio fade.
+- **Advanced**: autosave interval (0 = off, special-text shown as
+  ``"Off"``).
+
+Live propagation: when the dialog ``Save``-button fires, the saved
+:class:`Settings` is emitted on ``settings_saved``. MainWindow wires
+that into ``_apply_settings``, which forwards layout changes to the
+running :class:`EditorPane` and autosave-interval changes to its
+:class:`DocumentSession`. Other render-default fields take effect on
+the next render — no propagation needed.
 """
 
 from __future__ import annotations
@@ -18,23 +34,32 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
+    QSpinBox,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from core.models import MODEL_NAMES, cache_root
-from core.settings import Settings, save_settings
+from core.settings import LAYOUT_CHOICES, Settings, save_settings
 
 VERSION = "0.1.0"
 DEVICES = ("auto", "cpu", "cuda")
 COMPUTE_TYPES = ("auto", "int8", "float16", "float32")
+
+# Layout combo: human-readable label ↔ stored Settings value. The order
+# matches LAYOUT_CHOICES so first-selected stays "video_top".
+_LAYOUT_LABELS: dict[str, str] = {
+    "video_top": "Video on top",
+    "video_left": "Video on left",
+}
 
 
 class SettingsDialog(QDialog):
@@ -47,12 +72,15 @@ class SettingsDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.setMinimumSize(560, 420)
+        self.setMinimumSize(560, 460)
         self._current = current
 
         layout = QVBoxLayout(self)
         tabs = QTabWidget()
         tabs.addTab(self._build_transcription_tab(), "Transcription")
+        tabs.addTab(self._build_editor_tab(), "Editor")
+        tabs.addTab(self._build_advanced_tab(), "Advanced")
+        self._tabs = tabs
         layout.addWidget(tabs)
 
         buttons = QDialogButtonBox(
@@ -62,6 +90,34 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    # ----- accessors (used by tests + MainWindow live wiring) -----
+
+    @property
+    def tabs(self) -> QTabWidget:
+        return self._tabs
+
+    @property
+    def layout_combo(self) -> QComboBox:
+        return self._layout_combo
+
+    @property
+    def pad_lead_spin(self) -> QDoubleSpinBox:
+        return self._pad_lead_spin
+
+    @property
+    def pad_trail_spin(self) -> QDoubleSpinBox:
+        return self._pad_trail_spin
+
+    @property
+    def audio_fade_spin(self) -> QSpinBox:
+        return self._audio_fade_spin
+
+    @property
+    def autosave_spin(self) -> QSpinBox:
+        return self._autosave_spin
+
+    # ----- tabs -----
 
     def _build_transcription_tab(self) -> QWidget:
         page = QWidget()
@@ -111,6 +167,62 @@ class SettingsDialog(QDialog):
 
         return page
 
+    def _build_editor_tab(self) -> QWidget:
+        page = QWidget()
+        form = QFormLayout(page)
+
+        self._layout_combo = QComboBox()
+        for choice in LAYOUT_CHOICES:
+            self._layout_combo.addItem(_LAYOUT_LABELS[choice], userData=choice)
+        idx = self._layout_combo.findData(self._current.layout)
+        if idx >= 0:
+            self._layout_combo.setCurrentIndex(idx)
+        form.addRow("Layout", self._layout_combo)
+
+        self._pad_lead_spin = QDoubleSpinBox()
+        self._pad_lead_spin.setRange(0.0, 2.0)
+        self._pad_lead_spin.setSingleStep(0.05)
+        self._pad_lead_spin.setSuffix(" s")
+        self._pad_lead_spin.setDecimals(2)
+        self._pad_lead_spin.setValue(float(self._current.default_pad_lead))
+        form.addRow("Default pad lead", self._pad_lead_spin)
+
+        self._pad_trail_spin = QDoubleSpinBox()
+        self._pad_trail_spin.setRange(0.0, 2.0)
+        self._pad_trail_spin.setSingleStep(0.05)
+        self._pad_trail_spin.setSuffix(" s")
+        self._pad_trail_spin.setDecimals(2)
+        self._pad_trail_spin.setValue(float(self._current.default_pad_trail))
+        form.addRow("Default pad trail", self._pad_trail_spin)
+
+        self._audio_fade_spin = QSpinBox()
+        self._audio_fade_spin.setRange(0, 500)
+        self._audio_fade_spin.setSingleStep(10)
+        self._audio_fade_spin.setSuffix(" ms")
+        self._audio_fade_spin.setValue(int(self._current.default_audio_fade_ms))
+        form.addRow("Default audio fade", self._audio_fade_spin)
+
+        return page
+
+    def _build_advanced_tab(self) -> QWidget:
+        page = QWidget()
+        form = QFormLayout(page)
+
+        self._autosave_spin = QSpinBox()
+        self._autosave_spin.setRange(0, 600)
+        self._autosave_spin.setSingleStep(10)
+        self._autosave_spin.setSuffix(" s")
+        # Special-text replaces the rendered value when the spinbox sits
+        # at its minimum; "Off" reads better than "0 s" for the disabled
+        # state (Decision 8 — autosave is off by default).
+        self._autosave_spin.setSpecialValueText("Off")
+        self._autosave_spin.setValue(int(self._current.autosave_interval_s))
+        form.addRow("Autosave interval", self._autosave_spin)
+
+        return page
+
+    # ----- handlers -----
+
     def _browse_output(self) -> None:
         chosen = QFileDialog.getExistingDirectory(
             self, "Choose default output folder"
@@ -135,6 +247,7 @@ class SettingsDialog(QDialog):
 
     def _save(self) -> None:
         out_dir = self._output_dir.text().strip() or None
+        layout_value = self._layout_combo.currentData() or self._current.layout
         new = Settings(
             default_model=self._model_combo.currentText(),
             default_language=self._current.default_language,
@@ -142,11 +255,13 @@ class SettingsDialog(QDialog):
             output_dir=out_dir,
             compute_device=self._device_combo.currentText(),
             compute_type=self._compute_combo.currentText(),
-            layout=self._current.layout,
-            default_pad_lead=self._current.default_pad_lead,
-            default_pad_trail=self._current.default_pad_trail,
-            default_audio_fade_ms=self._current.default_audio_fade_ms,
-            autosave_interval_s=self._current.autosave_interval_s,
+            layout=layout_value,
+            default_pad_lead=float(self._pad_lead_spin.value()),
+            default_pad_trail=float(self._pad_trail_spin.value()),
+            default_audio_fade_ms=int(self._audio_fade_spin.value()),
+            autosave_interval_s=int(self._autosave_spin.value()),
+            editor_splitter_state=self._current.editor_splitter_state,
+            transcript_splitter_state=self._current.transcript_splitter_state,
         )
         save_settings(new)
         self.settings_saved.emit(new)

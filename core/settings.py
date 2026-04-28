@@ -7,6 +7,8 @@ crash. The on-disk format is plain JSON for inspectability.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import os
@@ -39,6 +41,14 @@ DEFAULT_PAD_LEAD = 0.10
 DEFAULT_PAD_TRAIL = 0.10
 DEFAULT_AUDIO_FADE_MS = 30
 DEFAULT_AUTOSAVE_INTERVAL_S = 0  # 0 = autosave OFF
+
+# Phase 5e — splitter state persistence. The raw QByteArray emitted by
+# QSplitter.saveState() doesn't survive JSON serialization, so we store
+# a base64 string when present and decode back to bytes on load. ``None``
+# means "no saved state" (the splitter falls back to its built-in
+# proportional defaults).
+DEFAULT_EDITOR_SPLITTER_STATE: bytes | None = None
+DEFAULT_TRANSCRIPT_SPLITTER_STATE: bytes | None = None
 
 
 def settings_dir() -> Path:
@@ -79,8 +89,22 @@ class Settings:
     default_audio_fade_ms: int = DEFAULT_AUDIO_FADE_MS
     autosave_interval_s: int = DEFAULT_AUTOSAVE_INTERVAL_S
 
+    # Phase 5e — opaque QSplitter state (raw bytes from
+    # ``QSplitter.saveState()``; restored via ``restoreState`` on next
+    # editor open). ``None`` = no persisted layout, fall through to the
+    # programmatic defaults set in ``EditorPane._build_splitters``.
+    editor_splitter_state: bytes | None = DEFAULT_EDITOR_SPLITTER_STATE
+    transcript_splitter_state: bytes | None = DEFAULT_TRANSCRIPT_SPLITTER_STATE
+
     def to_dict(self) -> dict:
-        return asdict(self)
+        data = asdict(self)
+        # Bytes don't survive JSON. Encode to base64 ASCII so they round-
+        # trip cleanly; ``None`` stays ``None``.
+        for key in ("editor_splitter_state", "transcript_splitter_state"):
+            value = data.get(key)
+            if isinstance(value, bytes):
+                data[key] = base64.b64encode(value).decode("ascii")
+        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> Settings:
@@ -109,7 +133,34 @@ class Settings:
                     DEFAULT_LAYOUT,
                 )
             kwargs["layout"] = DEFAULT_LAYOUT
+        # Phase 5e — splitter state is base64-encoded on disk. Decode back
+        # to bytes so consumers can hand the value straight to
+        # ``QSplitter.restoreState``. Garbage values fall back to None
+        # rather than crashing the load.
+        for key in ("editor_splitter_state", "transcript_splitter_state"):
+            kwargs[key] = _decode_splitter_state(kwargs.get(key))
         return cls(**kwargs)
+
+
+def _decode_splitter_state(value: object) -> bytes | None:
+    """Decode a base64 splitter-state string back to ``bytes``.
+
+    ``None`` and empty values pass through. Pre-existing ``bytes`` (e.g.
+    when the dict was constructed in-process rather than read from disk)
+    are returned unchanged. A garbled string is logged and dropped.
+    """
+    if value in (None, "", b""):
+        return None
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        try:
+            return base64.b64decode(value, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            log.warning("could not decode splitter state %r: %s", value, exc)
+            return None
+    log.warning("unexpected splitter-state type %s; dropping", type(value).__name__)
+    return None
 
 
 def load_settings(path: Path | None = None) -> Settings:

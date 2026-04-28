@@ -240,25 +240,40 @@ def test_strip_position_update_repaints(qtbot):
     assert not _images_equal(img1, img2)
 
 
-def test_strip_dim_overlay_darkens_cut_regions(qtbot):
-    """Cut spans must read darker than kept spans on the rendered strip."""
+def test_strip_dim_overlay_distinguishes_cut_regions(qtbot):
+    """Cut spans must read visually distinct from kept spans.
+
+    5d shipped a "darker" overlay; the 5e real-content check found
+    black-on-dark-mode is invisible. The new implementation is a
+    translucent gray + diagonal hatch that lifts dark bases toward
+    gray and pushes light bases the same way — direction depends on
+    palette. The contract is "different enough to read as cut" not
+    "uniformly darker," so the test asserts a perceptual delta in
+    either direction.
+    """
     strip = _build_strip(qtbot, width=400, height=80)
     strip.set_peaks(_flat_peaks(400), duration_s=10.0)
-    # Keep [0, 5), cut [5, 10] of a 10-second strip.
     strip.set_ranges([Range(source_id="src0", start=0.0, end=5.0)], 10.0)
     img = _grab_image(strip)
 
-    # Sample a column in the kept span and one in the cut span at the
-    # same row. Use rows that should not coincide with the playhead
-    # (which sits at x=0 by default).
-    y_sample = strip.height() // 2 + 1
-    kept_x = strip.width() // 4  # ~25% across, in the kept half
-    cut_x = strip.width() * 3 // 4  # ~75% across, in the cut half
-    kept_pixel = img.pixelColor(kept_x, y_sample)
-    cut_pixel = img.pixelColor(cut_x, y_sample)
-    # The dim overlay is translucent black, so the cut pixel must be
-    # darker (lower lightness) than the kept pixel.
-    assert _lightness(cut_pixel) < _lightness(kept_pixel)
+    # Average lightness across a small rect rather than one pixel —
+    # the hatch lines mean a single sampled column may land on a hatch
+    # stroke (very light) or between strokes (overlay base).
+    def _avg_lightness(x_lo: int, x_hi: int) -> float:
+        total = 0
+        n = 0
+        for x in range(x_lo, x_hi):
+            for y in range(strip.height() // 4, 3 * strip.height() // 4):
+                total += _lightness(img.pixelColor(x, y))
+                n += 1
+        return total / max(1, n)
+
+    kept_avg = _avg_lightness(strip.width() // 8, strip.width() // 8 + 30)
+    cut_avg = _avg_lightness(strip.width() * 5 // 8, strip.width() * 5 // 8 + 30)
+    # Either direction is acceptable; what matters is a visible delta.
+    assert abs(kept_avg - cut_avg) >= 10, (
+        f"cut-vs-kept contrast too low: kept={kept_avg:.1f} cut={cut_avg:.1f}"
+    )
 
 
 def test_strip_resize_does_not_regenerate_peaks(qtbot, monkeypatch):
