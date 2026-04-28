@@ -149,10 +149,19 @@ def test_result_card_new_transcription_button_fires(tk_root):
 
 
 @pytest.fixture
-def app(tk_root):
-    """Build an App against the bare Tk root (no DnD), avoiding mainloop()."""
+def app(tk_root, tmp_path, monkeypatch):
+    """Build an App against the bare Tk root (no DnD), avoiding mainloop().
+
+    Pins ``WHISPER_SETTINGS_DIR`` to ``tmp_path`` so any settings-write
+    triggered through the App stays in the test's tmp tree rather than
+    silently mutating the user's real ``~/Library/Application Support``
+    settings file. The fixture isolates by default — categorical isolation
+    is cheaper than reasoning per-test about whether ``save_settings``
+    can be reached.
+    """
     from ui.app import App
 
+    monkeypatch.setenv("WHISPER_SETTINGS_DIR", str(tmp_path))
     instance = App(root=tk_root)
     yield instance
     # No explicit teardown needed; tk_root fixture destroys the root.

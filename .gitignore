@@ -16,3 +16,7 @@ htmlcov/
 
 # Regenerated per-developer by tests/conftest.py::synthetic_video
 tests/fixtures/synthetic.mp4
+
+# Phase 5d: waveform peak side-cars are a per-source cache; never
+# committed (regenerated on demand via workers/waveform.py).
+*.peaks.npz

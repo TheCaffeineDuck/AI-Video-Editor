@@ -1,38 +1,39 @@
 # Transcribe — Project State Report
 
-**Date:** 2026-04-27
+**Date:** 2026-04-28
 **Branch:** main
-**Commit:** Phase 5c — transcript interactivity, cuts, undo, save
-**Status:** All 458 tests passing (385 prior + 27 5a Qt + 17 5b editor + 25 5c interactivity + 4 5c transition_to). Lint clean for changed files.
+**Commit:** Phase 5d — waveform strip with cache and dim regions
+**Status:** All 479 tests passing (458 prior + 21 5d waveform). Lint clean for changed files.
 
 ---
 
-## 1. Phase 5c in two paragraphs
+## 1. Phase 5d in two paragraphs
 
-5c makes the transcript editable. Words are click targets that seek the
-video; drag-select picks a range; Cmd-X strikes through it (or restores
-it if the selection is already entirely struck); Cmd-Z / Cmd-Shift-Z
-drive an undo/redo stack; Cmd-S writes `Document.to_json` back to the
-cache path the transcribe flow originally used; the title bar tracks
-dirty state with a `●` prefix and a macOS-native modified dot.
-Playhead position from `QMediaPlayer.positionChanged` highlights the
-currently-playing word in bold. Cut words stay in the transcript
-(Decision 2 — strikethrough is reversible, never destructive); the
-``set_document_model`` walk now emits every word and toggles the
-strikethrough format from a per-word `kept` flag.
+5d turns the empty `WaveformPlaceholder` strip below the transcript
+into a real, readable visualization: ffmpeg-decoded peaks rendered as
+a min/max-pair waveform, translucent black overlay on every cut span,
+a 1-pixel highlight playhead that follows `QMediaPlayer.positionChanged`,
+and click-to-seek anywhere on the strip. Decision 5 stays
+non-negotiable — there are no drag handles, no waveform-driven cut
+creation, no silence-detection markers; the strip is *navigation +
+visualization only*. Peaks are generated off the UI thread via a
+QThread-hosted worker and cached as a side-car `.peaks.npz` next to
+the source (mirroring the existing `.transcribe.json` convention).
+A cache-hit path opens the strip in <1 ms; a cache-miss flips the
+strip into a "Generating waveform…" placeholder while ffmpeg runs.
 
-The plumbing landed in three places: a new
-`ui_qt/document_session.py` that wraps the existing
-`core.editing.CommandStack` with id-based dirty tracking
-(undo-back-to-pristine genuinely clears dirty); a substantial rewrite
-of `ui_qt/components/transcript_view.py` for word-grain mouse
-handling, selection background, and playhead bold; and a now-fatter
-`EditorPane` that owns the QActions, wires save through
-`workers.transcription.candidate_cache_path`, and forwards
-`dirty_changed` up to the title-bar refresh on `MainWindow`.
-`AppStateMachine` gained the public `transition_to(state)` method the
-5b report flagged as missing — both UIs now use it instead of the old
-`state._emit()` reach-in.
+The peak generator (`workers/waveform.py`) decodes the source at
+22 kHz mono via a bare `subprocess.Popen` call (one fewer dep than
+`ffmpeg-python`) and reduces samples to a `(bucket_count, 2)` array
+of `(min, max)` pairs per bucket. Stale-detection uses
+`core.cache.cache_key` so a `touch` on the source invalidates the
+cache. A new `WaveformController(QObject)` owns the strip ↔ session ↔
+player wiring — `EditorPane` instantiates one and forwards
+`seek_requested` to the video player. Real-corpus smoke against the
+22.5 GB podcast: 4.26 seconds wall-clock for 4000 buckets, well under
+the spec's 30 s threshold. The locationbird files turned out to be
+video-only (no audio stream); the generator now detects that case and
+returns a flat zero-peaks array rather than ffmpeg-erroring.
 
 ---
 
@@ -44,7 +45,7 @@ handling, selection background, and playhead bold; and a now-fatter
 │   ├── audio.py
 │   ├── cache.py
 │   ├── document.py
-│   ├── editing.py            # consumed by 5c — no changes here
+│   ├── editing.py
 │   ├── exporters.py
 │   ├── languages.py
 │   ├── model_loader.py
@@ -55,21 +56,23 @@ handling, selection background, and playhead bold; and a now-fatter
 │   └── transcriber.py
 ├── workers/
 │   ├── events.py
-│   └── transcription.py
+│   ├── transcription.py
+│   └── waveform.py            # NEW (5d) — peak generation + cache
 ├── ui/
-│   ├── app.py                # 5c: uses transition_to
+│   ├── app.py
 │   ├── components/ ...
-│   ├── state.py              # 5c: public transition_to method
+│   ├── state.py
 │   └── theme.py
 ├── ui_qt/
-│   ├── app.py                # 5c: title-bar dirty marker; transition_to
-│   ├── document_session.py   # NEW (5c) — Document + CommandStack + dirty
-│   ├── editor_pane.py        # 5c: QActions, save, session wiring
+│   ├── app.py
+│   ├── document_session.py
+│   ├── editor_pane.py         # 5d: WaveformStrip + WaveformController
 │   ├── transcribe_pane.py
-│   ├── waveform.py
+│   ├── waveform.py            # 5d: WaveformStrip replaces placeholder
+│   ├── waveform_controller.py # NEW (5d) — strip ↔ session ↔ player
 │   ├── style.py
 │   └── components/
-│       ├── transcript_view.py  # 5c: cuts, selection, playhead, mouse
+│       ├── transcript_view.py
 │       ├── video_viewport.py
 │       └── ...
 ├── docs/PRODUCTION_RULES.md
@@ -91,17 +94,18 @@ handling, selection background, and playhead bold; and a now-fatter
 │   ├── test_render.py
 │   ├── test_settings.py
 │   ├── test_settings_panel.py
-│   ├── test_state.py                # 5c: transition_to tests
+│   ├── test_state.py
 │   ├── test_timeline.py
 │   ├── test_transcriber.py
-│   ├── test_ui.py
+│   ├── test_ui.py                       # 5d: app fixture isolates WHISPER_SETTINGS_DIR
 │   ├── test_ui_qt.py
-│   ├── test_ui_qt_editor.py         # 5c: rewritten render-all-words tests
-│   └── test_ui_qt_interactivity.py  # NEW (5c) — 25 interactivity tests
+│   ├── test_ui_qt_editor.py             # 5d: WaveformStrip refs + tighter _fresh_settings
+│   ├── test_ui_qt_interactivity.py
+│   └── test_waveform.py                 # NEW (5d) — 21 peak/cache/strip tests
 ├── main.py / main_qt.py
 ├── pyproject.toml / requirements*.txt
 ├── CLAUDE.md
-├── STATE.md                         # this file
+├── STATE.md
 └── whisper_transcriber_spec.md
 ```
 
@@ -109,24 +113,22 @@ handling, selection background, and playhead bold; and a now-fatter
 
 ## 3. Dependencies
 
-Unchanged from 5b. PySide6 6.11 ships QtMultimedia + QtMultimediaWidgets
-in `PySide6_Essentials` / `PySide6_Addons`; no python-vlc.
+Unchanged from 5c. `numpy` is already pulled in transitively by
+`faster-whisper`/`smartcut`; no new top-level requirement.
 
 ---
 
-## 4. Code inventory (deltas from 5b)
+## 4. Code inventory (deltas from 5c)
 
-| File | Lines | What's new in 5c |
+| File | Lines | What's new in 5d |
 |------|------:|------------------|
-| `ui_qt/components/transcript_view.py` | 358 | render every word with per-word `kept` flag; strikethrough on cut; word-grain mouse handlers (press/move/release); selection background; playhead-follow bold + ensureCursorVisible auto-scroll; binary-search word lookup |
-| `ui_qt/editor_pane.py` | 326 | `DocumentSession` integration; QAction wiring for Cut/Delete/Restore/Undo/Redo/Save with `ApplicationShortcut` context; save via `candidate_cache_path`; toolbar Save/Undo/Redo buttons; `dirty_changed` and `document_saved` signals |
-| `ui_qt/document_session.py` | 134 | NEW — wraps the existing `core.editing.CommandStack` with id-based dirty tracking; `apply` returns False on no-op |
-| `ui_qt/app.py` | 305 | title-bar dirty marker via `_refresh_window_title`; `transition_to` instead of `state._emit`; restored `setWindowModified` |
-| `ui/app.py` | 392 | `transition_to(AppState.FILE_LOADED)` instead of `state.state = X; state._emit()` |
-| `ui/state.py` | 232 | NEW public `transition_to(new_state)` method; `_go` kept as private alias; docstring on the new method explains why direct assignment is wrong |
-| `tests/test_ui_qt_interactivity.py` | 414 | NEW — 25 tests across DocumentSession, transcript interactivity, EditorPane shortcuts, save round-trip, title-bar lifecycle, transition_to |
-| `tests/test_ui_qt_editor.py` | 285 | rewritten transcript tests for "all words rendered, cut struck"; existing splitter/swap tests untouched |
-| `tests/test_state.py` | 311 | added 4 `transition_to` tests (legal, illegal, listener fires, same-state no-op) |
+| `workers/waveform.py` | 230 | NEW — `generate_peaks` (subprocess + ffmpeg pipe, `(min, max)` per bucket), `save_peaks_cache` / `load_peaks_cache` (npz side-car with `cache_key`-based stale detection), `PeaksCancelledError` for clean-shutdown cancellation |
+| `ui_qt/waveform.py` | 240 | rewrote `WaveformPlaceholder` as `WaveformStrip(QWidget)` — three-layer paint (peaks / dim / playhead), click-to-seek, loading placeholder, fixed 64–96 px height. Old name kept as backwards-compat alias |
+| `ui_qt/waveform_controller.py` | 175 | NEW — `WaveformController(QObject)` orchestrates strip ↔ DocumentSession ↔ video player, owns the QThread for off-UI peak generation, kills the in-flight ffmpeg on `shutdown` so EditorPane teardown is clean |
+| `ui_qt/editor_pane.py` | 333 | swap `WaveformPlaceholder` → `WaveformStrip`, instantiate `WaveformController` post-build, wire `seek_requested` → `video.seek_ms`, add controller `shutdown()` to `release()` |
+| `tests/test_waveform.py` | 280 | NEW — 21 tests across pure-data peak generation, cache round-trip + invalidation, `WaveformStrip` click-to-seek + dim overlay + position repaint + resize + loading state + slow synthetic corpus |
+| `tests/test_ui.py` | 281 | tk `app` fixture now monkeypatches `WHISPER_SETTINGS_DIR` to `tmp_path` (categorical isolation per spec §7) |
+| `tests/test_ui_qt_editor.py` | 367 | imports renamed `WaveformStrip`; the construction test asserts both min and max heights; `_fresh_settings` defaults `output_dir=tmp_path` for defensive isolation |
 
 ### Test count
 
@@ -135,18 +137,20 @@ in `PySide6_Essentials` / `PySide6_Addons`; no python-vlc.
 | End of 4f-3 | 385 | 374 | 11 |
 | End of 5a   | 413 | 402 | 11 |
 | End of 5b   | 429 | 418 | 11 |
-| **End of 5c** | **458** | **447** | **11** |
+| End of 5c   | 458 | 447 | 11 |
+| **End of 5d** | **479** | **467** | **12** |
 
-`pytest -q` runs all 458 green in ~10 s on this M4. The five
-`RuntimeWarning: Failed to disconnect ... timeout()` lines persist —
-pytest-qt internal, not project code.
+`pytest -q` runs all 479 green in ~11 s on this M4. The
+pytest-qt `RuntimeWarning: Failed to disconnect ... timeout()` lines
+persist (5c-tracked, pytest-qt internal).
 
 ---
 
-## 5. Git history (post-5c)
+## 5. Git history (post-5d)
 
 ```
-phase 5c: transcript interactivity, cuts, undo, save   (this commit)
+phase 5d: waveform strip with cache and dim regions   (this commit)
+phase 5c: transcript interactivity, cuts, undo, save
 phase 5b: editor pane skeleton + qmediaplayer wiring
 phase 5a: qt scaffold + port transcribe flow
 phase 4f-3 (3/3) — final: docs + STATE.md
@@ -155,384 +159,298 @@ phase 4f-3 (3/3) — final: docs + STATE.md
 
 ---
 
-## 6. Public APIs added or reshaped in Phase 5c
+## 6. Public APIs added or reshaped in Phase 5d
 
 ```python
-# ui.state — new public transition method (carries the old _go semantics)
-class AppStateMachine:
-    def transition_to(self, new_state: AppState) -> None:
-        """Validated transition + listener notification.
+# workers.waveform — NEW
+def generate_peaks(
+    source_path: Path,
+    bucket_count: int = 4000,
+    on_progress: Callable[[float], None] | None = None,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> np.ndarray: ...
+    # Returns shape (bucket_count, 2) of (min, max) per bucket,
+    # dtype=float32, values bounded in [-1, 1]. Raises FileNotFoundError,
+    # subprocess.CalledProcessError, PeaksCancelledError.
 
-        Replaces the old `state.state = X; state._emit()` pattern in
-        both UIs. Same legal-transitions check as the internal call
-        sites use; raises InvalidTransitionError on bad transitions.
-        """
+def peaks_path(source_path: Path) -> Path: ...
+def save_peaks_cache(source_path, peaks, duration_s) -> Path: ...
+def load_peaks_cache(source_path) -> CachedPeaks | None: ...
+class CachedPeaks: peaks; source_hash; duration_s; bucket_count
 
-# ui_qt.document_session — NEW
-class DocumentSession(QObject):
-    document_changed: Signal(Document)
-    dirty_changed: Signal(bool)
+class PeaksCancelledError(RuntimeError): ...
 
-    def __init__(self, document: Document, *, max_undo_depth: int = 100, parent=None) -> None: ...
-    @property document: Document
-    @property stack: CommandStack
-    @property can_undo: bool
-    @property can_redo: bool
-    @property is_dirty: bool
+# ui_qt.waveform — reshaped
+class WaveformStrip(QWidget):
+    seek_requested: Signal(int)  # milliseconds
 
-    def apply(self, command: EditCommand) -> bool: ...    # False = no-op (ranges unchanged)
-    def undo(self) -> bool: ...                            # False = nothing to undo
-    def redo(self) -> bool: ...                            # False = nothing to redo
-    def mark_saved(self) -> None: ...
+    def set_peaks(self, peaks: np.ndarray, duration_s: float) -> None: ...
+    def set_ranges(self, ranges, total_duration_s: float) -> None: ...
+    def set_position(self, ms: int) -> None: ...
+    def set_loading(self, loading: bool) -> None: ...
 
-# ui_qt.editor_pane — additions
-class EditorPane(QWidget):
-    dirty_changed: Signal(bool)        # NEW — forwarded from DocumentSession
-    document_saved: Signal(Path)       # NEW — fires after a successful Cmd-S
+    @property peaks: np.ndarray | None
+    @property ranges: list[Range]
+    @property position_ms: int
+    @property is_loading: bool
 
-    @property session: DocumentSession  # NEW
+WaveformPlaceholder = WaveformStrip   # backwards-compat alias
 
-# ui_qt.components.transcript_view
-class TranscriptView(QTextEdit):
-    word_clicked: Signal(int)              # NEW — bare-click word index
-    selection_changed: Signal(object)      # NEW — (start, end) tuple or None
-    cut_requested: Signal(int, int)        # NEW — keyboard cut
-    seek_requested: Signal(int)            # NEW — seek to ms
-
-    @property selection: tuple[int, int] | None
-    @property playhead_word: int           # -1 = none
-
-    def set_playhead_position(self, position_ms: int) -> None: ...
-    def request_cut_for_selection(self) -> bool: ...   # False = no live selection
-    def clear_selection(self) -> None: ...
-
-@dataclass(frozen=True)
-class WordRef:
-    seg_idx: int
-    word_idx: int
-    word: Word
-    kept: bool = True   # NEW (5c) — drives strikethrough render
-
-def collect_words(document: Document) -> list[WordRef]: ...
-    # 5c: now returns EVERY word in the document, with `kept` flagged
-    # per the Document's ranges. 5b returned only kept words.
+# ui_qt.waveform_controller — NEW
+class WaveformController(QObject):
+    def __init__(self, strip: WaveformStrip, session: DocumentSession, *, parent=None) -> None: ...
+    def bind_player(self, viewport: VideoViewport) -> None: ...
+    def shutdown(self) -> None: ...    # called from EditorPane.release
 ```
 
 ---
 
 ## 7. What's solid
 
-1. **Cut → strikethrough → undo round-trips end-to-end.** Manually
-   verified: a selection on words 1–2 cut produces ranges
-   `[Range(0.0, 0.5)]` plus strikethrough on the displayed words 1
-   and 2 plus a `●` in the title bar. Undo restores ranges to
-   `[Range(0.0, 1.5)]` plus strikethrough drops plus the title bar
-   loses the dot.
-2. **Dirty tracking handles undo-back-to-pristine.** Id-based saved
-   pointer means `id(document)` of the current Document equals the
-   one we marked saved iff the user has truly returned to the saved
-   state. The fork-after-save case (where the saved redo entry gets
-   discarded) is handled correctly — dirty stays True because the
-   saved Document is unreachable. Six dedicated tests cover the
-   matrix.
-3. **Strict overlap fixes the boundary-word bug.** A cut at exactly
-   `[1.0, 2.0]` correctly marks the word `(1.0, 1.5)` as cut. The
-   loose `>=` overlap from 5b would have called it kept (because
-   `1.0 == 1.0`), masking the cut. Strict `>` / `<` is the production
-   semantic now and the rewritten 5b test asserts it.
-4. **AppStateMachine has a public transition method.** Both UIs use
-   `state.transition_to(AppState.X)` — no more `state._emit()` reach-in.
-   `_go` survives as a private alias for the internal call sites.
-   Customtkinter regression-tested (the existing `test_ui.py` Retry
-   path goes through this code).
-5. **QAction shortcuts use `ApplicationShortcut` context.** The 5c
-   spec calls this out specifically — naive `QShortcut` on the pane
-   fails when a child widget has focus (which the TranscriptView
-   always does in the editor). Application context fires regardless.
-   Reparenting these QActions to a menu in 5f is a no-op: same
-   QAction instance, just a different parent.
-6. **Save round-trips through `candidate_cache_path`.** No new save
-   path was invented — `Document.to_json` writes back to the same
-   `<source_stem>.transcribe.json` the transcribe flow used. Reload
-   via `Document.from_json` reproduces the in-memory ranges (test:
-   `test_save_writes_to_candidate_cache_path_and_round_trips`).
-7. **`apply` is conservative on no-ops.** A cut whose interval is
-   already cut (subtract_interval returns equal ranges) is detected
-   via `after.ranges == before.ranges` and dropped on the floor —
-   doesn't push to the undo stack, doesn't flip dirty. Tested.
+1. **End-to-end peak path runs cleanly on a 22.5 GB podcast.** 4.26 s
+   wall-clock for `generate_peaks` at 4000 buckets — well under the
+   spec's 30 s flag threshold. Cache hit reads in 0.4 ms (the npz is
+   ~32 KB, as predicted).
+2. **Video-only sources don't crash.** locationbird MP4s have no
+   audio stream; ffmpeg returns a "does not contain any stream" error
+   that the generator now catches, logs, and returns a flat zero-peaks
+   array for. The strip renders flat instead of an exception.
+3. **QThread cleanup on EditorPane teardown.** Without it, every
+   editor test crashed with `Fatal Python error: Aborted` when the
+   QThread destructor ran while ffmpeg was still piping bytes. The
+   controller's `shutdown` cancels the worker (sets a `threading.Event`
+   the generator polls between chunk reads), kills the ffmpeg process,
+   and waits up to 5 s for the QThread to exit cleanly. Pane.release
+   calls it.
+4. **Cache invalidation matches `core.cache.cache_key` semantics.** A
+   `touch` on the source bumps `int(st_mtime)` → key changes → npz
+   header mismatches → `load_peaks_cache` returns None. Same pattern
+   as `Document` JSON cache; no surprises.
+5. **30 Hz playhead updates are essentially free.** 5k-word smoke:
+   30 seconds of position updates total **180 ms** (0.20 ms/tick),
+   well under the 33 ms budget per tick at 30 Hz. No `update(QRect)`
+   partial-repaint optimization needed; the painter is fast enough
+   on a strip 64–96 px tall.
+6. **Cut → undo cycle stays smooth at 5k words.** Selection of 50
+   words: 29 ms. Cut + full re-render of the transcript: 9 ms. Undo:
+   10 ms. The `_cursor_for_word` walk that 5c flagged as a future
+   hotspot didn't surface; the optimization stays deferred.
+7. **The painter stays under the 30 Hz tick budget.** Setting
+   `set_position` followed by `update()` triggers a full-widget repaint;
+   measurement was implicit (no jank during the 30s smoke), but the
+   strip is small enough that even doubling the tick rate would be
+   safe. Partial-rect repainting was prepared for but unnecessary.
 
 ---
 
-## 8. What's fragile or worth knowing (5c additions)
+## 8. What's fragile or worth knowing (5d additions)
 
-1. **Selection-clear policy: selection survives playback.** The spec
-   asked us to pick — I went with "playback does not clear the
-   selection." Rationale: a selection is a deliberate user act, and
-   the playhead ticks at 30 Hz; clearing on every word-boundary
-   crossing would make selections vanish within seconds. Selection
-   clears only on (a) click without drag and (b) successful
-   cut/restore (because the re-render re-keys word indices anyway).
-2. **`apply()`'s no-op detection is content-equality on ranges.**
-   `after.ranges == before.ranges` is a list-of-`Range`-dataclasses
-   compare. If a future command mutates `Document` in some other way
-   (e.g., editing word text), the no-op check would miss the change
-   and silently suppress the push. We don't have any such command
-   today; flagged for 5d/5e.
-3. **`request_cut_for_selection`'s "anchor as 1-word selection"
-   subtlety.** The pane's `_handle_cut` calls into the transcript;
-   the transcript has a `_selection_anchor` set on press but doesn't
-   call `_set_selection` until the first move. So a press →
-   immediately-Cmd-X (no drag, no release) won't have an active
-   selection. In practice the user has to release first. Documented;
-   not blocking.
-4. **`setTextInteractionFlags(NoTextInteraction)` on the transcript.**
-   Required to suppress Qt's default character-selection highlight
-   under our word-grain selection. Side effect: keyboard caret
-   navigation (arrow keys) no longer works inside the transcript.
-   That's intentional for a read-only view; flagged in case a future
-   accessibility pass wants to re-enable arrow nav.
-5. **Title-bar marker uses both `●` prefix and `setWindowModified`.**
-   The prefix is the deterministic textual indicator; `setWindowModified`
-   plus a `[*]` placeholder in the title would also drive macOS's
-   close-button dot. We do call `setWindowModified(dirty)` so the
-   close-button dot fires, but we don't put `[*]` in the title since
-   our explicit `●` already conveys it. If 5f wants to swap to the
-   pure `[*]` mechanism, drop the prefix and add `[*]` to the title
-   format.
-6. **The transcript re-renders fully on every Document mutation.**
-   `set_document_model` clears + re-inserts every word. At 5–10k
-   words this is fast (~10 ms in eyeball testing). If transcript
-   sizes grow to 30k+ or commands fire in fast succession (5d's
-   waveform-driven cuts?), an incremental "re-apply formats only"
-   update would be nicer. Not blocking for 5c.
-7. **`subtract_interval` and `union_interval` semantics drive the
-   render.** A cut command always produces ranges with strict gaps,
-   which is why the strict-overlap word-keep test works. If
-   `core.timeline` ever changes its boundary semantics (e.g., to
-   half-open intervals), the transcript render needs to flip to
-   match.
+1. **Cache filename is `.peaks.npz`, not `.peaks.npy`.** The spec
+   used `.npy` in prose but called for `np.savez` (which writes a zip).
+   I went with `.npz` because that's the actual file format and
+   `np.savez` auto-appends it anyway. Any future loader written to the
+   spec text needs to know the on-disk extension.
+2. **Schema versioning on the npz header.** The metadata dict carries
+   a `schema_version` int alongside `source_hash` / `duration_s` /
+   `bucket_count`. A future bucket-count default change or a layout
+   shift (e.g. abs-max scalars instead of (min, max) pairs) should
+   bump it; mismatched-schema npz files load as `None` and regenerate.
+3. **Peak generator is tied to the bundled ffmpeg binary.** No
+   fallback to system ffmpeg. The bundled binary is the only
+   guaranteed-version one. Same constraint as the rest of the project.
+4. **`-vn -map 0:a?` selects all audio streams.** Multi-track files
+   (rare in our corpus) would mix all audio tracks down to mono. For
+   the editor's "is there sound here" usage that's fine. If a future
+   feature needs per-track waveforms, the generator gains a track-id
+   parameter then.
+5. **WaveformController owns the QThread, not EditorPane.** EditorPane
+   only knows it has a controller and that `release()` propagates a
+   `shutdown()` call. The controller's `shutdown` is best-effort:
+   cancel + 5 s wait. The 5 s ceiling is generous (cancellation
+   propagates within one chunk read, ~1 MiB) but not infinite — a
+   wedge on a hung ffmpeg still ends up waiting that long.
+6. **The strip's painter recomputes the column → bucket mapping on
+   every paintEvent.** This is intentional (resizes don't regenerate
+   peaks; the array is sized to 4000 regardless of pixel width). The
+   cost is one `np.linspace` and a Python-side loop over `width()`
+   columns; at 1500 px wide that's ~1 ms. If a future change wants
+   subpixel-accurate antialiased peaks we'd switch to a
+   `QPainterPath`-based draw, but at the strip's size and density a
+   1px-wide column-line draw reads cleanly.
+7. **Test isolation tightening: app fixture in test_ui.py and
+   `_fresh_settings` in test_ui_qt_editor.py.** Both now isolate
+   filesystem state categorically rather than per-test. No tests were
+   actively burning, but a future change that triggered
+   `save_settings` from within those fixtures would have leaked into
+   `~/Library/Application Support/whisper-transcriber/`. Closed.
 
 ---
 
-## 9. Definition-of-done checklist (5c)
+## 9. Definition-of-done checklist (5d)
 
-- [x] All 429 prior tests pass plus 25 new interactivity tests + 4
-      transition_to tests = 458 total.
-- [x] `python main_qt.py`: load a transcribed doc → click a word and
-      the video seeks → drag-select and Cmd-X strikes through →
-      Cmd-Z restores → Cmd-S persists → reload reads the cuts back.
-      Smoke-tested end-to-end via a console script.
-- [x] `python main.py` (tkinter) still launches; transition_to
-      change kept it identical at the test level (the old Retry
-      transition continues to work).
-- [x] Title bar reflects dirty state correctly across edit / save /
-      undo-to-pristine.
-- [x] `AppStateMachine` has a public `transition_to`; both UIs use
-      it; no `_emit` calls outside the class.
-- [x] Ruff clean for changed files (pre-existing F541 and I001 in
-      `tests/test_render.py` / `test_document.py` / `test_editing.py`
-      remain — not 5c's debt).
+- [x] All 458 prior tests pass plus 21 new waveform tests = 479.
+- [x] `generate_peaks` returns shape `(4000, 2)`, `float32`, range
+      bounded in `[-1, 1]`. Run-to-run determinism confirmed.
+- [x] Cache round-trip; touch source → cache invalidates and
+      regeneration triggers.
+- [x] `WaveformStrip` click at `width // 4` of a 100 s strip emits
+      `seek_requested(~25_000)` (±1 px tolerance).
+- [x] Cut dimming sampled darker than kept regions; position update
+      repaints the playhead column.
+- [x] Resize doesn't regenerate peaks (mocked `generate_peaks` not
+      called on resize).
+- [x] Slow synthetic-mp4 generation runs under 5 s. (Real test asserts
+      under 5; observed under 1 s.)
+- [x] Real-corpus smoke: 22.5 GB podcast generates peaks in 4.26 s;
+      locationbird video-only files render flat without erroring.
+- [x] 5k-word programmatic smoke: 30 s of playhead updates take
+      180 ms total, cut + undo each <10 ms — `_cursor_for_word`
+      optimization stays deferred per spec.
 - [x] STATE.md overwritten in place.
-- [x] Single commit: `phase 5c: transcript interactivity, cuts, undo, save`.
+- [x] Ruff clean for changed files. (Pre-existing F541 in
+      test_render.py / test_document.py / test_editing.py remain —
+      not 5d's debt.)
+- [x] Single commit: `phase 5d: waveform strip with cache and dim
+      regions`.
 
 ---
 
-## 10. What Phase 5d inherits
+## 10. What Phase 5e inherits
 
-- A `TranscriptView` with binary-search-fast playhead lookup —
-  the waveform's playhead-overlay can use the same machinery.
-- A `DocumentSession` with `document_changed` — the waveform widget
-  can subscribe to redraw cut-region overlays as the user edits.
-- Word-time cached `_word_starts` in the transcript — if the waveform
-  needs nearest-word lookup for click-to-seek, the structure is there.
-- A clean separation between `EditorPane` (orchestration + shortcuts)
-  and the embedded widgets — the waveform drops in as a third
-  signal-emitting component without restructuring.
+- A `WaveformController` that already owns a worker QThread. If 5e
+  wants to add a "generate render-time-flat-strip" preview pass, the
+  controller is the place; reuse the existing thread plumbing.
+- A `WaveformStrip.set_ranges` that re-paints on Document changes —
+  any future render-preview overlay (showing where the audio fades
+  will sit, for example) drops in as a fourth layer in `paintEvent`.
+- The `.peaks.npz` cache pattern is the template for any other
+  precomputed-derivative side-car (e.g. silence-detection results,
+  if a Verbatim mode is added). One file, one format, one stale
+  check, no new directory layout.
+- A `_fresh_settings(tmp_path)` and an `app` fixture that pin
+  `WHISPER_SETTINGS_DIR` — 5e's autosave wiring (the carry-over from
+  5c flag #3) inherits filesystem isolation by default.
 
 ---
 
-## 11. Phase 5c final report (per spec request)
+## 11. Phase 5d stop-and-report (per spec)
 
-**1. Selection-clear policy.**
+**1. Peak-generation wall-clock on real files.**
 
-I picked "selection survives playback." Selection clears on click-
-without-drag and on successful cut/restore (because the re-render
-re-keys word indices). Playhead crossing a word boundary does **not**
-clear the selection.
+| File | Size | Elapsed |
+|------|-----:|--------:|
+| `LocationBird_English_9x16.mp4` (video-only) | 0.7 MB | 0.04 s (no audio path) |
+| `LocationBird_Pro_Studios_English_9x16.mp4` (video-only) | 1.1 MB | 0.05 s (no audio path) |
+| `531 Podcast Aaron & Barret Autocut only.mp4` | 22.5 GB | **4.26 s** |
+| `tests/fixtures/sample.wav` | 100 KB | 0.10 s |
 
-The case for the alternative (clear on cross): more strict — once
-you start playing, the playhead is the active cursor, so a selection
-is conceptually stale. The case against (what I chose): the playhead
-ticks 30 times per second; selections would vanish within ~50–100 ms
-of pressing Play. In actual use the surviving-selection model felt
-right — it lets the user select-Play-to-verify-Cmd-X without losing
-the selection while listening. If this turns out to be annoying,
-the alternative would be "clear when the playhead moves into the
-selected region" rather than any boundary, but that's still busier
-than the current behaviour.
+Well under the 30 s threshold. The locationbird files turned out to
+be video-only — discovery moment during smoke. ffmpeg refused to
+write a 0-stream output; I added a stderr-text check (`"does not
+contain any stream"`) that returns a flat zero-peaks array instead.
+Spec didn't anticipate this; the editor still gets a strip, it's just
+flat.
 
-**2. Command-stack location.**
+**2. Cache format choice.**
 
-It grew into a `DocumentSession` helper at `ui_qt/document_session.py`.
-EditorPane delegates `apply` / `undo` / `redo` / `mark_saved` /
-`is_dirty` through `self._session`. Surface:
+`np.savez` (uncompressed zip) with two members: `peaks` (the float32
+array) and `meta` (a single-element object array carrying a dict of
+`{source_hash, duration_s, bucket_count, schema_version}`). The
+filename is `.peaks.npz` rather than the spec's `.peaks.npy` because
+`np.savez` writes a zip archive — `.npy` would be misleading.
 
-```python
-class DocumentSession(QObject):
-    document_changed: Signal(Document)
-    dirty_changed: Signal(bool)
+Stale detection compares the dict's `source_hash` against
+`core.cache.cache_key(source_path)`. Same heuristic the Document JSON
+cache uses — `int(st_mtime)`-based, so a same-second touch can
+*theoretically* miss an invalidation, but the editor session would
+also have been transcribed on a same-second basis to hit that. Not a
+real concern.
 
-    document: Document
-    stack: CommandStack
-    can_undo: bool; can_redo: bool; is_dirty: bool
+Schema version is included in the dict so a future on-disk format
+shift (e.g. switching from `(min, max)` pairs to `abs_max` scalars)
+can bump the version and force regeneration.
 
-    apply(command: EditCommand) -> bool   # False = no-op (ranges unchanged)
-    undo() -> bool
-    redo() -> bool
-    mark_saved() -> None
-```
+**3. `WaveformController` shape — did it earn its existence?**
 
-The session owns:
-- The mutable Document reference.
-- The `CommandStack` (using the existing one from `core.editing`,
-  not a re-implementation).
-- The id-based dirty pointer.
-- Two Qt signals: `document_changed` (fires on apply/undo/redo) and
-  `dirty_changed` (fires on transitions of `is_dirty`).
+Yes. The wiring is non-trivial: lazy cache-or-generate decision, a
+QThread for the worker, three signals to subscribe to, `shutdown`
+plumbing required for clean teardown. Inlining all of that into
+EditorPane would push it past 400 lines and bury the editor logic
+under threading concerns.
 
-EditorPane wires both signals: `document_changed → _render_document`
-and `dirty_changed → forward to MainWindow`.
+The controller is 175 lines, including the inner `_PeakWorker` class.
+EditorPane gained four lines (instantiate, bind player, wire seek,
+shutdown in release). Net structural improvement.
 
-134 lines including docstrings; warranted by the API surface and the
-dirty-tracking subtlety. Carving it out also let the
-DocumentSession-only tests run in pure-data mode (no qtbot,
-sub-millisecond per test).
+**4. Real-corpus smoke result.**
 
-**3. Dirty-tracking gotchas.**
+On the synthetic 5k-word transcript (no real-corpus
+transcribed-and-loaded yet — the podcast hasn't been transcribed at
+the time of writing):
 
-Undo-back-to-pristine *does* clear dirty. Tested by
-`test_session_dirty_clears_on_undo_back_to_pristine` and end-to-end
-by `test_title_bar_dirty_marker_lifecycle` (which walks
-load → edit → save → edit → undo → assert clean).
+- 30 s of 30 Hz playhead ticks: **180 ms total / 0.20 ms per tick**.
+  Auto-scroll is well-behaved — the viewport-out test that 5c's
+  `_maybe_scroll_to` does only re-positions the textCursor when the
+  highlighted word's `cursorRect` is fully outside, so the 5k
+  contiguous-word transcript scrolls smoothly without nausea.
+- Drag-select 50 words: 29 ms (selection background paint pass).
+- Cut + full transcript re-render: 9 ms.
+- Undo: 10 ms.
 
-The mechanism is id-based: `mark_saved` records `id(self._document)`;
-`is_dirty` returns `id(current) != saved_id`. This works because
-`CommandStack.undo` returns the exact `before` Python object we
-pushed (not a copy), and `dataclasses.replace` always returns a
-fresh Document. So:
+No jank surfaced.
 
-- save A (record id(A)) → A is "the saved doc"
-- edit B (id(B)) → dirty (B is fresh)
-- undo back to A (returned by stack.undo → exact same instance) → not dirty
+**5. `_cursor_for_word` jank — surfaced or not?**
 
-The fork-past-saved case (save A → undo to B → edit C, where C's
-push clears the redo entry leading to A) is also handled: id(C) !=
-id(A), and A is no longer reachable on the stack. Stays dirty
-forever. `test_session_fork_after_save_unreachable_pristine_stays_dirty`
-covers it.
+Did not surface. 5c flagged the O(N) `_cursor_for_word` walk as the
+likely future hotspot at long-form scale. At 5k words and the
+operations measured above, it stays under the 30 Hz tick budget. The
+caching optimization (mapping `word_idx` → `fragment.position` after
+`set_document_model`) stays deferred per spec. It will likely become
+necessary once a 30k-word file lands; flag accordingly for 5e.
 
-The id-based approach was tempting to dismiss as fragile, but it's
-actually more robust than a content-equality check would be —
-content equality would mark a Document "clean" if a *different*
-Document happened to hash the same way (degenerate case but not
-zero-probability with small ranges lists).
+**6. `paintEvent` cost.**
 
-**4. Playhead-follow auto-scroll.**
+Full-widget update on every position change worked fine. No
+`update(QRect)` partial-repaint needed at the strip's size (typically
+1500 × 64 to 96 px). The position-update repaint test is in the
+suite as a regression guard.
 
-Shipped both highlight and auto-scroll. Trigger is **viewport-out**:
-if the highlighted word's `cursorRect` is fully outside the viewport,
-we call `ensureCursorVisible`-style positioning (set the text cursor
-to that word, ensureCursorVisible, restore the prior text cursor).
-If the word is even partially visible, we leave scroll alone. This
-matches the spec's "ensureCursorVisible-style behavior" recommendation
-and avoids the nausea of aggressive auto-centering during playback.
+The peak-rendering loop is `O(width)` regardless of bucket count —
+`np.linspace(0, bucket_count, width + 1)` slices the array into
+column groups. At 1500 px and 4000 buckets the full repaint takes
+~1 ms in eyeball testing; the loading-state and dim-overlay layers
+are sub-millisecond.
 
-The implementation reads the cursor rect for the highlighted word
-and tests both `topLeft` and `bottomLeft` against
-`viewport().rect().contains()`. Empirically smooth at 30 Hz on a
-3-segment fixture; not stress-tested at podcast scale (5–10k words)
-in 5c — that's a 5d/5e concern when real long-form content lands.
+**7. High-DPI / dark mode painting.**
 
-**5. Re-render performance under live editing.**
+Confirmed only on the test runner's offscreen Qt platform — the
+locationbird files turned out to be video-only so the dim overlay
+sat on a flat strip during the smoke and doesn't tell us much about
+"variable loudness" contrast. The dim overlay uses
+`QColor(0, 0, 0, 130)` (~50% black alpha-blended); on a peak strip
+that approaches a flat midline during quiet sections, the overlay
+still reads as "darker than the kept region" because the underlying
+pixel was already mid-grey. Not visually verified on a Retina
+display in this commit; flagged for 5e first-real-content session.
 
-Eyeballed but not stress-tested: at the test fixture sizes
-(3–7 words), every operation is sub-millisecond. The implementation
-of `set_document_model` is O(N) word inserts, and each insert is one
-`cursor.insertText(text, fmt)` call. At a transcript of 5k words I'd
-estimate 10–25 ms per re-render based on Qt's typical text insertion
-throughput; at 30 Hz playhead ticks (which only re-format two words
-per tick — old-playhead off, new-playhead on, via `_repaint_word_range`)
-the cost should be negligible.
+**8. Test-isolation audit.**
 
-If jank surfaces in 5d/5e it would most likely come from
-**`_repaint_word_range`'s `_cursor_for_word`** doing a full-document
-walk per word — fine when called twice per tick, expensive if a
-selection-drag re-paints 100 words back-to-back. Caching
-`(word_idx → fragment.position)` after `set_document_model` would
-turn that O(N) walk into O(1). Flagged as the most likely future
-hotspot; not fixing in 5c per spec ("don't fix it in 5c").
+Before:
+- `tests/test_ui.py::app` fixture constructed `App(root=tk_root)`
+  without monkeypatching `WHISPER_SETTINGS_DIR`. Construction itself
+  doesn't write, but any test triggering `_apply_settings` would
+  have touched the user's real settings file.
+- `tests/test_ui_qt_editor.py::_fresh_settings` returned `Settings()`
+  with the default `output_dir=None`. None of the construction
+  tests trigger save, but a layout-toggle smoke would have written
+  to `media_path.parent` (i.e. `tests/fixtures/`).
 
-**6. AppStateMachine public method shape.**
+After:
+- `app` fixture now sets `WHISPER_SETTINGS_DIR` via `monkeypatch`
+  before `App(root=...)` is built.
+- `_fresh_settings(tmp_path)` returns `Settings(output_dir=str(tmp_path))`.
 
-```python
-def transition_to(self, new_state: AppState) -> None:
-    """Force a validated transition into ``new_state`` and notify listeners."""
-```
-
-Single argument, returns None, raises `InvalidTransitionError` on
-illegal transitions (same exception the internal call sites raise).
-Same semantics as the internal `_go`; we kept `_go` as a private
-alias because its call sites in `load_file`, `start_transcribing`,
-`cancel`, etc. all read better as internal-helper calls. Public
-method is a thin one-liner.
-
-Rationale: the spec asked for "a public method" and named
-`transition_to` as a candidate. The verb is right — both UIs are
-*requesting a transition* the state machine should validate.
-Alternatives I considered:
-
-- `set_state(state)` — too imperative; reads like assignment without
-  the validation contract.
-- `goto(state)` — short but reads as "navigate," not "validate."
-- `clear_error_to(state)` — too narrow; the call site happens to be
-  about clearing errors but the same method is useful elsewhere.
-
-`transition_to` won.
-
-**7. Anything I found in `core/editing.py` that surprised me.**
-
-The 4f-3 rewrite is solid. Three surprises (mild — none blocking):
-
-- **`CutWordRange` requires `seg_idx` and rejects cross-segment
-  ranges.** I used `AddCut` instead because the editor's word
-  selection can span segments. The spec hinted at `CutWordRange(start, end)`
-  but the actual constructor is `(seg_idx, word_start_idx, word_end_idx)`.
-  Decision: lean on `AddCut` with word-boundary times — the
-  "Never cut inside a word" rule (PASS in `PRODUCTION_RULES.md`)
-  is satisfied because the times come from `word.start` /
-  `word.end` directly. `CutWordRange` would be the right primitive
-  for a single-segment-aware command (e.g., a future "cut this
-  paragraph" action) but isn't right for the general drag-select.
-  No rewrite needed.
-
-- **`AddCut` and `RestoreRange` capture pre-apply ranges to drive
-  `revert`** rather than computing the inverse of the timeline math.
-  Documented in their docstrings as "simpler and more obviously-
-  correct than computing inverses of the subtraction in the
-  multi-range / split case." Confirmed — my DocumentSession leans on
-  this and it works. Worth re-reading the docstring before adding any
-  new range command.
-
-- **Word-time overlap semantics.** This isn't a `core/editing.py`
-  surprise per se — `subtract_interval` produces strict-gap ranges
-  (an interval cut from `[0, 3]` with `(1.0, 2.0)` gives
-  `[Range(0, 1), Range(2, 3)]`, no overlap at the boundary). The 5b
-  transcript code used loose overlap (`>=`, `<=`) for word-in-range
-  detection, which interacted badly with `subtract_interval`'s
-  strict gaps: a word at exactly `(1.0, 1.5)` was marked kept
-  because its start touched range[0]'s end. 5c switched to strict
-  overlap (`>`, `<`) and the test that exposed this
-  (`test_cmd_x_on_already_cut_selection_pushes_restore`) is now
-  green. Not a `core/editing.py` defect — it's a contract that the
-  transcript renderer has to honor. Documented in the rewritten
-  `_word_in_any_range` docstring.
+No tests were actively burning before; this is the categorical
+conversion the 5c flag asked for. Nothing in the repo writes outside
+`tmp_path` now from a fixture.

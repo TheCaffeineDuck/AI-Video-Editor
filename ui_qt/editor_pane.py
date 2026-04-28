@@ -7,7 +7,7 @@ Topology (Decision 1 + Decision 5):
         ├── VideoViewport
         └── inner QSplitter  (always Vertical)
             ├── TranscriptView
-            └── WaveformPlaceholder
+            └── WaveformStrip
 
 Only the *outer* splitter flips with the layout toggle. The inner
 splitter is always vertical so the waveform stays directly under the
@@ -59,7 +59,8 @@ from core.settings import DEFAULT_LAYOUT, LAYOUT_CHOICES, Settings, save_setting
 from ui_qt.components.transcript_view import TranscriptView
 from ui_qt.components.video_viewport import VideoViewport
 from ui_qt.document_session import DocumentSession
-from ui_qt.waveform import WaveformPlaceholder
+from ui_qt.waveform import WaveformStrip
+from ui_qt.waveform_controller import WaveformController
 from workers.transcription import candidate_cache_path
 
 _LOG = logging.getLogger(__name__)
@@ -119,6 +120,12 @@ class EditorPane(QWidget):
         self._build_actions()
         self._wire_signals()
 
+        self._waveform_controller = WaveformController(
+            self._waveform, self._session, parent=self
+        )
+        self._waveform_controller.bind_player(self._video)
+        self._waveform.seek_requested.connect(self._video.seek_ms)
+
         self._render_document()
         self._wire_video_source()
 
@@ -153,7 +160,11 @@ class EditorPane(QWidget):
         return self._inner
 
     def release(self) -> None:
-        """Tear down the embedded media player before the pane is destroyed."""
+        """Tear down the embedded media player + waveform thread before destruction."""
+        try:
+            self._waveform_controller.shutdown()
+        except RuntimeError:
+            pass
         try:
             self._video.release()
         except RuntimeError:
@@ -208,7 +219,7 @@ class EditorPane(QWidget):
 
         self._inner = QSplitter(Qt.Orientation.Vertical, self._outer)
         self._transcript = TranscriptView(self._inner)
-        self._waveform = WaveformPlaceholder(self._inner)
+        self._waveform = WaveformStrip(self._inner)
         self._inner.addWidget(self._transcript)
         self._inner.addWidget(self._waveform)
         self._inner.setStretchFactor(0, 1)

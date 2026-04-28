@@ -38,7 +38,7 @@ from ui_qt.components.transcript_view import TranscriptView, collect_words  # no
 from ui_qt.components.video_viewport import VideoViewport, _format_ms  # noqa: E402
 from ui_qt.editor_pane import EditorPane  # noqa: E402
 from ui_qt.transcribe_pane import TranscribePane  # noqa: E402
-from ui_qt.waveform import WaveformPlaceholder  # noqa: E402
+from ui_qt.waveform import WaveformStrip  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SAMPLE_WAV = REPO_ROOT / "tests" / "fixtures" / "sample.wav"
@@ -156,10 +156,11 @@ def test_transcript_view_renders_every_word_and_strikes_cut_ones(qtbot):
     assert int(cursor.charFormat().property(WORD_INDEX_PROPERTY)) == kept_word_idx
 
 
-def test_waveform_placeholder_min_height(qtbot):
-    wp = WaveformPlaceholder()
+def test_waveform_strip_min_height(qtbot):
+    wp = WaveformStrip()
     qtbot.addWidget(wp)
     assert wp.minimumHeight() == 64
+    assert wp.maximumHeight() == 96
 
 
 # ---------------------------------------------------------------------------
@@ -168,15 +169,15 @@ def test_waveform_placeholder_min_height(qtbot):
 
 
 def _fresh_settings(tmp_path: Path) -> Settings:
-    """A Settings object whose save() writes to ``tmp_path/settings.json``.
+    """A Settings object scoped to ``tmp_path`` for both save+output paths.
 
-    Doesn't use the WHISPER_SETTINGS_DIR env var because the editor
-    pane saves via ``save_settings(self._settings)`` (no path arg) —
-    relies on settings_dir(). The test fixture ``main_window`` sets
-    that env var; helpers here call ``save_settings(s, path=...)``
-    directly to avoid coupling.
+    Construction tests don't trigger save themselves, but a future change
+    that calls ``editor.save_doc()`` from a constructor smoke-check would
+    silently write to ``tests/fixtures/`` (i.e. the repo). Setting
+    ``output_dir`` to ``tmp_path`` short-circuits that footgun. The
+    ``main_window`` fixture also sets ``WHISPER_SETTINGS_DIR``.
     """
-    return Settings()
+    return Settings(output_dir=str(tmp_path))
 
 
 def test_editor_pane_constructs_video_top_default(qtbot, tmp_path):
@@ -193,7 +194,7 @@ def test_editor_pane_constructs_video_top_default(qtbot, tmp_path):
         # Inner always holds transcript over waveform.
         assert pane.inner_splitter.count() == 2
         assert isinstance(pane.inner_splitter.widget(0), TranscriptView)
-        assert isinstance(pane.inner_splitter.widget(1), WaveformPlaceholder)
+        assert isinstance(pane.inner_splitter.widget(1), WaveformStrip)
     finally:
         pane.release()
 
