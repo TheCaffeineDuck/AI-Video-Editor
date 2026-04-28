@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QObject, Qt, QThread, QTimer, Signal
@@ -47,7 +48,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMessageBox,
-    QProgressDialog,
     QPushButton,
     QSplitter,
     QToolBar,
@@ -117,6 +117,31 @@ class _RenderRunner(QObject):
             self.finished.emit()
 
 
+@dataclass
+class EditorActions:
+    """Bundle of menu/toolbar :class:`QAction`s consumed by the editor.
+
+    MainWindow constructs an :class:`EditorActions` once at startup and
+    hands the same instance to every :class:`EditorPane` it spawns. The
+    pane wires each action's ``triggered`` signal to the matching
+    handler on construction and disconnects on :meth:`EditorPane.release`
+    so a stale pane doesn't continue to receive shortcut events after
+    it's been swapped out.
+
+    Standalone EditorPane instances (most pytest fixtures) get their
+    own actions via :meth:`EditorPane._build_local_actions` — those
+    instances live and die with the pane.
+    """
+
+    save: QAction
+    export_: QAction
+    undo: QAction
+    redo: QAction
+    cut: QAction
+    restore: QAction
+    delete: QAction
+
+
 class EditorPane(QWidget):
     """The editor view: video + transcript + waveform-placeholder.
 
@@ -142,6 +167,7 @@ class EditorPane(QWidget):
     dirty_changed = Signal(bool)
     document_saved = Signal(Path)
     render_started = Signal(Path)
+    render_progress = Signal(float)
     render_completed = Signal(Path)
     render_failed = Signal(str)
     render_cancelled = Signal()
@@ -151,6 +177,7 @@ class EditorPane(QWidget):
         document: Document,
         *,
         settings: Settings,
+        actions: EditorActions | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -161,7 +188,11 @@ class EditorPane(QWidget):
 
         self._build_toolbar()
         self._build_splitters()
-        self._build_actions()
+        self._actions = actions or self._build_local_actions()
+        # ``(signal, slot)`` pairs to disconnect on release. See
+        # :meth:`_wire_actions`.
+        self._action_connections: list[tuple] = []
+        self._wire_actions()
         self._wire_signals()
 
         self._waveform_controller = WaveformController(
@@ -182,10 +213,14 @@ class EditorPane(QWidget):
         self._inner.splitterMoved.connect(self._on_splitter_moved)
 
         # Render-worker plumbing — initialised lazily on the first export.
+        # 5f migrated the inline ``QProgressDialog`` to a status-bar
+        # widget owned by MainWindow; the pane now just emits
+        # ``render_started`` / ``render_progress`` / ``render_completed``
+        # / ``render_failed`` / ``render_cancelled`` and lets the host
+        # window decide how to surface them.
         self._render_thread: QThread | None = None
         self._render_worker: RenderWorker | None = None
         self._render_runner: _RenderRunner | None = None
-        self._render_dialog: QProgressDialog | None = None
         self._render_cancel_event: threading.Event | None = None
 
         # Autosave: a single QTimer driven from the configured interval.
@@ -237,6 +272,18 @@ class EditorPane(QWidget):
             self._splitter_save_timer.stop()
         except RuntimeError:
             pass
+        # Disconnect the action signal connections so a swap to a fresh
+        # EditorPane doesn't leave stale handlers attached to the
+        # MainWindow-owned QActions. Without this, both the displaced
+        # pane's handler and the new pane's handler fire on every Cmd-S,
+        # Cmd-Z, etc. — until DeferredDelete eventually clears the old
+        # one, which is a window of unpredictable double-saves.
+        for signal, slot in self._action_connections:
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        self._action_connections = []
         # Cancel any in-flight export. Same shape as the waveform
         # controller's shutdown — flip the cancel flag, ask the QThread
         # to quit, wait briefly for it to land. Leaving a render
@@ -259,6 +306,26 @@ class EditorPane(QWidget):
             self._video.release()
         except RuntimeError:
             pass
+
+    @property
+    def actions_bundle(self) -> EditorActions:
+        """The :class:`EditorActions` this pane is bound to (shared or local)."""
+        return self._actions
+
+    @property
+    def is_rendering(self) -> bool:
+        return self._render_thread is not None and self._render_thread.isRunning()
+
+    def cancel_render(self) -> None:
+        """Public hook so MainWindow's status-bar Cancel button can request a cancel.
+
+        Sets the threading.Event the render worker observes through its
+        progress callback. The actual ``RenderCancelled`` event arrives
+        on the GUI thread once smartcut unwinds — the call-site is
+        non-blocking.
+        """
+        if self._render_cancel_event is not None:
+            self._render_cancel_event.set()
 
     # ----- layout / build -----
 
@@ -336,61 +403,115 @@ class EditorPane(QWidget):
         self._status.setStyleSheet("color: #6B7280; padding: 4px 8px;")
         self._outer_layout.addWidget(self._status)
 
-    def _build_actions(self) -> None:
-        """Pane-level QActions for the editor shortcuts.
+    def _build_local_actions(self) -> EditorActions:
+        """Construct an :class:`EditorActions` parented to this pane.
+
+        Used when no shared actions were passed in by MainWindow — i.e.
+        EditorPane instantiated standalone (most pytest fixtures). The
+        QActions die with the pane on ``deleteLater``, which is fine
+        because nothing else references them in standalone use.
 
         ``Qt.ApplicationShortcut`` context (rather than the default
         ``WindowShortcut``) — naive ``QShortcut`` on the pane fails in
         some macOS focus configurations, especially when a child
-        widget like the TranscriptView has the active focus. Actions
-        with application context fire regardless of which descendant
-        has focus.
-
-        These are owned by the editor pane in 5c. 5f reparents them to
-        the menu bar (File → Save, Edit → Undo, etc.) by reusing the
-        same QAction instances — no rebinding needed.
+        widget like the TranscriptView has the active focus.
         """
-        self._cut_action = self._make_action(
-            "Cut",
-            [QKeySequence.StandardKey.Cut, QKeySequence("Backspace")],
-            self._handle_cut,
-        )
+        cut = QAction("Cut", self)
+        cut.setShortcuts([QKeySequence.StandardKey.Cut, QKeySequence("Backspace")])
         # Forward Delete (the dedicated key, not Backspace) is bound
         # separately because macOS has it as a distinct keysym and
         # QKeySequence("Delete") doesn't include both spellings.
-        self._delete_action = self._make_action(
-            "Delete",
-            [QKeySequence(Qt.Key.Key_Delete)],
-            self._handle_cut,
+        delete = QAction("Delete", self)
+        delete.setShortcut(QKeySequence(Qt.Key.Key_Delete))
+        restore = QAction("Restore Cuts", self)
+        restore.setShortcuts(
+            [QKeySequence("Ctrl+Shift+Backspace"), QKeySequence("Meta+Backspace")]
         )
-        self._restore_action = self._make_action(
-            "Restore",
-            [QKeySequence("Ctrl+Shift+Backspace"), QKeySequence("Meta+Backspace")],
-            self._handle_cut,  # same handler — branches on selection state
-        )
-        self._undo_action = self._make_action(
-            "Undo", [QKeySequence.StandardKey.Undo], self._handle_undo
-        )
-        self._redo_action = self._make_action(
-            "Redo", [QKeySequence.StandardKey.Redo], self._handle_redo
-        )
-        self._save_action = self._make_action(
-            "Save", [QKeySequence.StandardKey.Save], self._handle_save
-        )
-        self._export_action = self._make_action(
-            "Export", [QKeySequence("Ctrl+E"), QKeySequence("Meta+E")], self._handle_export
+        undo = QAction("Undo", self)
+        undo.setShortcut(QKeySequence.StandardKey.Undo)
+        redo = QAction("Redo", self)
+        redo.setShortcut(QKeySequence.StandardKey.Redo)
+        save = QAction("Save", self)
+        save.setShortcut(QKeySequence.StandardKey.Save)
+        export_ = QAction("Export…", self)
+        export_.setShortcuts([QKeySequence("Ctrl+E"), QKeySequence("Meta+E")])
+        return EditorActions(
+            save=save, export_=export_, undo=undo, redo=redo,
+            cut=cut, restore=restore, delete=delete,
         )
 
-    def _make_action(self, text, shortcuts, slot) -> QAction:
-        action = QAction(text, self)
-        if isinstance(shortcuts, list):
-            action.setShortcuts(shortcuts)
-        else:
-            action.setShortcut(shortcuts)
-        action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
-        action.triggered.connect(slot)
-        self.addAction(action)
-        return action
+    def _wire_actions(self) -> None:
+        """Connect each action's ``triggered`` signal to its handler.
+
+        Application shortcut context + ``addAction(self, ...)`` makes the
+        shortcuts global to the app while this pane is alive.
+        ``_action_connections`` records ``(signal, slot)`` pairs so
+        :meth:`release` can call ``signal.disconnect(slot)`` — mandatory
+        when the actions are owned by MainWindow and outlive any single
+        pane instance, otherwise stale slots fire on the next user
+        action and silently double-handle.
+
+        We track ``(signal, slot)`` pairs rather than the
+        :class:`QMetaObject.Connection` objects ``connect`` returns
+        because PySide6 doesn't expose a clean way to disconnect by
+        connection handle — the supported overload is
+        ``signal.disconnect(slot)``.
+        """
+        a = self._actions
+        for act in (a.save, a.export_, a.undo, a.redo, a.cut, a.restore, a.delete):
+            act.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+            self.addAction(act)
+        wirings = [
+            (a.save.triggered, self._handle_save),
+            (a.export_.triggered, self._handle_export),
+            (a.undo.triggered, self._handle_undo),
+            (a.redo.triggered, self._handle_redo),
+            # Cut / Restore / Delete share a single handler that branches
+            # on the live selection state — the keystroke names map to
+            # different verbs depending on whether the selected words are
+            # currently kept or already cut.
+            (a.cut.triggered, self._handle_cut),
+            (a.restore.triggered, self._handle_cut),
+            (a.delete.triggered, self._handle_cut),
+        ]
+        for signal, slot in wirings:
+            signal.connect(slot)
+        self._action_connections = wirings
+
+    # ----- backwards-compat aliases -----
+    #
+    # 5c and 5e tests reach for ``editor._cut_action`` / ``_save_action`` /
+    # etc. These were attribute fields before 5f's action-promotion
+    # refactor. Aliasing through properties keeps the old surface
+    # working while the source of truth is :class:`EditorActions`.
+
+    @property
+    def _cut_action(self) -> QAction:
+        return self._actions.cut
+
+    @property
+    def _delete_action(self) -> QAction:
+        return self._actions.delete
+
+    @property
+    def _restore_action(self) -> QAction:
+        return self._actions.restore
+
+    @property
+    def _undo_action(self) -> QAction:
+        return self._actions.undo
+
+    @property
+    def _redo_action(self) -> QAction:
+        return self._actions.redo
+
+    @property
+    def _save_action(self) -> QAction:
+        return self._actions.save
+
+    @property
+    def _export_action(self) -> QAction:
+        return self._actions.export_
 
     def _wire_signals(self) -> None:
         self._transcript.cut_requested.connect(self._handle_cut_request)
@@ -422,6 +543,8 @@ class EditorPane(QWidget):
     def _refresh_undo_redo_buttons(self) -> None:
         self._undo_btn.setEnabled(self._session.can_undo)
         self._redo_btn.setEnabled(self._session.can_redo)
+        self._actions.undo.setEnabled(self._session.can_undo)
+        self._actions.redo.setEnabled(self._session.can_redo)
 
     # ----- shortcut handlers -----
 
@@ -614,11 +737,10 @@ class EditorPane(QWidget):
                 "This document has no ranges to render.",
             )
             return
-        if self._render_thread is not None and self._render_thread.isRunning():
-            QMessageBox.information(
-                self, "Render in progress",
-                "Wait for the current export to finish before starting another.",
-            )
+        if self.is_rendering:
+            # MainWindow disables the Export QAction during a render;
+            # this guard catches the toolbar-button path (no shared
+            # disabled state) and any future shortcut bypass.
             return
         primary = next(iter(self._session.document.sources.values()), None)
         if primary is None or not primary.path.is_file():
@@ -671,79 +793,36 @@ class EditorPane(QWidget):
         self._render_worker = worker
         self._render_runner = runner
 
-        # Indeterminate progress dialog: ``setRange(0, 0)`` paints a busy
-        # bar. ``core.render.render_cut`` doesn't currently emit
-        # progress to ``on_progress`` for the smartcut step; fudging a
-        # fake bar would lie to the user. Spec §1 explicitly forbids
-        # adding progress to core/.
-        dlg = QProgressDialog("Rendering…", "Cancel", 0, 0, self)
-        dlg.setWindowTitle("Export")
-        dlg.setMinimumDuration(0)
-        dlg.setAutoClose(False)
-        dlg.setAutoReset(False)
-        dlg.canceled.connect(self._handle_render_cancel)
-        self._render_dialog = dlg
-        dlg.show()
-
         thread.start()
 
     def _handle_render_event(self, event: RenderEvent) -> None:
-        """Receive worker events on the GUI thread."""
+        """Receive worker events on the GUI thread.
+
+        The pane re-emits each event as a typed Qt signal; MainWindow
+        owns the status-bar widget that subscribes to these and renders
+        progress/complete/error/cancel into the bottom strip. The pane
+        deliberately doesn't pop a modal so the user can keep editing
+        during an in-flight render.
+        """
         if isinstance(event, RenderStarted):
             self.render_started.emit(event.output_path)
         elif isinstance(event, RenderProgress):
-            # render_cut may begin emitting progress in a future phase;
-            # promote the dialog from indeterminate to a real bar when
-            # we see real numbers.
-            if self._render_dialog is not None:
-                if self._render_dialog.maximum() == 0:
-                    self._render_dialog.setRange(0, 100)
-                self._render_dialog.setValue(int(event.fraction * 100))
+            self.render_progress.emit(float(event.fraction))
         elif isinstance(event, RenderComplete):
-            self._close_render_dialog()
             self.render_completed.emit(event.output_path)
-            QMessageBox.information(
-                self, "Export complete",
-                f"Wrote {event.output_path.name} ({event.elapsed:.1f}s).",
-            )
-            self._render_thread = None
-            self._render_worker = None
-            self._render_runner = None
-            self._render_cancel_event = None
+            self._reset_render_state()
         elif isinstance(event, RenderError):
-            self._close_render_dialog()
             self.render_failed.emit(event.message)
-            QMessageBox.critical(self, "Export failed", event.message)
-            self._render_thread = None
-            self._render_worker = None
-            self._render_runner = None
-            self._render_cancel_event = None
+            self._reset_render_state()
         elif isinstance(event, RenderCancelled):
-            self._close_render_dialog()
             self.render_cancelled.emit()
-            self._render_thread = None
-            self._render_worker = None
-            self._render_runner = None
-            self._render_cancel_event = None
+            self._reset_render_state()
 
-    def _handle_render_cancel(self) -> None:
-        if self._render_cancel_event is not None:
-            self._render_cancel_event.set()
-        # Disable the Cancel button so a frantic user doesn't stack
-        # cancel signals while the worker winds down.
-        if self._render_dialog is not None:
-            self._render_dialog.setLabelText("Cancelling…")
-            self._render_dialog.setCancelButton(None)
-
-    def _close_render_dialog(self) -> None:
-        dlg = self._render_dialog
-        self._render_dialog = None
-        if dlg is None:
-            return
-        try:
-            dlg.close()
-        except RuntimeError:
-            pass
+    def _reset_render_state(self) -> None:
+        self._render_thread = None
+        self._render_worker = None
+        self._render_runner = None
+        self._render_cancel_event = None
 
     # ----- helpers -----
 
