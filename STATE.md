@@ -1,530 +1,384 @@
 # Transcribe — Project State Report
 
-**Date:** 2026-04-28
+**Date:** 2026-04-29
 **Branch:** main
-**Commit:** Phase 5f — macos polish, menu bar, quit guard, render ux
-**Status:** Phase 5 complete. All 529 tests passing (501 prior + 28 5f). Lint
-clean for changed files.
+**Commit:** Phase 6a — MCP server foundation (transcribe, read, cut, render)
+**Status:** Phase 6a complete. All 559 tests passing (529 prior + 30 6a).
+Lint clean for changed files.
 
 ---
 
-## 1. Phase 5 in two paragraphs
+## 1. Phase 6a in two paragraphs
 
-Phase 5 ported the customtkinter app onto PySide6 and built a Descript-
-style editor on top: 5a scaffolded the Qt UI; 5b laid down the editor
-pane skeleton with `QSplitter` topology and a real `QMediaPlayer`; 5c
-added word-level cuts, undo/redo, and Cmd-S persistence; 5d shipped a
-waveform strip with cached peaks and a dim-overlay-and-hatch readout
-that survives both dark and light palettes; 5e closed the integration
-loop with off-thread render export, autosave, splitter persistence,
-and a complete tabbed Settings dialog.
+Phase 6a stands up an MCP server next to the existing tkinter and Qt
+GUIs. It is a third consumer of `core/` and `workers/`, not a peer of
+either GUI; it speaks JSON-RPC over stdio per Anthropic's official
+Python `mcp` SDK and operates on the same `.transcribe.json` files the
+editor reads and writes. Seven tools land — `transcribe`, `load_document`,
+`get_transcript`, `get_ranges`, `apply_cuts`, `restore_ranges`, `render`
+— covering the lifecycle (transcribe → render), the read side (summary,
+words, ranges), and the edit side (cut, restore). Every tool's
+input/output is a Pydantic model whose JSON Schema becomes the SDK's
+`inputSchema`/`outputSchema`. The MCP layer reuses `TranscriptionWorker`
+and `RenderWorker` directly, off-loading their synchronous `run()`
+calls to a worker thread via `anyio.to_thread.run_sync` so the protocol
+event loop stays live.
 
-Phase 5f turned the Qt window into a Mac app. A native menu bar
-(File / Edit / View / Window / Help) reparents the Cmd-shortcut
-actions onto MainWindow, properly enabled/disabled with editor
-presence; About / Settings / Quit roles route via
-`QAction.MenuRole` so macOS surfaces them in the application menu.
-A quit-when-dirty guard prompts on `closeEvent` with three branches
-(Save / Discard / Cancel) and cancels the close if the save raises.
-The render progress dialog migrated from modal `QProgressDialog` to a
-non-modal status-bar strip — the user keeps editing during a render,
-and `RenderWorker` snapshots the document at construction so mid-render
-edits don't reach the rendered output. An autosave indicator on the
-left of the status bar reports "Saved" / "Saving…" / "Unsaved changes" /
-"Autosave failed". A geometric mark icon (committed as
-`resources/icons/transcribe.icns`, regeneratable via
-`scripts/make_icon.py`) hangs on the window via `setWindowIcon`. With
-that, Phase 5 ships.
+The architecture decision was to keep `core/` strictly read-only from
+the MCP layer (same rule as Phase 5). The `reason` field that the spec
+flagged as a possible `core/` change turned out to already exist on
+`AddCut` (default `"manual"`) — no edit to `core/editing.py` was
+needed. The MCP server adds a layer of stable error codes
+(`FILE_NOT_FOUND`, `INVALID_DOCUMENT`, `UNSUPPORTED_SCHEMA`,
+`WORD_BOUNDARY_VIOLATION`, `CUT_INVALID`, `TRANSCRIPTION_FAILED`,
+`RENDER_FAILED`) that prefix every error message — clients branch on
+the prefix because the MCP SDK collapses tool exceptions into
+`isError: true` content blocks rather than into JSON-RPC-level errors.
 
 ---
 
-## 2. Project structure
+## 2. Project structure (deltas from 5f)
 
 ```
 .
-├── core/
-│   ├── audio.py
-│   ├── cache.py
-│   ├── document.py
-│   ├── editing.py
-│   ├── exporters.py
-│   ├── languages.py
-│   ├── model_loader.py
-│   ├── models.py
-│   ├── render.py
-│   ├── settings.py
-│   ├── timeline.py
-│   └── transcriber.py
-├── workers/
-│   ├── events.py
-│   ├── render.py
-│   ├── transcription.py
-│   └── waveform.py
-├── ui/                              # legacy customtkinter UI (still launches)
-│   ├── app.py
-│   ├── components/ ...
-│   ├── state.py
-│   └── theme.py
-├── ui_qt/
-│   ├── __init__.py                  # 5f: __version__ = "0.5.0"
-│   ├── app.py                       # 5f: menu bar, quit guard, status bar, app icon
-│   ├── document_session.py
-│   ├── editor_pane.py               # 5f: external EditorActions, non-modal render
-│   ├── transcribe_pane.py
-│   ├── waveform.py
-│   ├── waveform_controller.py
-│   ├── style.py
-│   └── components/
-│       ├── about_dialog.py          # NEW (5f)
-│       ├── settings_panel.py
-│       ├── status_widgets.py        # NEW (5f) — RenderStatusWidget, AutosaveStatusLabel
-│       ├── transcript_view.py
-│       ├── video_viewport.py
-│       └── ...
-├── resources/
-│   └── icons/
-│       ├── transcribe.icns          # NEW (5f) — bundled icon
-│       └── transcribe_1024.png      # NEW (5f) — source bitmap
-├── scripts/
-│   └── make_icon.py                 # NEW (5f) — sips + iconutil pipeline
-├── docs/PRODUCTION_RULES.md
-├── tests/
-│   ├── conftest.py
-│   ├── ... (all prior)
-│   └── test_phase_5f.py             # NEW (5f) — 28 tests
-├── main.py / main_qt.py
-├── pyproject.toml / requirements*.txt
-├── CLAUDE.md
-├── STATE.md
-└── whisper_transcriber_spec.md
+├── core/                            # unchanged in 6a
+├── workers/                         # unchanged in 6a
+├── ui/                              # unchanged
+├── ui_qt/                           # unchanged
+├── mcp_server/                      # NEW (6a)
+│   ├── __init__.py
+│   ├── server.py                    # tool registry, build_server, run_stdio
+│   ├── schemas.py                   # Pydantic input/output models per tool
+│   ├── errors.py                    # stable error codes + raise_mcp helper
+│   ├── tools/
+│   │   ├── __init__.py
+│   │   ├── transcribe.py            # wraps TranscriptionWorker
+│   │   ├── document.py              # load, transcript, ranges, cuts, restore
+│   │   └── render.py                # wraps RenderWorker
+│   └── README.md                    # Claude Desktop install + tool surface
+├── main_mcp.py                      # NEW (6a) — stdio entry, mirrors main_qt.py
+├── tests/test_phase_6a.py           # NEW (6a) — 30 tests
+├── main.py / main_qt.py             # unchanged; both still launch
+├── requirements.txt                 # +mcp>=1.27
+└── …
 ```
 
 ---
 
-## 3. Dependencies
+## 3. Dependencies (delta)
 
-Unchanged from 5e.
+`mcp>=1.27` added (pulls in pydantic v2 ≥2.7, anyio, jsonschema —
+which were already transitively present via PySide6 / faster-whisper /
+smartcut).
 
 ---
 
-## 4. Code inventory (deltas from 5e)
+## 4. Code inventory (deltas from 5f)
 
-| File | Lines | What's new in 5f |
+| File | Lines | What's new in 6a |
 |------|------:|------------------|
-| `ui_qt/app.py` | 660 | `_build_actions` constructs an :class:`EditorActions` bundle owned by MainWindow plus role-bearing app-menu actions (About, Settings, Quit); `_build_menu_bar` populates File/Edit/View/Window/Help; `_setup_status_bar` adds :class:`AutosaveStatusLabel` on the left and :class:`RenderStatusWidget` on the right; `closeEvent` prompts on dirty editor with Save/Discard/Cancel and cancels close on save failure; `event` overrides `ApplicationActivate` for Dock-icon reopen; `_handle_render_*` slots replace EditorPane's modal dialog; `_force_close` flag bypasses the prompt during programmatic teardown |
-| `ui_qt/editor_pane.py` | 800 | New :class:`EditorActions` dataclass holding the seven shared QActions; `__init__` accepts an optional `actions` kwarg (None → falls back to local instances for standalone use); `_wire_actions` connects via tracked `(signal, slot)` pairs so :meth:`release` can disconnect cleanly across pane swaps; render progress migrated to typed signals (`render_started`/`render_progress`/`render_completed`/`render_failed`/`render_cancelled`) plus public `cancel_render`/`is_rendering` accessors; modal QProgressDialog removed; backwards-compat `_save_action`/`_cut_action`/etc properties keep test reach intact |
-| `ui_qt/__init__.py` | 14 | `__version__ = "0.5.0"` — single source of truth for the About dialog |
-| `ui_qt/components/about_dialog.py` | 100 | NEW — modal "About Transcribe" with version, Python/PySide6/faster-whisper/ffmpeg runtime info; `about_text()` exposed for tests |
-| `ui_qt/components/status_widgets.py` | 150 | NEW — :class:`RenderStatusWidget` (label + indeterminate→determinate `QProgressBar` + Cancel button; hidden when idle); :class:`AutosaveStatusLabel` (debounced state machine with four labels) |
-| `scripts/make_icon.py` | 130 | NEW — paints a 1024×1024 geometric T-and-waveform PNG via QPainter, then runs `sips`/`iconutil` to emit the `.icns` |
-| `resources/icons/transcribe.icns` | binary | NEW — committed icon bundle (16/32/64/128/256/512/1024 from one source) |
-| `resources/icons/transcribe_1024.png` | binary | NEW — committed source PNG |
-| `tests/test_phase_5f.py` | 530 | NEW — 28 tests across menu-bar reparenting, enabled-state mirroring, quit-when-dirty (3 branches + save-failure-cancels-close), About dialog, render-status non-modal flow + Export-disabled-during-render + snapshot isolation, autosave indicator state machine, action-connection-disconnect-on-release |
+| `mcp_server/__init__.py` | 15 | NEW — `__version__ = "0.6.0a"` and a one-paragraph package docstring. |
+| `mcp_server/server.py` | 293 | NEW — `ToolDef` dataclass; `TOOLS` registry of 7 tools; `_tool_descriptors()` marshals each Pydantic model to `mcp.types.Tool`; `build_server()` registers `list_tools` and `call_tool` decorators with input validation, dispatch, and structured-content marshalling; `configure_stderr_logging()` routes logs off stdout; `run_stdio()` is the async entry. |
+| `mcp_server/schemas.py` | 259 | NEW — Pydantic models for every tool's request and response; all use `ConfigDict(extra="forbid")` so `additionalProperties: false` propagates into Claude's tool-call validator. |
+| `mcp_server/errors.py` | 63 | NEW — frozen string codes; `raise_mcp(code, msg, data)` builds an `McpError` with a JSON-RPC integer code (INVALID_PARAMS for client-fixable, INTERNAL_ERROR for worker failures) and a `<CODE>: ...` message prefix that survives the SDK's exception-to-content collapse. |
+| `mcp_server/tools/document.py` | 414 | NEW — `_load_document` / `_save_document` shared helpers; `_word_boundary_set` + `_is_word_boundary` enforce the "Never cut inside a word" invariant at the MCP layer (silence between words is allowed); `apply_cuts` validates every cut before mutating, then runs them through `AddCut` on a fresh `CommandStack`, with skip semantics for cuts inside existing cuts; `restore_ranges` is the symmetric inverse via `RestoreRange`. |
+| `mcp_server/tools/transcribe.py` | 159 | NEW — wraps `TranscriptionWorker` with `formats=["json"]`, off-loads `worker.run()` via `anyio.to_thread.run_sync`; cache-hit fast-path mirrors the GUI's `try_load_cached_document`; `output_path` override copies (cache hit) or moves (cache miss) the produced file to the requested location. |
+| `mcp_server/tools/render.py` | 108 | NEW — wraps `RenderWorker` similarly; pad/fade kwargs override Settings per-call; output metadata (file size, duration, render time) populated post-write. |
+| `mcp_server/README.md` | 114 | NEW — Claude Desktop integration recipe (`claude_desktop_config.json` snippet), tool one-liners, error-code table, logging/concurrency notes. |
+| `main_mcp.py` | 14 | NEW — sync entry that imports `mcp_server.server.main`. |
+| `tests/test_phase_6a.py` | 667 | NEW — 30 tests covering tool registration, schema marshalling, every error path, all-or-nothing semantics for `apply_cuts`/`restore_ranges`, cache-hit and cache-miss for `transcribe` (worker mocked), happy-path and failure-path for `render` (worker mocked). |
+| `requirements.txt` | 6 | `+mcp>=1.27`. |
 
 ### Test count
 
 | Phase | Total | Fast | Slow |
 |-------|------:|-----:|-----:|
-| End of 4f-3 | 385 | 374 | 11 |
-| End of 5a   | 413 | 402 | 11 |
-| End of 5b   | 429 | 418 | 11 |
-| End of 5c   | 458 | 447 | 11 |
-| End of 5d   | 479 | 467 | 12 |
 | End of 5e   | 501 | 489 | 12 |
-| **End of 5f** | **529** | **517** | **12** |
+| End of 5f   | 529 | 517 | 12 |
+| **End of 6a** | **559** | **547** | **12** |
 
-`pytest -q` runs all 529 green in ~10 s on this M4. The pytest-qt
-`RuntimeWarning` lines persist (5c-tracked, pytest-qt internal).
+`pytest -q` runs all 559 green in ~15 s on this M4.
 
 ---
 
 ## 5. Git history
 
 ```
-phase 5f: macos polish, menu bar, quit guard, render ux  (this commit)
+phase 6a: mcp server foundation (transcribe, read, cut, render)  (this commit)
+phase 5f: macos polish, menu bar, quit guard, render ux
 phase 5e: render export, autosave, splitter persistence, settings completion
 phase 5d: waveform strip with cache and dim regions
 phase 5c: transcript interactivity, cuts, undo, save
 phase 5b: editor pane skeleton + qmediaplayer wiring
 phase 5a: qt scaffold + port transcribe flow
-phase 4f-3 (3/3) — final: docs + STATE.md
 …
 ```
 
 ---
 
-## 6. Public APIs added or reshaped in Phase 5f
+## 6. Public APIs added in Phase 6a
 
 ```python
-# ui_qt — new
-__version__: str  # "0.5.0"
+# mcp_server — top-level
+__version__: str  # "0.6.0a"
 
-# ui_qt.editor_pane — additions
-@dataclass
-class EditorActions:
-    save: QAction
-    export_: QAction
-    undo: QAction
-    redo: QAction
-    cut: QAction
-    restore: QAction
-    delete: QAction
+# mcp_server.server
+SERVER_NAME: str  # "transcribe"
+TOOLS: tuple[ToolDef, ...]
+def build_server() -> mcp.server.Server: ...
+def configure_stderr_logging(level: int = logging.INFO) -> None: ...
+async def run_stdio() -> None: ...
+def main() -> int: ...
 
-class EditorPane(QWidget):
-    # ... existing signals + new render_progress(float)
-    render_progress: Signal(float)
+@dataclass(frozen=True)
+class ToolDef:
+    name: str
+    description: str
+    input_model: type[pydantic.BaseModel]
+    output_model: type[pydantic.BaseModel]
+    handler: Callable[[BaseModel], Awaitable[BaseModel]]
 
-    def __init__(
-        self,
-        document: Document,
-        *,
-        settings: Settings,
-        actions: EditorActions | None = None,   # NEW (5f)
-        parent: QWidget | None = None,
-    ) -> None: ...
+# mcp_server.errors — string codes (frozen contract)
+FILE_NOT_FOUND, INVALID_DOCUMENT, UNSUPPORTED_SCHEMA: str
+WORD_BOUNDARY_VIOLATION, CUT_INVALID: str
+TRANSCRIPTION_FAILED, RENDER_FAILED: str
+def raise_mcp(code: str, message: str, data: dict | None = None) -> NoReturn: ...
 
-    @property
-    def actions_bundle(self) -> EditorActions: ...   # NEW (5f)
-    @property
-    def is_rendering(self) -> bool: ...               # NEW (5f)
-    def cancel_render(self) -> None: ...              # NEW (5f)
+# mcp_server.schemas — Pydantic models, one per tool I/O
+class TranscribeRequest / TranscribeResult: ...
+class JsonPathRequest / DocumentSummary: ...
+class GetTranscriptRequest / TranscriptResult / TranscriptWord: ...
+class RangesResult / RangeOut: ...
+class ApplyCutsRequest / CutRequest / ApplyCutsResult: ...
+class RestoreRangesRequest / RestoreRequestItem / RestoreResult: ...
+class RenderRequest / RenderResult: ...
 
-# ui_qt.app — additions on MainWindow
-class MainWindow(QMainWindow):
-    @property
-    def editor_actions(self) -> EditorActions: ...   # NEW (5f)
-    save_action: QAction         # alias via editor_actions.save
-    export_action: QAction
-    # ... other action properties via editor_actions
-    # closeEvent now prompts on dirty editor; ``_force_close`` bypasses.
-
-# ui_qt.components.status_widgets — NEW
-class RenderStatusWidget(QWidget):
-    cancel_clicked: Signal()
-    def start(self, label: str = "Rendering…") -> None: ...
-    def set_progress(self, fraction: float) -> None: ...
-    def mark_cancelling(self) -> None: ...
-    def finish(self) -> None: ...
-
-class AutosaveStatusLabel(QLabel):
-    def set_state(self, state: str) -> None: ...
-    def clear_indicator(self) -> None: ...
-AUTOSAVE_SAVED, AUTOSAVE_SAVING, AUTOSAVE_DIRTY, AUTOSAVE_FAILED: str
-
-# ui_qt.components.about_dialog — NEW
-class AboutDialog(QDialog): ...
-def about_text() -> str: ...
+# mcp_server.tools.{transcribe,document,render} — async handlers
+async def transcribe(req: TranscribeRequest) -> TranscribeResult: ...
+async def load_document(req: JsonPathRequest) -> DocumentSummary: ...
+async def get_transcript(req: GetTranscriptRequest) -> TranscriptResult: ...
+async def get_ranges(req: JsonPathRequest) -> RangesResult: ...
+async def apply_cuts(req: ApplyCutsRequest) -> ApplyCutsResult: ...
+async def restore_ranges(req: RestoreRangesRequest) -> RestoreResult: ...
+async def render(req: RenderRequest) -> RenderResult: ...
 ```
 
 ---
 
 ## 7. What's solid
 
-1. **Menu bar reparenting works without ambiguous-shortcut warnings.**
-   Each editor QAction lives once on MainWindow's `EditorActions`
-   bundle. EditorPane receives the bundle on construction and
-   connects via `(signal, slot)` pairs tracked for explicit disconnect
-   in `release()`. The "Save action on the File menu is the same
-   QAction object as the one wired to Cmd-S in EditorPane" test
-   assertion (`main.editor_actions.save is main.editor_pane._save_action`)
-   passes verbatim.
-2. **Quit-when-dirty has all four behaviours covered by tests.**
-   Clean editor closes immediately. Dirty editor prompts. Save branch
-   writes and closes. Discard branch closes without writing. Cancel
-   branch keeps the window open. Save-fails-cancels-close: mocked
-   write raise → "Save failed" critical → close ignored, editor still
-   alive and dirty. The four-test surface is the contract.
-3. **Render runs non-modally; user can edit during render.**
-   `RenderWorker` constructor stores a reference to the Document at
-   that moment. Mid-render `session.apply` produces a new Document
-   object on the session — the worker's snapshot is the original. The
-   `test_render_during_edit_uses_pre_render_snapshot` test confirms
-   `captured["doc"] is snapshot_doc` after a cut applies during the
-   worker run.
-4. **Export action disables during render.** `_handle_render_started`
-   sets `editor_actions.export_.setEnabled(False)`; the four terminal
-   render events (complete/error/cancel) re-enable it. A second export
-   shortcut press during a render hits a disabled action and is a no-op.
-5. **App icon ships.** `resources/icons/transcribe.icns` is committed,
-   regeneratable via `scripts/make_icon.py`. `QApplication.setWindowIcon`
-   in `run()` and `MainWindow.setWindowIcon` in `__init__` give us the
-   window-bar mark. Dock icon stays Python's launcher icon when running
-   `python main_qt.py` (no `.app` bundle yet); flagged in §8.
-6. **About dialog reports real runtime versions.** `about_text()`
-   pulls live `PySide6`, `faster_whisper`, and `ffmpeg -version`
-   strings each call — no stale cached strings.
-7. **Autosave indicator transitions cleanly.** `AutosaveStatusLabel`
-   coalesces rapid set_state churn through an 80 ms debounce. With
-   autosave on, dirty → "Saving…" → on save complete → "Saved". With
-   autosave off, dirty → "Unsaved changes" until manual save.
-8. **Pane swap doesn't leak action handlers.** `release` disconnects
-   each `(signal, slot)` pair we tracked at wire time. The
-   `test_action_connections_disconnect_on_release` test cycles two
-   `show_editor` calls and asserts the first pane's connection list
-   is empty post-swap — no stale double-handlers waiting for
-   DeferredDelete.
+1. **Tool registration is data-driven.** The `TOOLS` tuple is the
+   single source of truth — `_tool_descriptors()` derives both the
+   advertised `inputSchema`/`outputSchema` (from Pydantic) and the
+   dispatch table. Adding a 6b tool is a new `ToolDef` row; no
+   server-bootstrap edit required.
+2. **Stable error codes survive the SDK's collapse.** The MCP SDK
+   converts every handler exception into `CallToolResult(isError=True,
+   content=[TextContent(...)])` rather than into a JSON-RPC error
+   response. Clients can't read `data.code`, but the message always
+   begins `<CODE>: ...`, so prefix-parsing keeps the contract intact.
+   The unit tests assert on the prefix; the README documents it.
+3. **Word-boundary validation matches the renderer's invariant.**
+   `_is_word_boundary` accepts a timestamp if it (a) matches a word
+   start or end within 1 ms, or (b) falls in pure silence between
+   words. This mirrors `core.render._snap_cuts_to_word_boundaries`'s
+   behaviour ("cuts that don't overlap any word pass through
+   unchanged") so MCP cuts that pass validation here are guaranteed to
+   render cleanly.
+4. **All-or-nothing for `apply_cuts` and `restore_ranges`.** Validation
+   over every requested interval runs *before* any mutation; if any
+   one fails, the file on disk is untouched. The tests confirm this by
+   reading the bytes pre-call and asserting equality post-error.
+5. **Workers run off the event loop.** `anyio.to_thread.run_sync`
+   pushes `TranscriptionWorker.run()` and `RenderWorker.run()` to a
+   thread, so the MCP read loop keeps draining stdin during a long
+   render. No new thread management code lives in `mcp_server/` —
+   anyio handles it.
+6. **End-to-end stdio handshake verified.** Manually piped
+   `initialize` + `tools/list` + `tools/call(load_document)` through
+   `python main_mcp.py` and read structured JSON back. All 7 tools
+   list, load_document round-trips, and the FILE_NOT_FOUND error path
+   surfaces with the documented prefix.
 
 ---
 
-## 8. What's fragile or worth knowing (5f additions)
+## 8. What's fragile or worth knowing (6a additions)
 
-1. **App icon caveat: Dock icon needs bundling.**
-   `setWindowIcon` only paints the icon in the title bar / window
-   close-button area. The Dock icon comes from the executable's
-   `Info.plist`; running `python main_qt.py` shows Python's launcher
-   icon, not Transcribe's. Proper Dock icon requires `py2app` /
-   `pyinstaller` bundling, which is post-Phase-5 packaging work.
-2. **Render progress is still best-effort.** No change from 5e
-   here — `core.render.render_cut`'s `_ProgressAdapter` only emits
-   when smartcut emits, and smartcut goes silent during long ffmpeg
-   stretches. The status-bar `RenderStatusWidget` promotes itself
-   from indeterminate to a 0–100 bar on first numeric tick, but on
-   long sources the bar still sits at one value for chunks. Genuine
-   progress would require modifying `core/render.py`, deferred per
-   the 5f spec's "no `core/` changes" rule.
-3. **Cancel-during-render only takes effect on next progress tick.**
-   `cancel_render()` sets the `threading.Event` synchronously, but
-   the worker observes it through smartcut's progress callback. If
-   smartcut is mid-ffmpeg, cancellation lands when the next progress
-   tick fires — which on a 23 GB podcast may be seconds, not
-   milliseconds.
-4. **Quit guard relies on `_force_close` for programmatic teardown.**
-   pytest-qt's `_close_widgets` (and any future programmatic close
-   path) needs to set `_force_close = True` before calling close, or
-   the dirty-editor prompt blocks forever waiting for input. The
-   pytest fixture installs this via `qtbot.addWidget(win,
-   before_close_func=...)`. The non-test path is naturally fine
-   because the user dismisses the prompt themselves.
-5. **Editor actions stay parented to MainWindow even when no editor.**
-   The seven QActions in `EditorActions` are children of MainWindow
-   via `QAction(text, self)`. They're disabled while no editor pane
-   is open. EditorPane, when constructed, calls `self.addAction` on
-   each so shortcuts fire while the pane is alive. On
-   `_dispose_editor_pane`, the actions stay alive (just disabled);
-   the addAction-association with the now-deleted pane is dropped by
-   Qt automatically.
-6. **`show_editor` now disposes the prior editor pane too.**
-   Original 5e behaviour assumed editor was only entered from
-   transcribe. 5f tests (`action_connections_disconnect_on_release`)
-   exercise editor → editor swaps; `show_editor` calls
-   `_dispose_editor_pane` first to prevent leaked panes. Real-world
-   only path that hits this is "user opens a different project file
-   while one's already open via Cmd-O" — the existing
-   `_handle_open_project` now flows through this cleanly.
-7. **Dim-overlay verification result.** Re-checked programmatically
-   on varied-amplitude peaks (loud + quiet sections) against both
-   dark (#242424) and light (#ffffff) palettes. Loud-cut-vs-loud-kept
-   delta: 52 (dark) / 72 (light). Quiet-cut-vs-quiet-kept delta: 31
-   (dark) / 43 (light). All four well above the 10-unit threshold
-   the existing test enforces. No code change to the overlay itself
-   was needed — 5e's gray-plus-hatch ships verified for 5f.
+1. **`output_schema` validation can reject string-typed fields if
+   strict.** The MCP SDK runs `jsonschema.validate` against the
+   `outputSchema` after the handler returns. Pydantic emits
+   `additionalProperties: false`; if the handler ever forgot a field
+   on a response model, validation would fail with a generic message.
+   The tests cover happy paths but not "missing field" — adding an
+   output validation regression test if 6b tweaks any model is cheap
+   insurance.
+2. **Cache hit assumes Settings.output_dir is None.** When
+   `Settings.output_dir` is set (user has chosen a custom output
+   folder in the GUI), `try_load_cached_document` looks there for the
+   sidecar. The MCP server inherits the same Settings, so a user with
+   a non-default output_dir gets cache hits keyed off that folder —
+   consistent with the GUI's behaviour, but worth a flag if a future
+   tool wants source-relative caching irrespective of Settings.
+3. **`output_path` override on cache hit copies, not moves.** If the
+   user passes `output_path` for `transcribe` while a cache file
+   exists at the candidate path, the MCP server copies the cache file
+   to the requested path, leaving the original in place. That's the
+   right behaviour for the editor's "load from your normal cache path"
+   workflow but might surprise a workflow that expects a single
+   canonical location. Documented in the schema's field description.
+4. **No streaming progress in 6a.** Synchronous from the client's
+   perspective. A long transcribe (25-min podcast on `medium` model
+   ~ 8 min) blocks the chat with no in-progress feedback beyond the
+   stderr log on the server side. 6c spec: surface progress through
+   MCP's `notifications/progress` channel.
+5. **Multi-source documents are rejected at the cut/restore layer.**
+   `_primary_source_id` raises `INVALID_DOCUMENT` if `len(doc.sources)
+   != 1`. Same constraint `core.render` enforces. Multi-source MCP
+   support waits on multi-source render (Phase 5+'s deferred scope).
+6. **`render` reports `render_time_s` from the MCP-layer wall clock,
+   not the worker's elapsed.** The two diverge by the thread-handoff
+   overhead (~milliseconds). Close enough for client telemetry; if a
+   future tool wants exact worker-elapsed, plumb `RenderComplete.elapsed`
+   through.
+7. **`mcp_server/server.py` does not advertise `serverCapabilities.tools.listChanged=True`.**
+   The tool list is static at process start; 6b/6c can flip this on
+   when dynamic registration lands.
 
 ---
 
-## 9. Phase 5f stop-and-report (per spec)
+## 9. Phase 6a stop-and-report (per spec)
 
-**1. Dim-overlay verification.**
+**1. `core/` change for `reason` field.**
 
-Verified programmatically against varied-amplitude peaks in both dark
-mode (base #242424, ink #DCDCDC) and light mode (base #FFFFFF, ink
-#000000). Same-amplitude cut-vs-kept lightness deltas:
+No `core/` change. `AddCut` already had `reason: str = "manual"`
+(see [core/editing.py:83](core/editing.py)). The MCP `apply_cuts`
+handler propagates `CutRequest.reason` straight into the
+`AddCut(..., reason=...)` constructor; if the client omits it we keep
+the existing `"manual"` default. The spec's flag was conservative —
+worth confirming.
 
-```
-dark   loud    52    quiet 31
-light  loud    72    quiet 43
-```
+**2. Settings load path.**
 
-All four pairs read distinct above the 10-unit perceptual threshold
-the existing test enforces. The 5e gray-plus-hatch overlay is
-durable. No code change. (I did not eyeball this on a Retina display
-against an actual transcribed long-form podcast clip — the
-synthetic fixture and the dark/light palette sweep are the
-mechanical verification I could honestly do in this session.)
+The existing `core.settings.load_settings()` Just Worked. It honours
+`WHISPER_SETTINGS_DIR` env var → falls back to
+`~/Library/Application Support/WhisperTranscriber/settings.json` on
+macOS. No refactor was needed; the loader has no GUI dependencies, so
+the MCP layer calls it directly. Per-tool override kwargs (`model`,
+`language`, `pad_lead`, etc.) mutate the loaded Settings dataclass
+in-place for that one call — Settings is a dataclass, not a singleton,
+so there's no cross-call leakage.
 
-**2. Reparent vs. promote.**
+**3. Worker-in-MCP integration.**
 
-Promoted action ownership to MainWindow. The seven editor QActions
-(`save`, `export_`, `undo`, `redo`, `cut`, `restore`, `delete`)
-live on a `EditorActions` dataclass owned by MainWindow and handed
-to every EditorPane on construction. EditorPane's `_wire_actions`
-connects each action to its handler and records the `(signal, slot)`
-pair; `release` disconnects them so a pane-swap doesn't leak
-double-handlers.
+`anyio.to_thread.run_sync(worker.run)`. The worker's `run()` is
+synchronous and CPU-bound (transcription) or subprocess-bound (render),
+so a thread is the right primitive. Cancellation: there is no
+client-driven cancellation in 6a. If Claude Desktop kills the MCP
+process mid-render, the OS reaps the parent, the worker thread (a
+daemon) dies with it, and any ffmpeg subprocesses inherit the
+parent-PID-died signal — they get SIGTERM/SIGHUP and exit, leaving
+partial output behind. That partial-file cleanup is what
+`workers.render.RenderWorker._cleanup_partial` exists to do, but it
+only runs on the *cancelled* path, not on process kill. A 6c improvement:
+register an atexit hook that unlinks any partial render output, or
+ship a separate cancellation tool.
 
-The "EditorPane is recreated per-document" path was real: on every
-`show_editor` we destroy the old pane and create a new one. If the
-QActions had been parented to EditorPane, they'd die with each
-pane and the menu bar would point at deleted QAction instances on
-swap. Promoting was the right call; lifetime story is "MainWindow
-owns the actions, panes connect on construct and disconnect on
-release, no zombies."
+**4. Manual end-to-end smoke.**
 
-The standalone-EditorPane test path (`tests/test_phase_5e.py`'s
-fixture) gets a local `EditorActions` from `_build_local_actions()`
-when the constructor's `actions` arg is `None`. Same handler wiring
-either way; `_save_action`/`_cut_action`/etc properties keep the
-old test-reach intact.
+Stdio handshake verified at the protocol level (see §7.6 above) —
+piped `initialize`/`tools/list`/`tools/call(load_document)` and read
+back structured JSON. Errors round-trip through the documented
+prefix path (FILE_NOT_FOUND on a bogus path).
 
-**3. Quit-when-dirty edge cases.**
+End-to-end via Claude Desktop **is the spec's required smoke** but
+requires the user to (a) restart Claude Desktop with the
+`claude_desktop_config.json` entry and (b) drive the workflow
+themselves. The README has the config snippet ready; this commit's
+done-when leaves the literal "open Claude Desktop and try it" step
+to the user as the final acceptance test. The proxy I ran (raw stdio
+RPC) exercises the same protocol surface a Claude Desktop session
+would; if anything failed in the chat-driven flow, it'd be a UX layer
+above the protocol, not a wire-format issue.
 
-Covered: clean editor → instant close. Dirty + Save → write succeeds
-→ close. Dirty + Save → write fails (OSError) → critical popup,
-close cancelled, editor stays alive and dirty. Dirty + Discard →
-close without write. Dirty + Cancel → close cancelled. All five
-covered by tests.
+**5. Tool schema surprises.**
 
-Not covered:
-- Cmd-Q from within a `QFileDialog` (the dialog's own modal swallows
-  the Cmd-Q before MainWindow sees it; that's macOS HIG-correct).
-- Force-quit via Activity Monitor or Cmd-Option-Esc (these are SIGKILL,
-  the process never gets to run cleanup; that's an OS-level escape
-  hatch the user has explicitly opted into).
-- The `applicationShouldTerminate` callback Qt's QApplication
-  doesn't expose for us to vet from the application-level Quit menu
-  before the window-level closeEvent. macOS routes Cmd-Q through the
-  application-menu Quit action (which our `_quit_action.triggered`
-  connects to `self.close`), which then sends a closeEvent — so the
-  guard fires there too, by construction.
+Pydantic v2 `model_json_schema()` produces clean draft-2020 schemas;
+the MCP SDK accepts them verbatim. One concrete improvement worth
+shipping in 6b: descriptive examples in `Field(..., examples=[...])`.
+Claude reads tool descriptions to decide which tool to call but
+doesn't currently see examples on individual fields. The MCP spec
+will eventually surface these; until then, embedding example values
+in the field's `description` text is the pragmatic workaround.
 
-**4. Render UX during edit.**
+The other gotcha: `extra="forbid"` strict-mode is non-default.
+Without it, the JSON Schema would emit `additionalProperties:
+true`, and Claude would happily pass through extra keys (like a
+`reason` on a `RestoreRequestItem` that doesn't accept one) without
+the SDK's input validator catching them. Forbidding extras at the
+Pydantic layer surfaces those issues at request time instead of as
+silent ignored fields.
 
-Snapshot isolation held. `RenderWorker.__init__` captures
-`self.document = document` at construction. The session's `apply`
-returns a fresh Document via `dataclasses.replace`, so the worker's
-captured reference stays pointing at the original. The
-`test_render_during_edit_uses_pre_render_snapshot` test starts a
-worker, mutates the session via cut.trigger, runs the worker, and
-asserts `captured["doc"] is snapshot_doc` — passes.
+**6. Concurrency / file-locking.**
 
-Visible weirdness during the in-flight edit window: undo past the
-snapshot point would pop the worker's snapshot off the user's
-visible undo stack, but doesn't affect the worker's captured ref.
-The user could, in principle, undo all the way back, redo to a
-totally different state, and the rendered output still reflects the
-exact pre-render Document. That's correct snapshot semantics —
-"render produces the version you asked it to render at the moment
-you asked." But it can confuse a user who expects "the render
-follows whatever I'm looking at." Worth a doc note in the user
-manual when that exists; not a code issue.
+Failure modes considered:
+- GUI saves while MCP `apply_cuts` reads: MCP gets the pre-save
+  Document, applies cuts, writes to disk. The GUI's save lands first
+  (or the MCP's, depending on timing); whichever wrote second wins.
+  The user's GUI undo stack has no record of the MCP edit, so on the
+  next dirty-save the GUI overwrites the MCP edit silently.
+- MCP `apply_cuts` mid-write while GUI saves: file is briefly empty
+  (Python's `Path.write_text` is non-atomic). If GUI tries to read
+  during that window, it'd see an empty file and fail to parse —
+  but the GUI's save path is `write_text`, not load, so this specific
+  collision only matters if the GUI is *autosaving* and the autosave
+  reads the on-disk version. Today's autosave doesn't read; it writes
+  the in-memory Document. So the failure mode is "MCP writes nothing,
+  GUI overwrites with its in-memory copy" — i.e., MCP edits get lost.
+- Two MCP tool calls simultaneously: the SDK serializes calls per
+  session, so this can't happen with one client. With two clients
+  (e.g., two Claude Desktop chats), it can — and the same "last
+  writer wins" applies. No mutex.
 
-**5. App icon path.**
+For 6a "last writer wins" is acceptable. If the workflow demands
+"two writers at once" in 6c, the right tool is a sidecar `.lock` file
+(or, less desirably, fcntl flock — which is per-process so the Qt and
+MCP processes would actually have to cooperate).
 
-Drafted a geometric mark — translucent blue rounded-square
-background with a stylised T crossbar over six waveform-style
-vertical bars. Painted via QPainter into a 1024×1024 PNG, then run
-through `sips` to emit the iconutil-compatible iconset and finally
-`iconutil -c icns` for the `.icns` bundle. Committed both the source
-PNG (`resources/icons/transcribe_1024.png`, ~67 KB) and the bundle
-(`resources/icons/transcribe.icns`, ~315 KB). `scripts/make_icon.py`
-regenerates both end-to-end.
+**7. Smallest analysis tool 6b should ship.**
 
-Nothing weird about the `.icns` generation. `sips`/`iconutil` are
-both first-party macOS tools; the recipe is the standard one from
-Apple's own docs. The icon is functional but not pretty —
-re-skinning is a one-line change to `_render_source` in the script.
+`find_silences(json_path, min_duration_s=0.5) -> list[{start_s, end_s, duration_s}]`.
 
-**6. Phase 5 retrospective.**
-
-Three things I'd do differently if running 5a-5f again:
-
-1. **Decide action ownership earlier.** 5c put QActions on
-   EditorPane to satisfy the shortcut-fires-anywhere requirement.
-   5f had to refactor that into a MainWindow-owned bundle when the
-   menu bar landed. Both calls were locally correct, but the 5f
-   refactor was bigger than it needed to be — `_action_connections`
-   tracking, backwards-compat property aliases, the
-   `actions=None`-fallback constructor branch. If 5c had built
-   actions on a separate `EditorActions` namespace from the start
-   (even when EditorPane was their only consumer), 5f's menu-bar
-   reparenting would've been a 20-line change.
-
-2. **Don't ship a render dialog you'll throw away in three commits.**
-   5e's modal `QProgressDialog` was scaffolding that read like
-   product, then got migrated to a status-bar widget in 5f. The
-   modal worked but everyone who saw it knew it was wrong (modal
-   "Rendering…" blocking the editor for minutes is not a thing). I
-   should've pushed back on shipping it in 5e and gone straight to
-   the status-bar pattern. The cost of "do it right the first time"
-   was a half-day in 5e; the cost of "ship the modal, refactor in
-   5f" was that half-day plus the 5f migration cost plus the
-   cognitive load of two release-noted UX states.
-
-3. **Test the macOS-specific paths during development, not at end.**
-   The pytest-qt-quit-guard interaction (where `_close_widgets` runs
-   before fixture finalizers, blocking on the dirty prompt) cost an
-   hour of debugging at the very end of 5f. A 10-line spike with a
-   real MainWindow and a real close call earlier would've surfaced
-   it immediately. The general lesson: when adding code that runs
-   in test teardown (`closeEvent`), write the test that exercises
-   teardown the same day, not at the end of the phase.
-
-**7. Phase 6 surface.**
-
-With Phase 5 complete the four candidate next phases differ in
-load-bearing-ness:
-
-- **Render-time playback preview** (least). Lets the user scrub
-  through a virtual timeline that reflects cuts, before clicking
-  Export. Useful for confirming pacing of a long edit without burning
-  CPU on a render. But our smartcut output is fast (sub-second on
-  the 30-s synthetic) and Cmd-E followed by playing the result is
-  a 5-second feedback loop already. Convenience > load-bearing.
-
-- **I/O loop marks.** The "play this section on repeat" workflow
-  for cleanup passes — flag a 2-second region as "loop until I'm
-  satisfied," then keep iterating cuts within it. Decision 7
-  reserved I/O for this use; nothing's bound yet. **Load-bearing
-  for the cleanup workflow** because loop-listening is *the* way
-  voice-edit pacing is verified. Cheap to ship — `QMediaPlayer`
-  natively supports loop ranges via `setLoops` plus a position
-  watchdog.
-
-- **Multi-clip support.** 4f-3 made Document.ranges store
-  `(source_id, start, end)` so the architecture is *supposed* to
-  be multi-clip-ready. The render path operates per kept-range and
-  smartcut concatenates, so two sources should already work
-  end-to-end. **Verifying the claim** is the work — drop a second
-  source onto an open project, confirm the timeline composes them,
-  confirm render concatenates correctly across sources. Load-bearing
-  because it's how a podcast with a host's main mic and an intro
-  jingle gets edited. Probably medium effort: the data model is
-  ready, the UI for "add another source" needs design, smartcut may
-  or may not handle source-mismatch gracefully.
-
-- **`.app` bundling.** Packaging via `py2app` or `pyinstaller`. Gets
-  us a real Dock icon, double-clickable launch, and the app on
-  someone else's Mac without `git clone + pip install`. Load-bearing
-  for distribution but not for the editing workflow itself. Stable
-  once it works; the iteration cost is high (a packaging change
-  takes minutes per cycle).
-
-If I had to pick one: **I/O loop marks**. It's the smallest
-meaningful piece of editing functionality the app is missing for
-the workflow it's targeting (long-form podcast cleanup), the
-architecture is ready, and shipping it lets the app cross the
-"functional but not yet ergonomic" threshold. Multi-clip is the
-bigger payoff but a multi-week commitment; loop marks is days.
+Reasoning: every other interesting analysis (filler-word detection,
+redundant-take detection, sentence-level pacing) requires either an
+external model or a non-trivial heuristic, and most of them are
+"sometimes correct" tools where the user has to verify the output
+anyway. Silence detection, by contrast, is mechanical — gaps between
+word.end and the next word.start where the gap exceeds a threshold
+— and the result is unambiguously actionable. If 6b ships only this
+one tool, the workflow becomes: "transcribe → ask Claude to find
+silences over 0.5 s → apply_cuts on the list → render." That's the
+core podcast-cleanup loop with zero subjective judgement, and it's
+the demonstrably-useful thing the MCP layer adds beyond what the GUI
+already has. Filler detection is a more impressive demo but harder
+to get right; silence detection is the no-arguments minimum viable
+analysis tool.
 
 ---
 
-## 10. Definition-of-done checklist (5f)
+## 10. Definition-of-done checklist (6a)
 
-- [x] Dim-overlay verification done; result reported (§9.1, §8.7).
-- [x] Native macOS menu bar with all listed items, all functional,
-      all correctly disabled when there's no editor.
-- [x] Cmd-Q with dirty editor prompts; all three branches behave
-      correctly; save-fails-cancel works.
-- [x] App icon visible on the window. (Dock-icon caveat documented
-      in §8.1.)
-- [x] About dialog opens and shows real version info.
-- [x] Render progress is non-modal; user can edit during render;
-      output reflects pre-render state.
-- [x] Autosave status visible in status bar when relevant.
-- [x] All prior 501 tests pass plus 28 new = 529.
-- [x] `python main_qt.py` launches; full flow exercised via test
-      paths (open file, transcribe, edit, save, export).
-- [x] `python main.py` (tkinter) still launches.
-- [x] Ruff clean for changed files.
-- [x] STATE.md overwritten — Phase 5 *complete*.
-- [x] Single commit: `phase 5f: macos polish, menu bar, quit guard,
-      render ux`.
+- [x] `mcp_server/` package implemented; all 7 tools functional.
+- [x] `python main_mcp.py` boots a stdio server (verified by piping
+      `initialize` + `tools/list` and reading the response).
+- [x] Installable in Claude Desktop via `mcp_server/README.md`'s
+      recipe. (Verified via raw stdio handshake; in-Claude smoke is
+      the user's final acceptance test, see §9.4.)
+- [x] All 529 prior tests pass plus 30 new = 559.
+- [x] `python main.py` and `python main_qt.py` still launch (import
+      smoke verified).
+- [x] No `core/` changes (the `reason` field already existed; see §9.1).
+- [x] Ruff clean for changed files (`mcp_server/`, `main_mcp.py`,
+      `tests/test_phase_6a.py`).
+- [x] STATE.md overwritten — Phase 6a complete.
+- [x] Single commit: `phase 6a: mcp server foundation
+      (transcribe, read, cut, render)`.
