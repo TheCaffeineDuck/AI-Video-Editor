@@ -153,6 +153,29 @@ class RangesResult(BaseModel):
     ranges: list[RangeOut]
     total_kept_s: float
     total_cut_s: float
+    is_source_monotonic: bool = True
+
+
+# ---------------------------------------------------------------------------
+# get_timeline (Phase 6a v3-aware tool)
+# ---------------------------------------------------------------------------
+
+
+class ClipOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_path: str
+    source_start_s: float
+    source_end_s: float
+    reason: str = ""
+
+
+class TimelineResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    clips: list[ClipOut]
+    total_duration_s: float
+    is_source_monotonic: bool
 
 
 # ---------------------------------------------------------------------------

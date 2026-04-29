@@ -2,19 +2,22 @@
 
 **Date:** 2026-04-29
 **Branch:** main
-**Commits:** Phase 6a in two passes —
+**Commits:** Phase 6a is shipped across four commits —
   * `f9c06f5` — MCP server foundation (transcribe / read / cut / render).
   * `1f4eca1` — smartcut non-monotonic spike (YELLOW gate, option 1 picked).
-  * Pending — schema v3 (Clip/Timeline) + run-batched renderer + AddCut.reason.
+  * `0a92ec2` — schema v3 (Clip/Timeline) + run-batched renderer +
+    `AddCut.reason`.
+  * Pending — GUI v3 reader (playlist-order transcript, edit actions
+    disabled on non-monotonic) + MCP `get_timeline` + non-monotonic
+    edit-refusal + smoke checklist.
 
-**Status:** Phase 6a's foundation is complete. All 588 tests pass (529
-prior + 30 MCP-foundation + 29 schema-v3). Lint clean for changed files.
-GUI v3 reader and MCP-tool retrofitting (clip-aware naming) are
-deferred to later passes.
+**Status:** Phase 6a is complete. All 602 tests pass (529 prior + 30
+MCP-foundation + 29 schema-v3 + 14 final). Lint clean for changed
+files. Phase 6b is next.
 
 ---
 
-## 1. Phase 6a in three paragraphs
+## 1. Phase 6a in four paragraphs
 
 Phase 6a opened with the MCP server foundation (commit `f9c06f5`) —
 seven tools wrapping the `core/` pipeline over stdio per Anthropic's
@@ -49,6 +52,22 @@ the final output (within-run *and* run-to-run boundaries). MediaContainer
 is reused across runs from the same source — the spike showed ~35 %
 wall-clock saving on the heavy HEVC 10-bit fixture.
 
+The final pass closes the loop on the editor-side and MCP-side
+v3-awareness. The Qt `TranscriptView` now branches on the document's
+monotonicity: monotonic docs render via the pre-6a source-order path
+(byte-identical, locked under a hash snapshot test); non-monotonic
+docs render in playlist order with a visible `— jump to N.NNs —`
+boundary between adjacent clips. `EditorPane` disables cut / restore /
+delete / save and stamps a "Phase 6b" tooltip when the loaded
+document is non-monotonic — the user never reaches the
+`NotImplementedError` safety net in `core.editing`. MCP gets a new
+`get_timeline` tool returning the v3 playlist (the v2-shaped
+`get_ranges` is retained but flagged lossy on non-monotonic), and
+`apply_cuts` / `restore_ranges` refuse non-monotonic documents with
+the new stable `EDIT_NOT_SUPPORTED` error code so clients branch
+cleanly. `docs/PHASE_6A_SMOKE.md` documents an 11-step manual checklist
+the user runs through Claude Desktop.
+
 ---
 
 ## 2. Project structure (deltas in this pass)
@@ -63,13 +82,22 @@ wall-clock saving on the heavy HEVC 10-bit fixture.
 │   └── …                    # other files unchanged
 ├── workers/                 # unchanged
 ├── ui/                      # unchanged (still reads via doc.ranges)
-├── ui_qt/                   # unchanged in this pass — GUI v3 reader is a later pass
-├── mcp_server/              # unchanged in this pass — clip-aware naming is a later pass
+├── ui_qt/
+│   ├── components/transcript_view.py  # NEW playlist-order render path
+│   └── editor_pane.py       # NEW _apply_monotonicity_state + tooltip
+├── mcp_server/
+│   ├── errors.py            # +EDIT_NOT_SUPPORTED
+│   ├── schemas.py           # +ClipOut, +TimelineResult, +is_source_monotonic on RangesResult
+│   ├── server.py            # 8th tool registered (get_timeline)
+│   └── tools/document.py    # +get_timeline, +_require_monotonic_timeline
 ├── scripts/
 │   └── smartcut_spike.py    # GATE — kept as a regression check
+├── docs/
+│   └── PHASE_6A_SMOKE.md    # NEW — 11-step manual checklist
 ├── tests/
-│   ├── test_phase_6a.py     # MCP-foundation tests (30, schema_version assertion bumped to 3)
-│   ├── test_phase_6a_v3.py  # NEW — 29 tests for schema v3 + renderer
+│   ├── test_phase_6a.py     # MCP-foundation tests (30 → 8-tool list update)
+│   ├── test_phase_6a_v3.py  # 29 tests for schema v3 + renderer
+│   ├── test_phase_6a_final.py  # NEW — 14 tests for GUI v3 reader + MCP awareness
 │   ├── test_document.py     # schema_version assertions updated to v3
 │   ├── test_editing.py      # AddCut.reason default updated to None
 │   └── test_exporters.py    # schema_version assertion bumped to v3
@@ -97,6 +125,13 @@ Unchanged.
 | `tests/test_document.py` | `Document.SCHEMA_VERSION == 3` (was 2). `to_json` emits `main_timeline` (was `ranges`). v1 migration test now expects v3 in memory. `_v2_payload(...)` keeps emitting `schema_version=2` to exercise the v2→v3 chain. |
 | `tests/test_editing.py` | `test_add_cut_default_reason_is_manual` → `test_add_cut_default_reason_is_none`. |
 | `tests/test_exporters.py` / `tests/test_phase_6a.py` | `schema_version` assertions bumped to 3. |
+| `ui_qt/components/transcript_view.py` | New `_render_source_order` (pre-6a body, locked under hash snapshot) and `_render_playlist_order` (walks clips in playlist order, emits ``— jump to N.NNs —`` between adjacent clips). `set_document_model` dispatches by `is_source_monotonic`. |
+| `ui_qt/editor_pane.py` | New `_apply_monotonicity_state()` called from `_render_document`. Disables `cut`, `restore`, `delete`, `save` (and the toolbar Save button) on non-monotonic timelines, stamps `EditorPane.NON_MONOTONIC_TOOLTIP`, and restores Qt's default tooltip when re-enabled. Export stays enabled because rendering is read-only. |
+| `mcp_server/errors.py` | Added `EDIT_NOT_SUPPORTED` to the stable code set (client-fixable tier — surfaces as `INVALID_PARAMS` at the JSON-RPC layer). |
+| `mcp_server/schemas.py` | New `ClipOut` + `TimelineResult` for the v3-aware tool. `RangesResult` gains `is_source_monotonic: bool` (default `True` so v2-shaped clients keep parsing). |
+| `mcp_server/server.py` + `mcp_server/tools/document.py` | Registered `get_timeline` (8th tool). `_require_monotonic_timeline` guard added to `apply_cuts` and `restore_ranges` — refuses with `EDIT_NOT_SUPPORTED` rather than letting `NotImplementedError` bubble through. `get_ranges` docstring documents the lossy-on-non-monotonic behaviour. |
+| `tests/test_phase_6a_final.py` | NEW — 14 tests: monotonic transcript hash snapshot, struck-words rendering, non-monotonic playlist-order rendering + boundary marker, edit-actions enabled on monotonic / disabled-with-tooltip on non-monotonic / pane loads non-monotonic without exception, MCP `get_timeline` on monotonic + non-monotonic, `get_ranges` flag on non-monotonic, `apply_cuts` + `restore_ranges` refuse non-monotonic with `EDIT_NOT_SUPPORTED`, `apply_cuts` still works on monotonic. |
+| `docs/PHASE_6A_SMOKE.md` | NEW — 11-step manual end-to-end checklist for Claude Desktop. |
 
 ### Test count
 
@@ -104,7 +139,8 @@ Unchanged.
 |-------|------:|-----:|-----:|
 | End of 5f       | 529 | 517 | 12 |
 | 6a MCP          | 559 | 547 | 12 |
-| **6a schema v3** | **588** | **571** | **17** |
+| 6a schema v3    | 588 | 571 | 17 |
+| **6a final**    | **602** | **585** | **17** |
 
 ---
 
@@ -191,30 +227,57 @@ def _ffmpeg_concat_demuxer(intermediates: list[Path], output_path: Path) -> None
    across runs from the same source path. The spike showed this drops
    3 sequential calls on the heavy HEVC clip from 20.7 s to 13.5 s
    (~35 % saving).
+8. **Qt editor monotonic render is locked under a hash snapshot.**
+   `tests/test_phase_6a_final.py::test_monotonic_transcript_render_is_unchanged_baseline`
+   computes a SHA-256 over `toPlainText()` + the per-word kept/struck
+   flag list and compares to a literal locked digest. Any future
+   change that affects what monotonic users see in the transcript
+   trips this test. Two structural sanity assertions ride alongside
+   ("alpha" / "delta" present, no `— jump to` marker) so a hash drift
+   has actionable diagnostics.
+9. **Non-monotonic Qt editor is read-only and obvious.** Loading a
+   non-monotonic v3 doc into the editor:
+   - renders the transcript in playlist order (gamma/delta first,
+     alpha/beta second for the canonical fixture)
+   - inserts an italicized gray `— jump to N.NNs —` block between
+     adjacent clips
+   - disables `cut`, `restore`, `delete`, `save` actions and stamps
+     `Editing non-monotonic timelines is not yet supported (Phase 6b).`
+     as the tooltip on each
+   - leaves `export` enabled (rendering reads the timeline; the
+     run-batched renderer handles non-monotonic by construction)
+   The `NotImplementedError` from `core.editing` is the safety net,
+   not the first line of defence — the user never reaches it through
+   the GUI.
+10. **`get_timeline` is the v3-faithful read tool.** `get_ranges` is
+    retained for v2-compat clients but its output flattens playlist
+    order into source order; `is_source_monotonic` on the response
+    flags when the flattening is lossy. `get_timeline` returns the
+    full clip list in playlist order with the same flag — clients
+    that need re-arrangement-aware reads pick this.
+11. **`apply_cuts` / `restore_ranges` refuse cleanly, not via stack
+    trace.** Both tools call `_require_monotonic_timeline` before any
+    other validation and raise `EDIT_NOT_SUPPORTED` (a stable client-
+    fixable code) when the document is non-monotonic. The
+    `NotImplementedError` from `core.editing` never bubbles up as
+    `INTERNAL_ERROR` for non-monotonic input.
 
 ---
 
 ## 7. What's fragile or worth knowing
 
-1. **MCP server still uses v2 vocabulary in its tool surface.** The
-   `get_ranges` tool returns `RangesResult { ranges: list[RangeOut],
-   total_kept_s, total_cut_s }`. Renaming to clip-shaped output is
-   deliberately deferred — clients that already wired against the v2
-   shape (including the test suite from commit `f9c06f5`) keep working.
-   When 6b ships re-arrangement we'll need to add a parallel
-   `get_timeline` tool that returns the playlist with non-monotonic
-   ordering preserved; the renaming question can wait until then.
-2. **GUI doesn't yet show non-monotonic timelines correctly.**
-   `ui_qt/components/transcript_view.py`, `waveform_controller.py`,
-   and `editor_pane.py` still iterate `doc.ranges` directly. For
-   monotonic v3 documents (everything 6a editing produces) this is
-   indistinguishable from v2 behaviour — no visible regression. For a
-   hand-crafted non-monotonic v3 fixture, the transcript view will
-   render words in source-time order rather than playlist order, and
-   the waveform will look strange. Editing actions are also not
-   blocked for non-monotonic — they'd fail at the
-   `_session.apply(command)` boundary with `NotImplementedError`. The
-   GUI v3 reader is a separate pass.
+1. **`get_ranges` is intentionally lossy on non-monotonic v3.** The
+   tool retains its v2 shape — flat list of ranges with totals — and
+   reports `is_source_monotonic` so a client can decide whether to
+   call `get_timeline` for the playlist-faithful view. Both tools ship
+   in 6a; renaming `get_ranges` is post-6c work if at all.
+2. **GUI waveform doesn't yet annotate clip jumps.** `WaveformController`
+   still calls `_strip.set_ranges(doc.ranges, duration)` to drive the
+   dim-overlay; for non-monotonic v3 docs the strip shows the source's
+   full kept-extent without a visual indication of playlist boundaries.
+   Acceptable for 6a — the editor disables editing on non-monotonic, so
+   the waveform only matters for read-only browse — but worth a 6b pass
+   when re-arrangement editing lands.
 3. **`_attach_reason_to_neighbor` uses a 1 ns float tolerance.** It
    compares `range.end == cut.start` with `abs(...) < 1e-9`. Cuts whose
    endpoints don't exactly match a range edge (post-`subtract_interval`
@@ -272,10 +335,34 @@ def _ffmpeg_concat_demuxer(intermediates: list[Path], output_path: Path) -> None
    `main_timeline.is_source_monotonic()`, which works correctly off
    the in-memory `ranges` (a non-monotonic v3 fixture leaves `ranges`
    non-sorted, so the property correctly reports non-monotonic).
-3. **GUI not retrofitted in this pass.** The spec called this out as
-   a concurrent sub-agent; we deferred it. Monotonic documents render
-   identically to v2; non-monotonic documents are not yet user-
-   creatable in the GUI flow. See §7.2.
+3. **GUI was retrofitted in the final pass.** The earlier schema-v3
+   commit deferred this; the final commit closes it. `TranscriptView`
+   branches on `is_source_monotonic`, the editor pane disables editing
+   on non-monotonic with the documented tooltip, and a hash-snapshot
+   test guarantees the monotonic render hasn't drifted. The waveform
+   strip is the one piece that still falls through to the v2 view (see
+   §7.2) — deferred to 6b.
+
+### 6a debt that 6b should clear
+
+- **Clip.reason is a 6a-scoped concession.** The 4th field on
+  :class:`Clip` carries `AddCut.reason` so it round-trips through v3
+  JSON. 6b will likely want a richer `cut_log` / `move_log` structure
+  on :class:`Document` so a re-arrangement command (`MoveClip`,
+  whatever its shape) can record both the move's rationale and the
+  source/destination indices without piggy-backing on Clip's reason
+  field. When that ships, Clip's reason can stay as a per-clip note
+  while structural edits live in the log.
+- **`Document.main_timeline` is a derived `@property`, not a real
+  field.** Trigger condition for finishing the migration: any future
+  `Clip` field that can't be expressed on the legacy `Range` type.
+  Multi-source is the concrete case — once a Document holds clips from
+  two source paths, the `Range.source_id` indirection through
+  `doc.sources` breaks down (each clip needs its own path on the wire,
+  which it has, but the in-memory `ranges` list can't carry it). At
+  that point `main_timeline` becomes the storage field and `ranges`
+  flips to a derived compatibility view (or is dropped if no caller
+  still needs it).
 
 ---
 
@@ -370,7 +457,7 @@ A few that turned out subtler than the spec assumed:
 
 ---
 
-## 11. What's done in 6a so far
+## 11. What 6a shipped (cumulative)
 
 - ✅ Smartcut spike committed; gate reported YELLOW; option 1 picked.
 - ✅ Schema v3: `Clip`, `Timeline`, `is_source_monotonic`, run-splitting.
@@ -379,25 +466,43 @@ A few that turned out subtler than the spec assumed:
 - ✅ Non-monotonic guard on `AddCut` / `RestoreRange` / `CutWordRange`.
 - ✅ Run-batched renderer with MediaContainer reuse + unified fade pass
      across all joins (within-run + run-boundary).
-- ✅ MCP server foundation (commit `f9c06f5`, separate prior pass).
-- ✅ All 588 tests pass (529 prior + 30 MCP-foundation + 29 schema-v3).
+- ✅ MCP server foundation (commit `f9c06f5`).
+- ✅ Qt editor v3-aware: playlist-order rendering on non-monotonic with
+     visible clip boundaries; edit actions disabled with documented
+     tooltip; export remains enabled; monotonic render byte-identical
+     under hash snapshot.
+- ✅ MCP `get_timeline` tool (8th tool); `get_ranges` retained with
+     lossy-flag; `apply_cuts` / `restore_ranges` refuse non-monotonic
+     with stable `EDIT_NOT_SUPPORTED` code.
+- ✅ `docs/PHASE_6A_SMOKE.md` — 11-step manual checklist for Claude
+     Desktop end-to-end.
+- ✅ All 602 tests pass (529 prior + 30 MCP-foundation + 29 schema-v3
+     + 14 final). Ruff clean for changed files. Both GUI entry points
+     and the MCP entry import cleanly.
 
-## 12. What's left for 6a (deferred to later passes)
+## 12. What's next (Phase 6b candidates)
 
-- ⏳ GUI v3 reader: `ui_qt/components/transcript_view.py`,
-  `waveform_controller.py`, `editor_pane.py` still iterate
-  `doc.ranges` directly. For non-monotonic documents the transcript
-  view should show clips in playlist order with a visual boundary at
-  run joins; the waveform should fall back to "show full source as
-  kept" gracefully; cut/restore/save actions should be disabled (with
-  tooltip explaining the limitation). Existing GUI tests pass
-  unchanged because monotonic v3 docs look identical to v2.
-- ⏳ MCP `get_ranges` → `get_timeline` (or addition of
-  `get_timeline`). The current `RangesResult` shape is fine for
-  monotonic documents and has clients (the `f9c06f5` test suite); a
-  parallel timeline-aware tool will be added when 6b ships
-  re-arrangement.
-- ⏳ Manual end-to-end smoke through Claude Desktop on a v3 document.
+- **Re-arrangement edit commands.** The smallest viable shape is
+  `MoveClip(from_index: int, to_index: int)` operating on
+  `Document.main_timeline.clips`. It's the first command that would
+  legitimately produce a non-monotonic timeline, and the editor's
+  6a-locked safety nets (NotImplementedError + the Qt "disabled with
+  tooltip" UX) become the right surface to *un-block* once it lands.
+- **`cut_log` / `move_log` storage on Document.** A flat append-only
+  list of edit entries (rationale + which structural change + when)
+  so MCP analysis tools can show the user *why* the document is in
+  the shape it's in. Replaces Clip.reason as the long-term home for
+  cut rationale (Clip.reason can stay as a per-clip annotation).
+- **Waveform v3 reader.** Pair with the rearrangement UX: clip
+  boundaries on the strip, a clear visual difference between "this
+  span is cut" and "this span is kept but plays later in the
+  playlist."
+- **Multi-source compositions.** Trigger to flip `main_timeline` from
+  `@property` to real field — see §8 6a-debt note.
+- **MCP analysis tools.** First candidate from the prior MCP-only
+  6a report: `find_silences(json_path, min_duration_s=0.5)`. Mechanical,
+  unambiguously actionable, completes the cleanup loop without needing
+  any model judgement.
 
 ## 13. Definition-of-done checklist
 
@@ -412,12 +517,18 @@ A few that turned out subtler than the spec assumed:
 - [x] `AddCut.reason` persists through save/load (with attach-to-
       neighbour heuristic mirroring v1→v2 migration).
 - [x] Editing on non-monotonic timelines raises `NotImplementedError`.
-- [x] All 529 prior tests stay green (only assertions touching
-      `schema_version` / `AddCut.reason` default needed updates;
-      production code unchanged for those tests).
+- [x] All 529 prior tests stay green; 73 new (30 MCP + 29 schema v3 +
+      14 final) — 602 total.
 - [x] `python main.py` and `python main_qt.py` import cleanly; `python
-      main_mcp.py` starts and lists 7 tools.
+      main_mcp.py` starts and lists 8 tools (now including `get_timeline`).
+- [x] Qt editor: monotonic render locked under hash snapshot;
+      non-monotonic renders in playlist order with boundary marker;
+      edit actions disabled with `Editing non-monotonic timelines is
+      not yet supported (Phase 6b).` tooltip.
+- [x] MCP `get_timeline` tool added; `get_ranges` annotated as lossy
+      with `is_source_monotonic` flag; `apply_cuts` / `restore_ranges`
+      refuse non-monotonic with stable `EDIT_NOT_SUPPORTED` code.
+- [x] `docs/PHASE_6A_SMOKE.md` — 11-step Claude Desktop checklist.
 - [x] Ruff clean for changed files.
-- [x] STATE.md updated in place — schema version, renderer strategy,
-      MediaContainer finding, AddCut.reason, what's done so far,
-      what's left.
+- [x] STATE.md updated — final pass deliverables, debt notes,
+      6b candidates.

@@ -115,7 +115,9 @@ def _make_doc_file(tmp_path: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def test_seven_tools_registered():
+def test_eight_tools_registered():
+    """Phase 6a final: ``get_timeline`` joins the surface as the v3-aware
+    counterpart to ``get_ranges``."""
     descs = _tool_descriptors()
     names = [d.name for d in descs]
     assert names == [
@@ -123,6 +125,7 @@ def test_seven_tools_registered():
         "load_document",
         "get_transcript",
         "get_ranges",
+        "get_timeline",
         "apply_cuts",
         "restore_ranges",
         "render",

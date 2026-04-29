@@ -26,6 +26,10 @@ INVALID_DOCUMENT = "INVALID_DOCUMENT"
 UNSUPPORTED_SCHEMA = "UNSUPPORTED_SCHEMA"
 WORD_BOUNDARY_VIOLATION = "WORD_BOUNDARY_VIOLATION"
 CUT_INVALID = "CUT_INVALID"
+# Phase 6a: editing on non-monotonic timelines is rejected by the core
+# command stack with NotImplementedError; we surface that as a stable
+# code rather than letting the trace bubble through.
+EDIT_NOT_SUPPORTED = "EDIT_NOT_SUPPORTED"
 
 # Server-side: a worker raised. Surface the underlying message so the
 # client (or the human reading the chat) has something to act on.
@@ -39,6 +43,7 @@ _CLIENT_CODES = frozenset(
         UNSUPPORTED_SCHEMA,
         WORD_BOUNDARY_VIOLATION,
         CUT_INVALID,
+        EDIT_NOT_SUPPORTED,
     }
 )
 

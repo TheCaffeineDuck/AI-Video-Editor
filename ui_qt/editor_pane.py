@@ -520,9 +520,63 @@ class EditorPane(QWidget):
 
     # ----- behavior -----
 
+    NON_MONOTONIC_TOOLTIP = (
+        "Editing non-monotonic timelines is not yet supported (Phase 6b)."
+    )
+
     def _render_document(self) -> None:
         self._transcript.set_document_model(self._session.document)
         self._refresh_undo_redo_buttons()
+        self._apply_monotonicity_state()
+
+    def _apply_monotonicity_state(self) -> None:
+        """Disable editing actions on non-monotonic timelines.
+
+        The core ``AddCut`` / ``RestoreRange`` commands raise
+        :class:`NotImplementedError` at apply time when the timeline is
+        non-monotonic; that's the safety net. The UX commitment is the
+        user never gets to a click that triggers the safety net. Save
+        is also disabled because the GUI has no path that could only
+        mutate a non-monotonic timeline (loading a v3 non-monotonic doc
+        is read-only by design); export stays enabled because rendering
+        reads the timeline rather than modifying it.
+
+        Tooltips are stamped only when we disable: enabling restores
+        Qt's default (which uses the action's display text). We never
+        overwrite a default tooltip with an empty string — that's
+        worse than the default since it strips the action label from
+        the menu hover.
+        """
+        is_monotonic = self._session.document.main_timeline.is_source_monotonic()
+        a = self._actions
+        edit_actions = (a.cut, a.restore, a.delete, a.save)
+        for act in edit_actions:
+            act.setEnabled(is_monotonic and self._action_default_enabled(act))
+            if is_monotonic:
+                # Restore the default-derived tooltip iff we previously
+                # stamped our override there. Don't touch tooltips set
+                # by other code paths.
+                if act.toolTip() == self.NON_MONOTONIC_TOOLTIP:
+                    act.setToolTip(act.text())
+            else:
+                act.setToolTip(self.NON_MONOTONIC_TOOLTIP)
+        if hasattr(self, "_save_btn"):
+            self._save_btn.setEnabled(a.save.isEnabled())
+            self._save_btn.setToolTip(
+                self.NON_MONOTONIC_TOOLTIP if not is_monotonic else ""
+            )
+
+    @staticmethod
+    def _action_default_enabled(_action: QAction) -> bool:
+        """Hook for "would this action be enabled if monotonic?"
+
+        Today every editing action is enabled-by-default while the
+        editor is alive (cut/restore short-circuit on empty selection,
+        save short-circuits on no-source, etc). The hook keeps room
+        for future per-action disable logic without re-tangling the
+        monotonicity check.
+        """
+        return True
 
     def _wire_video_source(self) -> None:
         if not self._session.document.sources:

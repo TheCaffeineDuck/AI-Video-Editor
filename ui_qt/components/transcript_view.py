@@ -201,6 +201,14 @@ class TranscriptView(QTextEdit):
         Called on initial load and after every successful Document
         mutation. Selection and playhead state are reset because the
         word indices are no longer the same after a re-render.
+
+        Phase 6a: dispatches by ``main_timeline.is_source_monotonic``.
+        Monotonic timelines (every v1/v2 doc, every v3 doc 6a editing
+        produces) take the source-order path, which by construction
+        equals playlist order for monotonic timelines and matches
+        every pre-6a snapshot. Non-monotonic timelines take a
+        playlist-order path with a visible boundary marker between
+        clips so the user sees that the source jumped.
         """
         self._words = []
         self._selection_anchor = None
@@ -212,35 +220,116 @@ class TranscriptView(QTextEdit):
         cursor = self.textCursor()
         cursor.beginEditBlock()
         try:
+            if document.main_timeline.is_source_monotonic():
+                self._render_source_order(cursor, document)
+            else:
+                self._render_playlist_order(cursor, document)
+        finally:
+            cursor.endEditBlock()
+        self._word_starts = [r.word.start for r in self._words]
+        self.moveCursor(QTextCursor.MoveOperation.Start)
+
+    def _render_source_order(self, cursor: QTextCursor, document: Document) -> None:
+        """Walk segments in source order; mark struck/kept by ranges.
+
+        The pre-6a render path. For monotonic timelines source order
+        equals playlist order, so this also satisfies the
+        playlist-order contract. Cut words still appear with
+        strikethrough — strikethrough is reversible (Decision 2),
+        the source text is never destroyed.
+        """
+        for seg_idx, seg in enumerate(document.segments):
+            if not seg.words:
+                if _segment_is_kept(seg, document.ranges):
+                    self._insert_text_run(cursor, seg.text)
+                    cursor.insertBlock()
+                continue
+            emitted_in_segment = False
+            for word_idx, word in enumerate(seg.words):
+                is_kept = _word_in_any_range(word, document.ranges)
+                ref = WordRef(
+                    seg_idx=seg_idx,
+                    word_idx=word_idx,
+                    word=word,
+                    kept=is_kept,
+                )
+                self._words.append(ref)
+                self._insert_word(
+                    cursor,
+                    word.text,
+                    len(self._words) - 1,
+                    struck=not is_kept,
+                )
+                emitted_in_segment = True
+            if emitted_in_segment:
+                cursor.insertBlock()
+
+    def _render_playlist_order(self, cursor: QTextCursor, document: Document) -> None:
+        """Walk clips in playlist order; emit each clip's words consecutively.
+
+        The non-monotonic path. For each clip the renderer emits all
+        segment-words whose source-time intersects the clip's
+        ``[source_start, source_end)``. A clip can host more than one
+        segment if the cut spans segment boundaries; the words are
+        emitted in source-time order *within* the clip, but clips
+        themselves are visited in playlist order.
+
+        Struck words don't appear in the playlist render — strikethrough
+        only reads as "the timeline jumped over this word" when there's
+        a single source-order to point at. With re-arrangement, the
+        struck-vs-kept distinction loses its visual home; clips ARE
+        the timeline. A horizontal-rule-style block marker delimits
+        adjacent clips so the user sees where the source jumped.
+        """
+        timeline = document.main_timeline
+        for clip_idx, clip in enumerate(timeline.clips):
+            if clip_idx > 0:
+                self._insert_clip_boundary(cursor, clip)
+            emitted_in_clip = False
             for seg_idx, seg in enumerate(document.segments):
-                if not seg.words:
-                    if _segment_is_kept(seg, document.ranges):
-                        self._insert_text_run(cursor, seg.text)
-                        cursor.insertBlock()
+                if seg.end <= clip.source_start or seg.start >= clip.source_end:
                     continue
-                emitted_in_segment = False
+                if not seg.words:
+                    self._insert_text_run(cursor, seg.text)
+                    emitted_in_clip = True
+                    continue
                 for word_idx, word in enumerate(seg.words):
-                    is_kept = _word_in_any_range(word, document.ranges)
+                    if (
+                        word.end <= clip.source_start
+                        or word.start >= clip.source_end
+                    ):
+                        continue
                     ref = WordRef(
                         seg_idx=seg_idx,
                         word_idx=word_idx,
                         word=word,
-                        kept=is_kept,
+                        kept=True,
                     )
                     self._words.append(ref)
                     self._insert_word(
                         cursor,
                         word.text,
                         len(self._words) - 1,
-                        struck=not is_kept,
+                        struck=False,
                     )
-                    emitted_in_segment = True
-                if emitted_in_segment:
-                    cursor.insertBlock()
-        finally:
-            cursor.endEditBlock()
-        self._word_starts = [r.word.start for r in self._words]
-        self.moveCursor(QTextCursor.MoveOperation.Start)
+                    emitted_in_clip = True
+            if emitted_in_clip:
+                cursor.insertBlock()
+
+    def _insert_clip_boundary(self, cursor: QTextCursor, clip) -> None:
+        """Emit a visual marker between adjacent clips in the playlist.
+
+        Plain-text block of the form ``— jump to N.NNs —`` so the user
+        sees where the source jumps. No word index attached so a click
+        on the boundary doesn't seek anywhere unintended; the keyboard-
+        and-mouse interactivity hooks all key off ``WORD_INDEX_PROPERTY``
+        being present.
+        """
+        marker = QTextCharFormat()
+        marker.setForeground(QColor(140, 140, 140))
+        marker.setFontItalic(True)
+        cursor.insertText(f"— jump to {clip.source_start:.2f}s —", marker)
+        cursor.insertBlock()
 
     # ----- selection -----
 

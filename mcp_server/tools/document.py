@@ -226,9 +226,53 @@ async def get_transcript(req: GetTranscriptRequest) -> TranscriptResult:
 
 
 async def get_ranges(req: JsonPathRequest) -> RangesResult:
+    """Return the document's keep-ranges in source-time order.
+
+    Phase 6a: this tool predates the v3 ``Timeline`` shape. For
+    monotonic v3 documents (every doc 6a editing produces) the output
+    is identical to the v2 contract. For non-monotonic v3 documents
+    (hand-built fixtures or 6b's rearrangement output) the playlist
+    order is *flattened* into source-time order here — the per-clip
+    ordering is lost, which is a lossy view of the timeline. Callers
+    that need playlist order should use :func:`get_timeline` instead.
+    The ``is_source_monotonic`` flag in the response signals whether
+    this flattening dropped information.
+    """
     doc, _, _ = _load_document(req.json_path)
     ranges, kept, cut = _ranges_to_payload(doc)
-    return RangesResult(ranges=ranges, total_kept_s=kept, total_cut_s=cut)
+    return RangesResult(
+        ranges=ranges,
+        total_kept_s=kept,
+        total_cut_s=cut,
+        is_source_monotonic=doc.main_timeline.is_source_monotonic(),
+    )
+
+
+async def get_timeline(req: JsonPathRequest) -> TimelineResult:  # noqa: F821
+    """Return the v3 ``main_timeline`` clips in playlist order.
+
+    Each clip carries ``source_path``, ``source_start_s``,
+    ``source_end_s``, and any ``reason`` set by an edit command. The
+    list preserves playlist (not source-time) order, so non-monotonic
+    re-arrangements round-trip cleanly.
+    """
+    from mcp_server.schemas import ClipOut, TimelineResult
+
+    doc, _, _ = _load_document(req.json_path)
+    timeline = doc.main_timeline
+    return TimelineResult(
+        clips=[
+            ClipOut(
+                source_path=str(c.source_path),
+                source_start_s=float(c.source_start),
+                source_end_s=float(c.source_end),
+                reason=c.reason,
+            )
+            for c in timeline.clips
+        ],
+        total_duration_s=float(timeline.total_duration_s),
+        is_source_monotonic=timeline.is_source_monotonic(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -314,8 +358,28 @@ def _interval_already_kept(
     return False
 
 
+def _require_monotonic_timeline(doc: Document) -> None:
+    """Refuse non-monotonic edits with EDIT_NOT_SUPPORTED.
+
+    The :class:`AddCut` / :class:`RestoreRange` commands raise
+    :class:`NotImplementedError` at apply time on non-monotonic
+    timelines. The MCP contract is for clients to branch on stable
+    string codes, not Python exception types — so we check at the tool
+    boundary and raise the documented error code instead of letting
+    the core trace surface as ``INTERNAL_ERROR``.
+    """
+    if not doc.main_timeline.is_source_monotonic():
+        errors.raise_mcp(
+            errors.EDIT_NOT_SUPPORTED,
+            "this document's timeline is non-monotonic — editing "
+            "(apply_cuts, restore_ranges) requires a source-monotonic "
+            "playlist. Rearrangement-aware editing is scheduled for Phase 6b.",
+        )
+
+
 async def apply_cuts(req: ApplyCutsRequest) -> ApplyCutsResult:
     doc, path, _ = _load_document(req.json_path)
+    _require_monotonic_timeline(doc)
     source_id = _primary_source_id(doc)
 
     cuts_in: list[CutRequest] = list(req.cuts)
@@ -370,6 +434,7 @@ async def apply_cuts(req: ApplyCutsRequest) -> ApplyCutsResult:
 
 async def restore_ranges(req: RestoreRangesRequest) -> RestoreResult:
     doc, path, _ = _load_document(req.json_path)
+    _require_monotonic_timeline(doc)
     source_id = _primary_source_id(doc)
 
     items: list[RestoreRequestItem] = list(req.ranges)

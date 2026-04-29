@@ -40,6 +40,7 @@ from mcp_server.schemas import (
     RenderResult,
     RestoreRangesRequest,
     RestoreResult,
+    TimelineResult,
     TranscribeRequest,
     TranscribeResult,
     TranscriptResult,
@@ -47,6 +48,7 @@ from mcp_server.schemas import (
 from mcp_server.tools.document import (
     apply_cuts,
     get_ranges,
+    get_timeline,
     get_transcript,
     load_document,
     restore_ranges,
@@ -124,11 +126,31 @@ TOOLS: tuple[ToolDef, ...] = (
         description=(
             "Return the kept ranges (the timeline that survives a render) "
             "with totals for kept and cut seconds. Use this to see what's "
-            "already been edited before applying further cuts."
+            "already been edited before applying further cuts. NOTE: this "
+            "tool flattens the playlist into source-time order and is lossy "
+            "for non-monotonic (rearranged) v3 documents — the response's "
+            "is_source_monotonic flag tells you whether the flattening "
+            "discarded ordering information. For a faithful playlist view, "
+            "use get_timeline instead."
         ),
         input_model=JsonPathRequest,
         output_model=RangesResult,
         handler=get_ranges,  # type: ignore[arg-type]
+    ),
+    ToolDef(
+        name="get_timeline",
+        description=(
+            "Return the v3 main_timeline as an ordered list of clips in "
+            "playlist order. Each clip carries source_path, "
+            "source_start_s, source_end_s, and an optional reason string "
+            "set by an edit command. is_source_monotonic indicates whether "
+            "the playlist visits a single source in source-time order — "
+            "True for every doc 6a editing produces, False for hand-built "
+            "or 6b-rearranged fixtures."
+        ),
+        input_model=JsonPathRequest,
+        output_model=TimelineResult,
+        handler=get_timeline,  # type: ignore[arg-type]
     ),
     ToolDef(
         name="apply_cuts",
@@ -139,7 +161,9 @@ TOOLS: tuple[ToolDef, ...] = (
             "to word boundaries (or fall in pure silence between words) — "
             "WORD_BOUNDARY_VIOLATION is raised otherwise. All-or-nothing: "
             "if any cut fails validation, no file is written. Cuts that "
-            "fully overlap an already-cut region are skipped (not errors)."
+            "fully overlap an already-cut region are skipped (not errors). "
+            "Refuses with EDIT_NOT_SUPPORTED when the document's timeline "
+            "is non-monotonic (Phase 6b will lift this restriction)."
         ),
         input_model=ApplyCutsRequest,
         output_model=ApplyCutsResult,
@@ -151,7 +175,8 @@ TOOLS: tuple[ToolDef, ...] = (
             "Re-insert one or more previously-cut intervals into the kept "
             "timeline of a .transcribe.json document. Inverse of apply_cuts; "
             "same word-boundary constraint and same all-or-nothing semantics. "
-            "Restores that are already fully kept are skipped."
+            "Restores that are already fully kept are skipped. Refuses with "
+            "EDIT_NOT_SUPPORTED on non-monotonic timelines."
         ),
         input_model=RestoreRangesRequest,
         output_model=RestoreResult,
