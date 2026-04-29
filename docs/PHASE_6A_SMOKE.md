@@ -40,10 +40,13 @@ Prompt:
 
 > "Which Transcribe tools are available?"
 
-Expected: Claude lists eight tools — `transcribe`, `load_document`,
-`get_transcript`, `get_ranges`, `get_timeline`, `apply_cuts`,
-`restore_ranges`, `render`. If Claude says it has no Transcribe tools,
-the config snippet didn't take or the server isn't booting; check
+Expected: Claude lists fourteen tools (post-6b). The eight 6a tools
+— `transcribe`, `load_document`, `get_transcript`, `get_ranges`,
+`get_timeline`, `apply_cuts`, `restore_ranges`, `render` — plus the
+six 6b-2 proposal-lifecycle tools (`propose_moves`, `list_proposals`,
+`read_proposal`, `apply_proposal`, `list_apply_results`,
+`read_apply_result`). If Claude says it has no Transcribe tools, the
+config snippet didn't take or the server isn't booting; check
 `~/Library/Logs/Claude/mcp*.log`.
 
 ### 2. Transcribe a fixture
@@ -61,7 +64,7 @@ Expected:
   `duration_s`, `word_count`, `language_detected`, and
   `cache_hit: false`.
 - `<dir>/<stem>.transcribe.json` exists on disk afterwards, JSON-
-  parseable, with `schema_version: 3`.
+  parseable, with `schema_version: 3.1` (post-6b-1).
 
 ### 3. Cache hit on second call
 
@@ -83,7 +86,7 @@ Prompt:
 Expected: Claude calls `load_document`. Response: `path`,
 `source_path`, `duration_s`, `word_count` matching step 2,
 `range_count: 1` (a fresh transcript has one full-duration keep
-range), `schema_version: 3`.
+range), `schema_version: 3.1`.
 
 ### 5. Read the timeline (v3 view)
 
@@ -128,8 +131,12 @@ Prompt:
 Expected: Claude reads the relevant words' start/end (or asks for
 clarification), calls `apply_cuts(json_path=..., cuts=[...])`.
 Response: `applied_count: 1`, `skipped_count: 0`, two ranges in
-`ranges_after`. The `.transcribe.json` on disk now has two clips, one
-of them carrying `reason: "pilot edit"`.
+`ranges_after`. The `.transcribe.json` on disk now has two clips.
+Note: the cut's `reason` ("pilot edit") attaches to the kept range
+*adjacent* to the cut (the range immediately preceding the cut, or
+the range immediately following when the cut starts at t=0) — not
+to the cut itself. v2 stores ranges, not cuts, so the reason rides
+on the surviving keep-range.
 
 ### 9. Word-boundary violation
 

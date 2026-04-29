@@ -36,9 +36,11 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from typing import Protocol, runtime_checkable
 
 from core.document import Document, Range
+from core.edit_events import ClipAnchor, EditEvent, is_valid_reason
 from core.timeline import subtract_interval, union_interval
 
 _DEFAULT_SOURCE_ID = "src0"
@@ -133,13 +135,21 @@ class AddCut:
       blank from the implicit "manual" stamp v2 added everywhere.
     - Apply-time guard: raises :class:`NotImplementedError` if the
       document's ``main_timeline`` is non-monotonic.
+
+    Phase 6b-1: every successful ``apply`` appends a
+    :class:`~core.edit_events.EditEvent` of kind ``"cut"`` to
+    ``Document.edit_log``. The event's ``reason`` mirrors what the
+    surviving :class:`Range` carries (denormalization), so MCP /
+    UI clients can read the rationale off either surface.
     """
 
     start: float
     end: float
     reason: str | None = None
     source_id: str = _DEFAULT_SOURCE_ID
-    _captured: list[Range] | None = field(default=None, repr=False, compare=False)
+    _captured: tuple[list[Range], tuple[EditEvent, ...]] | None = field(
+        default=None, repr=False, compare=False
+    )
 
     @property
     def description(self) -> str:
@@ -147,20 +157,37 @@ class AddCut:
 
     def apply(self, doc: Document) -> Document:
         _require_monotonic(doc, "AddCut")
-        self._captured = list(doc.ranges)
+        self._captured = (list(doc.ranges), doc.edit_log)
+        # Construct the EditEvent first; ``Range.reason`` is derived
+        # from ``event.reason``. Single writer (the event) so the two
+        # surfaces can never silently desync. See STATE.md §8 (6b-3
+        # debt cleanup) for why this matters.
+        event = EditEvent(
+            kind="cut",
+            timestamp=datetime.now(UTC),
+            reason=self.reason or "",
+            start=float(self.start),
+            end=float(self.end),
+            source_id=self.source_id,
+        )
         new_ranges = subtract_interval(
             doc.ranges, (self.start, self.end), self.source_id
         )
-        if self.reason:
+        if event.reason:
             new_ranges = _attach_reason_to_neighbor(
-                new_ranges, self.start, self.end, self.reason
+                new_ranges, self.start, self.end, event.reason
             )
-        return replace(doc, ranges=new_ranges)
+        return replace(
+            doc,
+            ranges=new_ranges,
+            edit_log=(*doc.edit_log, event),
+        )
 
     def revert(self, doc: Document) -> Document:
         if self._captured is None:
             raise RuntimeError("AddCut.revert called before apply")
-        return replace(doc, ranges=list(self._captured))
+        ranges, log = self._captured
+        return replace(doc, ranges=list(ranges), edit_log=log)
 
 
 @dataclass
@@ -173,12 +200,20 @@ class RestoreRange:
 
     Phase 6a: raises :class:`NotImplementedError` at apply time when
     the document's ``main_timeline`` is non-monotonic.
+
+    Phase 6b-1: appends an :class:`~core.edit_events.EditEvent` of
+    kind ``"restore"`` on every successful ``apply``. ``RestoreRange``
+    has no on-Range reason field of its own, so the event's ``reason``
+    always comes from the optional constructor argument (default ``""``).
     """
 
     start: float
     end: float
     source_id: str = _DEFAULT_SOURCE_ID
-    _captured: list[Range] | None = field(default=None, repr=False, compare=False)
+    reason: str = ""
+    _captured: tuple[list[Range], tuple[EditEvent, ...]] | None = field(
+        default=None, repr=False, compare=False
+    )
 
     @property
     def description(self) -> str:
@@ -186,16 +221,33 @@ class RestoreRange:
 
     def apply(self, doc: Document) -> Document:
         _require_monotonic(doc, "RestoreRange")
-        self._captured = list(doc.ranges)
+        self._captured = (list(doc.ranges), doc.edit_log)
+        # Event constructed first per the 6b-3 reason-flow contract.
+        # RestoreRange has no Range-side reason write today, but
+        # building the event before the new ranges keeps the pattern
+        # uniform across the three editing commands.
+        event = EditEvent(
+            kind="restore",
+            timestamp=datetime.now(UTC),
+            reason=self.reason,
+            start=float(self.start),
+            end=float(self.end),
+            source_id=self.source_id,
+        )
         new_ranges = union_interval(
             doc.ranges, (self.start, self.end), self.source_id
         )
-        return replace(doc, ranges=new_ranges)
+        return replace(
+            doc,
+            ranges=new_ranges,
+            edit_log=(*doc.edit_log, event),
+        )
 
     def revert(self, doc: Document) -> Document:
         if self._captured is None:
             raise RuntimeError("RestoreRange.revert called before apply")
-        return replace(doc, ranges=list(self._captured))
+        ranges, log = self._captured
+        return replace(doc, ranges=list(ranges), edit_log=log)
 
 
 @dataclass
@@ -222,7 +274,9 @@ class CutWordRange:
     word_end_idx: int
     reason: str = "manual"
     source_id: str = _DEFAULT_SOURCE_ID
-    _captured: list[Range] | None = field(default=None, repr=False, compare=False)
+    _captured: tuple[list[Range], tuple[EditEvent, ...]] | None = field(
+        default=None, repr=False, compare=False
+    )
 
     @property
     def description(self) -> str:
@@ -256,14 +310,240 @@ class CutWordRange:
     def apply(self, doc: Document) -> Document:
         _require_monotonic(doc, "CutWordRange")
         interval = self._resolve_interval(doc)
-        self._captured = list(doc.ranges)
+        self._captured = (list(doc.ranges), doc.edit_log)
+        # Event constructed first per the 6b-3 reason-flow contract.
+        # CutWordRange does NOT denormalize ``reason`` onto the
+        # surviving Range — that surface predates 6b-1's edit_log and
+        # carrying the default ``"manual"`` everywhere would surprise
+        # existing tests. The event still records the reason so the
+        # log surface is complete.
+        event = EditEvent(
+            kind="cut",
+            timestamp=datetime.now(UTC),
+            reason=self.reason or "",
+            start=float(interval[0]),
+            end=float(interval[1]),
+            source_id=self.source_id,
+        )
         new_ranges = subtract_interval(doc.ranges, interval, self.source_id)
-        return replace(doc, ranges=new_ranges)
+        return replace(
+            doc,
+            ranges=new_ranges,
+            edit_log=(*doc.edit_log, event),
+        )
 
     def revert(self, doc: Document) -> Document:
         if self._captured is None:
             raise RuntimeError("CutWordRange.revert called before apply")
-        return replace(doc, ranges=list(self._captured))
+        ranges, log = self._captured
+        return replace(doc, ranges=list(ranges), edit_log=log)
+
+
+# ---------------------------------------------------------------------------
+# MoveClipSpan
+# ---------------------------------------------------------------------------
+
+
+class SpanResolutionError(ValueError):
+    """Raised when a :class:`MoveClipSpan` can't resolve its span/target.
+
+    Subclass of ``ValueError`` so generic catch-blocks (e.g.,
+    ``apply_proposal``'s outcome loop) still see it. The message is
+    operator-grade — it identifies which anchor failed and why.
+    """
+
+
+@dataclass
+class MoveClipSpan:
+    """Move a contiguous span of clips to a new playlist position.
+
+    ``span`` is a tuple of :class:`~core.edit_events.ClipAnchor`
+    instances naming the clips to move, in playlist order. The clips
+    must be contiguous in the live timeline at apply time — anchor
+    ``span[i]`` matches ``clips[k+i]`` for some starting index ``k``.
+    ``target`` is an anchor naming the clip that the span should land
+    *before*; ``None`` means "move to the end of the playlist."
+
+    The same anchor pattern is used for the inverse: see
+    :meth:`inverse`. Anchors are by source identity (path + start +
+    end), so a move computed before any other moves still resolves
+    cleanly after intervening moves rearrange the clip order.
+
+    Construction validates ``reason`` against
+    :func:`~core.edit_events.is_valid_reason`. Empty span and
+    ``target == anchor in span`` (a self-cycle) are rejected.
+
+    Apply-time errors are :class:`SpanResolutionError` (a ``ValueError``
+    subclass): "span not found", "span not contiguous", "target not
+    found", "target inside span". A successful apply appends one
+    ``"move"`` :class:`~core.edit_events.EditEvent` to ``doc.edit_log``
+    and returns a new Document whose ``ranges`` reflect the new order.
+    """
+
+    span: tuple[ClipAnchor, ...]
+    target: ClipAnchor | None
+    reason: str
+    move_id: str | None = None
+    """Optional stable identifier for this move within a :class:`Proposal`.
+
+    6b-2 added this so an MCP client can selectively apply a subset of
+    a proposal's moves by id (the ``apply_proposal`` tool's
+    ``move_ids`` parameter). When ``None``, the proposal writer
+    auto-assigns a sequential id (``m000``, ``m001``, …) at
+    ``write`` / ``propose_moves`` time. Free-form strings are accepted
+    so authors can write descriptive ids (``"swap-take-2-take-3"``).
+    """
+    _captured: tuple[list[Range], tuple[EditEvent, ...]] | None = field(
+        default=None, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        if not self.span:
+            raise ValueError("MoveClipSpan.span must not be empty")
+        if not is_valid_reason(self.reason):
+            raise ValueError(
+                f"MoveClipSpan.reason {self.reason!r} is not a valid rationale; "
+                "see core.edit_events.is_valid_reason for accepted patterns"
+            )
+        if self.target is not None and self.target in self.span:
+            raise ValueError(
+                f"MoveClipSpan.target {self.target!r} is also in span "
+                "(self-cycle)"
+            )
+
+    @property
+    def description(self) -> str:
+        n = len(self.span)
+        target_label = "end" if self.target is None else "target"
+        return f"Move {n} clip{'s' if n != 1 else ''} to {target_label}"
+
+    # -- helpers ----------------------------------------------------------
+
+    def _find_span_indices(self, clips: list) -> list[int]:
+        """Locate ``self.span`` as a contiguous run inside ``clips``.
+
+        Returns the matched indices ``[i, i+1, …, i+len(span)-1]``.
+        Raises :class:`SpanResolutionError` if the first anchor isn't
+        found, or if the run isn't contiguous from there.
+        """
+        first = self.span[0]
+        first_idx: int | None = None
+        for k, c in enumerate(clips):
+            if first.matches(c):
+                first_idx = k
+                break
+        if first_idx is None:
+            raise SpanResolutionError(
+                f"span anchor {first!r} not found in timeline (len={len(clips)})"
+            )
+        for offset, anchor in enumerate(self.span):
+            k = first_idx + offset
+            if k >= len(clips):
+                raise SpanResolutionError(
+                    f"span runs past timeline end at anchor[{offset}]={anchor!r}"
+                )
+            if not anchor.matches(clips[k]):
+                raise SpanResolutionError(
+                    f"span not contiguous: anchor[{offset}]={anchor!r} does not "
+                    f"match clip at index {k} ({clips[k]!r})"
+                )
+        return list(range(first_idx, first_idx + len(self.span)))
+
+    def _find_target_index(self, clips: list, exclude: set[int]) -> int | None:
+        """Return the index of the clip matching ``self.target``, or
+        ``None`` when ``self.target is None`` (semantic: "to end").
+
+        Raises :class:`SpanResolutionError` when ``self.target`` is set
+        but no clip matches, or when the matched clip's index is in
+        ``exclude`` (target inside span — the construction-time check
+        catches anchor identity, but a different anchor could still
+        land inside the span post-resolution).
+        """
+        if self.target is None:
+            return None
+        for k, c in enumerate(clips):
+            if self.target.matches(c) and k not in exclude:
+                return k
+        # If the target's anchor matches a clip but only inside the
+        # excluded span, that's a different error than "not found."
+        for k, c in enumerate(clips):
+            if self.target.matches(c) and k in exclude:
+                raise SpanResolutionError(
+                    f"target {self.target!r} resolves to a clip inside the span"
+                )
+        raise SpanResolutionError(
+            f"target {self.target!r} not found in timeline (len={len(clips)})"
+        )
+
+    # -- command protocol -------------------------------------------------
+
+    def apply(self, doc: Document) -> Document:
+        clips = list(doc.main_timeline.clips)
+        ranges = list(doc.ranges)
+        span_indices = self._find_span_indices(clips)
+        i, j = span_indices[0], span_indices[-1]
+        target_idx = self._find_target_index(clips, exclude=set(span_indices))
+
+        span_ranges = ranges[i : j + 1]
+        remaining = ranges[:i] + ranges[j + 1 :]
+
+        if target_idx is None:
+            new_ranges = remaining + span_ranges
+        else:
+            # ``target_idx`` is an index into the full ``clips`` list;
+            # after removing the span (which sits at indices [i..j]),
+            # the same logical clip now sits at a smaller index when
+            # it was originally to the *right* of the span.
+            adjusted = target_idx if target_idx < i else target_idx - len(span_indices)
+            new_ranges = remaining[:adjusted] + span_ranges + remaining[adjusted:]
+
+        self._captured = (list(doc.ranges), doc.edit_log)
+        event = EditEvent(
+            kind="move",
+            timestamp=datetime.now(UTC),
+            reason=self.reason,
+            span=self.span,
+            target=self.target,
+        )
+        return replace(
+            doc,
+            ranges=new_ranges,
+            edit_log=(*doc.edit_log, event),
+        )
+
+    def revert(self, doc: Document) -> Document:
+        if self._captured is None:
+            raise RuntimeError("MoveClipSpan.revert called before apply")
+        ranges, log = self._captured
+        return replace(doc, ranges=list(ranges), edit_log=log)
+
+    def inverse(self, doc_before: Document) -> MoveClipSpan:
+        """Compute a :class:`MoveClipSpan` that undoes ``self`` applied to
+        ``doc_before``.
+
+        The inverse moves the same span back to before the clip that
+        originally came right after it; if the span sat at the end of
+        the playlist, the inverse target is ``None``.
+
+        Inverses round-trip: applying ``self`` to ``doc_before`` then
+        applying ``self.inverse(doc_before)`` to the result yields a
+        Document equal to ``doc_before`` (modulo the edit_log, which
+        accumulates two events — an explicit ``revert`` is the path to
+        a byte-identical round-trip on the log).
+        """
+        clips = list(doc_before.main_timeline.clips)
+        span_indices = self._find_span_indices(clips)
+        j = span_indices[-1]
+        if j + 1 >= len(clips):
+            inv_target: ClipAnchor | None = None
+        else:
+            inv_target = ClipAnchor.from_clip(clips[j + 1])
+        return MoveClipSpan(
+            span=self.span,
+            target=inv_target,
+            reason=f"undo: {self.reason}",
+            move_id=None,  # inverse is a fresh move; original id stays with the original
+        )
 
 
 # ---------------------------------------------------------------------------

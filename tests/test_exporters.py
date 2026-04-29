@@ -438,7 +438,7 @@ def test_write_outputs_json_writes_loadable_document(tmp_path: Path):
     doc = _example_doc(src)
     written = write_outputs(src, doc.segments, ["json"], document=doc)
     data = json.loads(written["json"].read_text())
-    assert data["schema_version"] == 3
+    assert data["schema_version"] == 3.1
     restored = Document.from_json(data)
     assert restored == doc
 

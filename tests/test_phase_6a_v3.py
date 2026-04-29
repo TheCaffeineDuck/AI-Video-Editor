@@ -248,12 +248,13 @@ def test_v2_to_v3_migration_lossless_for_monotonic_doc():
         Range(source_id="src0", start=0.0, end=4.0, reason=""),
         Range(source_id="src0", start=6.0, end=10.0, reason="filler"),
     ]
-    # Re-save: now v3 schema.
+    # Re-save: now v3.1 schema (6b-1 added edit_log).
     payload_v3 = doc.to_json()
-    assert payload_v3["schema_version"] == 3
+    assert payload_v3["schema_version"] == 3.1
     assert "main_timeline" in payload_v3
     assert "ranges" not in payload_v3
-    # Round-trip via v3.
+    assert payload_v3["edit_log"] == []  # empty on a freshly-migrated v2 doc
+    # Round-trip via v3.1.
     doc2 = Document.from_json(payload_v3)
     assert doc2 == doc
 

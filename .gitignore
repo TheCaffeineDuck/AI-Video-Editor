@@ -20,3 +20,4 @@ tests/fixtures/synthetic.mp4
 # Phase 5d: waveform peak side-cars are a per-source cache; never
 # committed (regenerated on demand via workers/waveform.py).
 *.peaks.npz
+.claude/

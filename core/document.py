@@ -29,6 +29,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
 
+from core.edit_events import EditEvent
+
 _LOG = logging.getLogger(__name__)
 
 
@@ -122,7 +124,7 @@ class UnsupportedSchemaError(ValueError):
     """Raised when ``Document.from_json`` is asked to load an unknown schema."""
 
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 3.1
 
 
 @dataclass(frozen=True)
@@ -157,8 +159,9 @@ class Document:
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     model_name: str = ""
     source_hash: str | None = None
+    edit_log: tuple[EditEvent, ...] = ()
 
-    SCHEMA_VERSION: ClassVar[int] = _SCHEMA_VERSION
+    SCHEMA_VERSION: ClassVar[float] = _SCHEMA_VERSION
 
     @property
     def main_timeline(self) -> Timeline:  # noqa: F821 — forward ref to core.timeline
@@ -197,11 +200,13 @@ class Document:
     def to_json(self) -> dict[str, Any]:
         """Return a plain-dict representation safe for ``json.dumps``.
 
-        Emits ``schema_version=3`` with the v3 ``main_timeline`` shape.
-        Each clip carries its source path explicitly (a redundant copy
-        of the data in ``sources[source_id].path``, but cheap and lets
-        a future multi-source loader skip the indirection).
-        ``source_hash`` is omitted when ``None``.
+        Emits ``schema_version=3.1`` with the v3 ``main_timeline`` shape
+        and the v3.1 ``edit_log`` array. Each clip carries its source
+        path explicitly (a redundant copy of the data in
+        ``sources[source_id].path``, but cheap and lets a future
+        multi-source loader skip the indirection). ``source_hash`` is
+        omitted when ``None``. ``edit_log`` is always present, even
+        when empty, so consumers can rely on the key existing.
         """
         out: dict[str, Any] = {
             "schema_version": self.SCHEMA_VERSION,
@@ -248,6 +253,7 @@ class Document:
                     for r in self.ranges
                 ],
             },
+            "edit_log": [e.to_json() for e in self.edit_log],
         }
         if self.source_hash is not None:
             out["source_hash"] = self.source_hash
@@ -259,16 +265,21 @@ class Document:
 
         Schema-version handling:
 
-        - ``schema_version == 3`` — load directly.
-        - ``schema_version == 2`` — migrate via :func:`_migrate_v2_to_v3`.
-        - ``schema_version == 1`` — migrate via :func:`_migrate_v1_to_v2`,
-          then :func:`_migrate_v2_to_v3`.
-        - missing / null / any other integer — raise
+        - ``schema_version == 3.1`` — load directly.
+        - ``schema_version == 3`` — migrate via :func:`_migrate_v3_to_v31_data`.
+        - ``schema_version == 2`` — migrate v2 → v3 → v3.1.
+        - ``schema_version == 1`` — migrate v1 → v2 → v3 → v3.1.
+        - missing / null / any other version — raise
           :class:`UnsupportedSchemaError`.
 
         Migrations run on read; the on-disk file is not rewritten as a
         side effect (write-through on next save). Never silently coerce
-        across schema versions: an unknown integer is a hard error.
+        across schema versions: an unknown version is a hard error.
+
+        v3 → v3.1 adds an append-only ``edit_log`` to the Document.
+        v3 inputs migrate with an empty ``edit_log`` — the structural
+        history of a pre-v3.1 file is unrecoverable at load time, but
+        every subsequent edit appends to the log going forward.
         """
         if "schema_version" not in data:
             raise UnsupportedSchemaError(
@@ -283,11 +294,15 @@ class Document:
             )
         if version == 1:
             v2 = _migrate_v1_to_v2_data(data)
-            return _load_v3(cls, _migrate_v2_to_v3_data(v2))
+            v3 = _migrate_v2_to_v3_data(v2)
+            return _load_v31(cls, _migrate_v3_to_v31_data(v3))
         if version == 2:
-            return _load_v3(cls, _migrate_v2_to_v3_data(data))
+            v3 = _migrate_v2_to_v3_data(data)
+            return _load_v31(cls, _migrate_v3_to_v31_data(v3))
+        if version == 3:
+            return _load_v31(cls, _migrate_v3_to_v31_data(data))
         if version == cls.SCHEMA_VERSION:
-            return _load_v3(cls, data)
+            return _load_v31(cls, data)
         raise UnsupportedSchemaError(
             f"Document JSON schema_version={version!r} is not supported "
             f"by this build (expects schema_version={cls.SCHEMA_VERSION})."
@@ -318,13 +333,17 @@ def _parse_segments(seg_data: list[dict[str, Any]]) -> list[Segment]:
     ]
 
 
-def _load_v3(cls: type[Document], data: dict[str, Any]) -> Document:
-    """Load a v3 (or up-migrated) document.
+def _load_v31(cls: type[Document], data: dict[str, Any]) -> Document:
+    """Load a v3.1 (or up-migrated) document.
 
     The clip list order from JSON is preserved verbatim onto
     ``ranges`` — for non-monotonic v3 fixtures this list will *not*
     be sorted by start, and ``main_timeline.is_source_monotonic()``
     will report ``False``. Edit commands branch on that.
+
+    ``edit_log`` is parsed via :meth:`EditEvent.from_json`. A missing
+    or empty array yields an empty tuple — that's the v3 default after
+    migration.
     """
     sources_raw = data.get("sources", {})
     sources = {
@@ -347,6 +366,7 @@ def _load_v3(cls: type[Document], data: dict[str, Any]) -> Document:
         )
         for c in clip_dicts
     ]
+    edit_log = tuple(EditEvent.from_json(e) for e in data.get("edit_log", []))
     return cls(
         sources=sources,
         segments=_parse_segments(data.get("segments", [])),
@@ -355,6 +375,7 @@ def _load_v3(cls: type[Document], data: dict[str, Any]) -> Document:
         created_at=datetime.fromisoformat(data["created_at"]),
         model_name=data.get("model_name", ""),
         source_hash=data.get("source_hash"),
+        edit_log=edit_log,
     )
 
 
@@ -412,6 +433,21 @@ def _migrate_v2_to_v3_data(data: dict[str, Any]) -> dict[str, Any]:
     out["schema_version"] = 3
     out["main_timeline"] = {"clips": clips}
     out.pop("ranges", None)
+    return out
+
+
+def _migrate_v3_to_v31_data(data: dict[str, Any]) -> dict[str, Any]:
+    """Migrate a v3 JSON dict to a v3.1 JSON dict.
+
+    Pure data-shape rewrite: ``schema_version`` flips to 3.1 and an
+    empty ``edit_log`` array is added if the input doesn't already
+    have one. The structural history of pre-v3.1 documents is
+    unrecoverable at load time — every edit going forward populates
+    the log, but the past stays opaque.
+    """
+    out = dict(data)
+    out["schema_version"] = 3.1
+    out.setdefault("edit_log", [])
     return out
 
 

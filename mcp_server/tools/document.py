@@ -183,7 +183,13 @@ def _ranges_to_payload(doc: Document) -> tuple[list[RangeOut], float, float]:
 
 async def load_document(req: JsonPathRequest) -> DocumentSummary:
     doc, path, raw = _load_document(req.json_path)
-    schema_version = int(raw.get("schema_version", Document.SCHEMA_VERSION))
+    raw_version = raw.get("schema_version", Document.SCHEMA_VERSION)
+    # v3.1 (Phase 6b-1) is a float; older versions are ints. Preserve
+    # the raw type so clients can branch on the precise value rather
+    # than rounding 3.1 → 3.
+    schema_version: int | float = (
+        float(raw_version) if isinstance(raw_version, float) else int(raw_version)
+    )
     return DocumentSummary(
         path=str(path),
         source_path=_primary_source_path(doc),

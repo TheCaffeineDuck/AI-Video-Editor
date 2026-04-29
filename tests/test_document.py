@@ -141,9 +141,9 @@ def _example_doc(**overrides) -> Document:
 
 
 def test_document_schema_version_constant():
-    # Phase 6a bumped to v3 (Clip/Timeline shape on disk; in-memory
-    # ``ranges`` field still drives state).
-    assert Document.SCHEMA_VERSION == 3
+    # Phase 6b-1 bumped to v3.1 (adds Document.edit_log alongside the
+    # v3 Clip/Timeline shape on disk).
+    assert Document.SCHEMA_VERSION == 3.1
 
 
 # ---------------------------------------------------------------------------
@@ -151,12 +151,13 @@ def test_document_schema_version_constant():
 # ---------------------------------------------------------------------------
 
 
-def test_document_to_json_emits_schema_version_3():
+def test_document_to_json_emits_schema_version_3_1():
     data = _example_doc().to_json()
-    assert data["schema_version"] == 3
+    assert data["schema_version"] == 3.1
     assert "sources" in data
     assert "main_timeline" in data
     assert "clips" in data["main_timeline"]
+    assert "edit_log" in data  # 6b-1 — always present, even if empty
     assert "ranges" not in data  # v2 key gone
     assert "cuts" not in data
     assert "media_path" not in data
@@ -166,7 +167,7 @@ def test_document_to_json_emits_schema_version_3():
 def test_document_to_json_is_json_serializable():
     data = _example_doc().to_json()
     parsed = json.loads(json.dumps(data))
-    assert parsed["schema_version"] == 3
+    assert parsed["schema_version"] == 3.1
     assert parsed["language"] == "en"
 
 
@@ -243,7 +244,7 @@ def test_from_json_missing_schema_version_raises():
         Document.from_json(payload)
     msg = str(excinfo.value)
     assert "schema_version" in msg
-    assert "3" in msg  # v3-aware build's expected schema
+    assert "3" in msg  # v3.1-aware build's expected schema
 
 
 def test_from_json_null_schema_version_raises():
@@ -288,8 +289,8 @@ def _v1_payload(*, cuts: list[dict] | None = None, **override) -> dict:
 
 def test_migration_empty_cuts_yields_single_full_range():
     doc = Document.from_json(_v1_payload())
-    # v1 → v2 → v3 chain; the in-memory build version is v3.
-    assert doc.SCHEMA_VERSION == 3
+    # v1 → v2 → v3 → v3.1 chain; the in-memory build version is v3.1.
+    assert doc.SCHEMA_VERSION == 3.1
     assert list(doc.sources.keys()) == ["src0"]
     assert doc.sources["src0"].path == Path("/tmp/example.wav")
     assert doc.sources["src0"].duration == 10.0
@@ -472,9 +473,9 @@ def test_build_document_serializes_with_schema_version():
         model_name="base",
     )
     data = doc.to_json()
-    assert data["schema_version"] == 3
+    assert data["schema_version"] == 3.1
     parsed = json.loads(json.dumps(data))
-    assert parsed["schema_version"] == 3
+    assert parsed["schema_version"] == 3.1
     restored = Document.from_json(parsed)
     assert restored.created_at.utcoffset().total_seconds() == 0.0
 
