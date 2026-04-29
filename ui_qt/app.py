@@ -37,12 +37,14 @@ import json
 import logging
 import queue
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QTimer
+from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QAction, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
+    QDockWidget,
     QFileDialog,
     QMainWindow,
     QMenu,
@@ -52,6 +54,14 @@ from PySide6.QtWidgets import (
 )
 
 from core.document import Document, UnsupportedSchemaError
+from core.proposal import (
+    ApplyResult,
+    StaleProposalError,
+    _new_id,
+    apply_proposal_with_human_decisions,
+    document_state_hash,
+    write_apply_result,
+)
 from core.settings import Settings, load_settings
 from ui.state import (
     AppState,
@@ -60,6 +70,11 @@ from ui.state import (
 )
 from ui_qt import __version__
 from ui_qt.components.about_dialog import AboutDialog
+from ui_qt.components.highlights_panel import HighlightsPanel
+from ui_qt.components.proposal_review_pane import (
+    DOCK_TARGET_WIDTH,
+    ProposalReviewPane,
+)
 from ui_qt.components.settings_panel import SettingsDialog
 from ui_qt.components.status_widgets import (
     AUTOSAVE_DIRTY,
@@ -109,12 +124,22 @@ class MainWindow(QMainWindow):
         self._transcribe_pane: TranscribePane | None = None
         self._editor_pane: EditorPane | None = None
         self._force_close: bool = False  # set after the user picks Discard or saves successfully
+        # Auto-show de-dup: the proposal_id we last auto-shown the dock
+        # for. Reset only when a *newer* fresh proposal arrives. See
+        # _handle_proposal_count_changed.
+        self._last_auto_shown_proposal_id: str | None = None
+        # Mirror state for the highlights panel — only auto-show once
+        # per session per (doc_path, highlight_id) so dismissing the
+        # dock once doesn't have to be repeated on every reload.
+        self._last_auto_shown_highlight_doc: Path | None = None
 
         # Actions outlive any single EditorPane — they're built once
         # here and handed down to every EditorPane this window spawns.
         self._build_actions()
         self._build_menu_bar()
         self._setup_status_bar()
+        self._setup_proposal_review_dock()
+        self._setup_highlights_dock()
 
         self.show_transcribe()
 
@@ -213,6 +238,23 @@ class MainWindow(QMainWindow):
         self._minimize_action.setShortcut(QKeySequence("Ctrl+M"))
         self._minimize_action.triggered.connect(self.showMinimized)
 
+        # Phase 6b-3: Edit menu entry that toggles the proposal review
+        # dock. Lives on MainWindow because the dock itself is owned by
+        # MainWindow (a QDockWidget needs a QMainWindow parent).
+        self._review_proposal_action = QAction("Review Proposal", self)
+        self._review_proposal_action.setCheckable(True)
+        self._review_proposal_action.setChecked(False)
+        self._review_proposal_action.setEnabled(False)  # enabled when an editor is open
+        self._review_proposal_action.triggered.connect(self._handle_toggle_review_proposal)
+
+        # Phase 6c-3: View menu entry that toggles the Highlights panel.
+        # Same dock-ownership pattern as Review Proposal.
+        self._highlights_action = QAction("Highlights", self)
+        self._highlights_action.setCheckable(True)
+        self._highlights_action.setChecked(False)
+        self._highlights_action.setEnabled(False)  # enabled when an editor is open
+        self._highlights_action.triggered.connect(self._handle_toggle_highlights)
+
     def _build_menu_bar(self) -> None:
         mb = self.menuBar()
         mb.setNativeMenuBar(True)  # macOS-native; no-op on other platforms.
@@ -233,10 +275,14 @@ class MainWindow(QMainWindow):
         edit_menu.addSeparator()
         edit_menu.addAction(self._editor_actions.cut)
         edit_menu.addAction(self._editor_actions.restore)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self._review_proposal_action)
 
         # View
         view_menu: QMenu = mb.addMenu("View")
         view_menu.addAction(self._layout_action)
+        view_menu.addSeparator()
+        view_menu.addAction(self._highlights_action)
 
         # Window
         window_menu: QMenu = mb.addMenu("Window")
@@ -286,6 +332,249 @@ class MainWindow(QMainWindow):
         self._render_status.cancel_clicked.connect(self._handle_render_cancel_request)
         bar.addPermanentWidget(self._render_status)
 
+    # ----- proposal review dock (Phase 6b-3) -----
+
+    def _setup_proposal_review_dock(self) -> None:
+        """Create the right-side dock that hosts the proposal review pane.
+
+        Hidden by default; toggled via Edit → Review Proposal. The
+        :class:`ProposalReviewPane` itself is decoupled from the editor
+        — it gets its document via :meth:`set_document` whenever the
+        editor pane is swapped in or out.
+        """
+        self._proposal_review_pane = ProposalReviewPane(self)
+        self._proposal_review_pane.apply_requested.connect(
+            self._handle_proposal_apply_requested
+        )
+        self._proposal_review_pane.proposals_changed.connect(
+            self._handle_proposal_count_changed
+        )
+        dock = QDockWidget("Proposal Review", self)
+        dock.setObjectName("ProposalReviewDock")
+        dock.setAllowedAreas(
+            Qt.DockWidgetArea.RightDockWidgetArea | Qt.DockWidgetArea.LeftDockWidgetArea
+        )
+        dock.setWidget(self._proposal_review_pane)
+        dock.setMinimumWidth(DOCK_TARGET_WIDTH)
+        dock.visibilityChanged.connect(self._on_review_dock_visibility_changed)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        dock.hide()
+        self._review_dock = dock
+
+    def _handle_toggle_review_proposal(self, checked: bool) -> None:
+        if self._review_dock is None:
+            return
+        self._review_dock.setVisible(checked)
+        if checked:
+            # Re-scan proposals on every open — a new .proposal.json may
+            # have landed via the MCP path while the dock was closed.
+            self._proposal_review_pane.reload_proposals()
+
+    def _on_review_dock_visibility_changed(self, visible: bool) -> None:
+        # Keep the menu checkmark and dock visibility in sync. Without
+        # this, the user closing the dock via its X-button would leave
+        # the Edit menu showing it as still open.
+        self._review_proposal_action.setChecked(visible)
+
+    def _handle_proposal_count_changed(
+        self, _count: int, latest_fresh_proposal_id: str
+    ) -> None:
+        """Auto-show the review dock when a fresh proposal arrives.
+
+        "Fresh" means: created after the most recent apply-result for
+        this document (or no apply-result exists). The pane is
+        responsible for the freshness calculation; we just key off the
+        proposal_id and avoid re-showing for an id we've already
+        surfaced. Once the user dismisses the dock, we don't reopen
+        it for the same proposal — only a *newer* fresh proposal does.
+        """
+        if self._review_dock is None:
+            return
+        if not latest_fresh_proposal_id:
+            return
+        if latest_fresh_proposal_id == self._last_auto_shown_proposal_id:
+            return
+        self._last_auto_shown_proposal_id = latest_fresh_proposal_id
+        if not self._review_dock.isVisible():
+            self._review_dock.setVisible(True)
+
+    # ----- highlights dock (Phase 6c-3) -----
+
+    def _setup_highlights_dock(self) -> None:
+        """Create the right-side dock that hosts the read-only Highlights panel.
+
+        Mirrors :meth:`_setup_proposal_review_dock`: hidden by default,
+        toggled via View → Highlights, content cleared on doc swap.
+        Auto-shows once per session when a doc loads with at least one
+        highlight in its sidecar dir.
+        """
+        self._highlights_panel = HighlightsPanel(self)
+        self._highlights_panel.highlights_present.connect(
+            self._handle_highlights_present
+        )
+        dock = QDockWidget("Highlights", self)
+        dock.setObjectName("HighlightsDock")
+        dock.setAllowedAreas(
+            Qt.DockWidgetArea.RightDockWidgetArea | Qt.DockWidgetArea.LeftDockWidgetArea
+        )
+        dock.setWidget(self._highlights_panel)
+        dock.setMinimumWidth(DOCK_TARGET_WIDTH)
+        dock.visibilityChanged.connect(self._on_highlights_dock_visibility_changed)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        dock.hide()
+        self._highlights_dock = dock
+
+    def _handle_toggle_highlights(self, checked: bool) -> None:
+        if self._highlights_dock is None:
+            return
+        self._highlights_dock.setVisible(checked)
+        if checked:
+            self._highlights_panel.reload_highlights()
+
+    def _on_highlights_dock_visibility_changed(self, visible: bool) -> None:
+        # Keep menu checkmark and dock visibility in sync. Same pattern
+        # as the proposal review dock.
+        self._highlights_action.setChecked(visible)
+
+    def _handle_highlights_present(
+        self, has_highlights: bool, _latest_highlight_id: str
+    ) -> None:
+        """Auto-show the highlights dock when a doc loads with highlights.
+
+        Per spec: once per session per document. Once the user dismisses
+        the dock for a doc, it doesn't auto-reopen for that same doc on
+        re-load — only switching to a *different* doc with highlights
+        triggers a fresh auto-show.
+        """
+        if self._highlights_dock is None or not has_highlights:
+            return
+        doc_path = self._editor_doc_path()
+        if doc_path is None:
+            return
+        if self._last_auto_shown_highlight_doc == doc_path:
+            return
+        self._last_auto_shown_highlight_doc = doc_path
+        if not self._highlights_dock.isVisible():
+            self._highlights_dock.setVisible(True)
+
+    def _refresh_highlights_panel(self) -> None:
+        """Push the current editor's document into the highlights panel."""
+        if self._editor_pane is None:
+            self._highlights_panel.set_document(None, None)
+            return
+        self._highlights_panel.set_document(
+            self._editor_pane.document,
+            self._editor_doc_path(),
+        )
+
+    def _editor_doc_path(self) -> Path | None:
+        """Resolve the on-disk .transcribe.json path for the current editor doc.
+
+        Returns ``None`` when there's no editor open or the doc has no
+        source media (no candidate cache path can be derived). Mirrors
+        :meth:`EditorPane._save_path` so the proposal review dock and
+        the save path always agree on where the doc lives.
+        """
+        if self._editor_pane is None:
+            return None
+        return self._editor_pane._save_path()
+
+    def _refresh_proposal_review_pane(self) -> None:
+        """Push the current editor's document into the proposal review pane."""
+        if self._editor_pane is None:
+            self._proposal_review_pane.set_document(None, None)
+            return
+        self._proposal_review_pane.set_document(
+            self._editor_pane.document,
+            self._editor_doc_path(),
+        )
+
+    def _handle_proposal_apply_requested(
+        self,
+        proposal,
+        decisions,
+    ) -> None:
+        """Path B apply on the GUI thread.
+
+        Synchronous: read-doc / apply / write-result / write-doc all
+        complete before returning. The doc and proposal directory are
+        small JSON files; an apply takes a few ms even for double-digit
+        move counts. If that ever changes (e.g., move counts in the
+        thousands), this handler can be moved to a QThread the same
+        way :class:`workers.render.RenderWorker` is.
+
+        Signal carries ``(Proposal, dict[str, Decision])`` — the
+        runtime types are validated by the pane's collected_decisions
+        helper before emit, so positional args here are trusted.
+        """
+        if self._editor_pane is None:
+            return
+        proposal_typed = proposal
+        decisions_typed = decisions
+        doc_path = self._editor_doc_path()
+        if doc_path is None:
+            QMessageBox.critical(
+                self, "Apply failed",
+                "Cannot apply: no save path is associated with this document.",
+            )
+            self._proposal_review_pane.mark_apply_failed("no save path")
+            return
+
+        live_doc = self._editor_pane.document
+        pre_hash = document_state_hash(live_doc)
+        try:
+            new_doc, outcomes = apply_proposal_with_human_decisions(
+                proposal_typed, live_doc, decisions_typed,
+            )
+        except StaleProposalError as exc:
+            self._proposal_review_pane.mark_apply_failed("stale proposal")
+            QMessageBox.critical(self, "Apply failed", str(exc))
+            return
+        except ValueError as exc:
+            self._proposal_review_pane.mark_apply_failed("validation")
+            QMessageBox.critical(self, "Apply failed", str(exc))
+            return
+
+        # Write the apply-result file (Path B uses the same on-disk
+        # schema as Path A).
+        apply_result = ApplyResult(
+            apply_result_id=_new_id(),
+            proposal_id=proposal_typed.proposal_id or "",
+            created_at=datetime.now(UTC),
+            document_pre_hash=pre_hash,
+            document_post_hash=document_state_hash(new_doc),
+            move_ids_filter=None,  # Path B never filters; decisions speak for themselves
+            outcomes=tuple(outcomes),
+        )
+        try:
+            write_apply_result(doc_path, apply_result)
+        except OSError as exc:
+            self._proposal_review_pane.mark_apply_failed("write apply-result")
+            QMessageBox.critical(self, "Apply failed", str(exc))
+            return
+
+        # Write the post-state document if any move actually applied.
+        # No-op runs (all rejected / all skipped) leave the file
+        # untouched — the apply-result still records the decisions.
+        if any(o.applied for o in outcomes):
+            try:
+                doc_payload = json.dumps(new_doc.to_json(), indent=2)
+                doc_path.write_text(doc_payload, encoding="utf-8")
+            except OSError as exc:
+                self._proposal_review_pane.mark_apply_failed("write doc")
+                QMessageBox.critical(self, "Apply failed", str(exc))
+                return
+            # Reload the editor pane on the new doc state.
+            self.show_editor(new_doc)
+
+        self._proposal_review_pane.mark_applied()
+        # Refresh proposals listing so the apply-result subtitle picks
+        # up the new run.
+        self._refresh_proposal_review_pane()
+        # Auto-dismiss the dock after a successful apply, per spec.
+        if self._review_dock is not None:
+            self._review_dock.hide()
+
     # ----- pane swap -----
 
     def show_transcribe(self) -> None:
@@ -304,6 +593,17 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(WINDOW_TITLE)
         self._set_editor_actions_enabled(False)
         self._autosave_label.clear_indicator()
+        # Clear the proposal review pane and disable its menu entry —
+        # there's no document to review.
+        self._review_proposal_action.setEnabled(False)
+        if self._review_dock is not None:
+            self._review_dock.hide()
+        self._proposal_review_pane.set_document(None, None)
+        # Same treatment for the highlights dock.
+        self._highlights_action.setEnabled(False)
+        if self._highlights_dock is not None:
+            self._highlights_dock.hide()
+        self._highlights_panel.set_document(None, None)
 
     def show_editor(self, document: Document) -> None:
         """Swap to a fresh EditorPane bound to ``document``.
@@ -334,6 +634,22 @@ class MainWindow(QMainWindow):
         self._set_editor_actions_enabled(True)
         self._refresh_layout_action_label()
         self._handle_editor_dirty_changed(False)
+        # The proposal review pane stays alive across editor swaps; bind
+        # it to the new document. Edit-menu toggle becomes available now
+        # that an editor is loaded.
+        self._review_proposal_action.setEnabled(True)
+        self._refresh_proposal_review_pane()
+        # Refresh the dock content if it was already open from a prior session
+        # (so a stale document's outline doesn't linger).
+        if self._review_dock is not None and self._review_dock.isVisible():
+            self._proposal_review_pane.reload_proposals()
+        # Highlights panel is always live-bound to the active editor doc.
+        # Setting set_document fires highlights_present which may auto-
+        # show the dock for a new doc.
+        self._highlights_action.setEnabled(True)
+        self._refresh_highlights_panel()
+        if self._highlights_dock is not None and self._highlights_dock.isVisible():
+            self._highlights_panel.reload_highlights()
 
     def _dispose_transcribe_pane(self) -> None:
         if self._transcribe_pane is None:

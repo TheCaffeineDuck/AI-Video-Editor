@@ -1,0 +1,483 @@
+"""GUI pane for inspecting + rendering highlights (Phase 6c-3).
+
+Read-only counterpart to :class:`~ui_qt.components.proposal_review_pane.ProposalReviewPane`.
+The highlight path has *no human review* — Claude proposes via the MCP
+``propose_highlights`` tool and the renders run via ``apply_highlight``.
+This panel exists for the human's convenience: see what's been proposed,
+trigger a render with one click, open the rendered .mp4 in the OS
+player. No editing of highlight specs from the GUI; if the user wants
+to change a highlight, they re-propose via Claude Desktop.
+
+Per-card actions:
+
+* **Render** — runs :func:`core.highlight_render.render_highlight` in
+  a :class:`QThread` so the GUI stays responsive. Greyed out while a
+  render is in flight; the per-card status line shows progress.
+* **Open** — opens the rendered .mp4 with the OS default player via
+  :class:`QDesktopServices`. Disabled until the highlight has been
+  rendered (i.e., the highlight's sidecar JSON carries a non-null
+  ``rendered_output_path`` *and* the file actually exists on disk).
+
+State machine:
+
+- **Empty** — no document loaded, or the doc has no highlights. The
+  pane shows a short placeholder; controls are hidden.
+- **Loaded** — at least one highlight; cards render in chronological
+  order (highlight_id is timestamp-prefixed).
+- **Rendering** — a single render is in flight; that card's Render
+  button is disabled and a spinner-shape progress bar replaces the
+  status line.
+- **Rendered** — render completed successfully; the card flips to
+  show "rendered" and Open enables.
+
+The ``proposal_review_pane`` worker pattern doesn't apply here —
+:class:`~core.proposal.apply_proposal_with_human_decisions` is fast
+enough to run synchronously, but ``render_highlight`` shells out to
+ffmpeg for tens of seconds and would freeze the UI. We use a
+``QThread`` per render rather than a thread pool because renders are
+exclusive (each one writes the same .mp4 path) and a queue
+discipline isn't needed at this scale.
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QFont
+from PySide6.QtWidgets import (
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
+
+from core.document import Document
+from core.highlight import (
+    Highlight,
+    list_highlights_for_document,
+    read_highlight,
+)
+from core.highlight_render import render_highlight
+from ui_qt.style import ACCENT, DANGER, MUTED, SUCCESS
+
+_LOG = logging.getLogger(__name__)
+
+DOCK_TARGET_WIDTH = 360
+
+
+# ---------------------------------------------------------------------------
+# Worker — runs render_highlight on a QThread
+# ---------------------------------------------------------------------------
+
+
+class _RenderWorker(QObject):
+    """Runs :func:`render_highlight` off the GUI thread.
+
+    Lives on a dedicated :class:`QThread` and emits progress + done
+    signals for the card to consume. The card owns the worker's
+    lifecycle and is responsible for cleaning up the thread (calling
+    ``quit()`` + ``wait()``) once :attr:`finished` fires.
+    """
+
+    progress = Signal(float)
+    finished = Signal(object)  # carries the HighlightRenderMetadata
+    failed = Signal(str)
+
+    def __init__(self, highlight: Highlight, document: Document) -> None:
+        super().__init__()
+        self._highlight = highlight
+        self._document = document
+
+    def run(self) -> None:
+        try:
+            metadata = render_highlight(
+                self._highlight,
+                self._document,
+                progress_callback=self._on_progress,
+            )
+        except Exception as exc:  # noqa: BLE001 — surface anything
+            self.failed.emit(str(exc))
+            return
+        self.finished.emit(metadata)
+
+    def _on_progress(self, value: float) -> None:
+        # progress_callback runs on the worker thread; emit is queued
+        # back to the GUI thread automatically because progress is a
+        # Qt signal.
+        try:
+            self.progress.emit(float(value))
+        except (TypeError, ValueError):
+            pass
+
+
+# ---------------------------------------------------------------------------
+# HighlightCard — one per highlight
+# ---------------------------------------------------------------------------
+
+
+def _format_duration(start: float, end: float) -> str:
+    span = max(0.0, end - start)
+    return f"{start:.1f}s – {end:.1f}s ({span:.1f}s)"
+
+
+class _HighlightCard(QFrame):
+    """Outline group for a single highlight: header, status, controls.
+
+    Rendering happens in a worker thread; signals from the worker drive
+    the UI updates here. The card owns the worker + its thread; on
+    completion the card cleans them both up.
+    """
+
+    rendered = Signal(str)  # emits highlight_id when render completes
+
+    def __init__(
+        self,
+        highlight: Highlight,
+        document: Document,
+        document_path: Path,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._highlight = highlight
+        self._document = document
+        self._document_path = document_path
+        self._worker: _RenderWorker | None = None
+        self._thread: QThread | None = None
+        self._build_ui()
+        self._refresh_open_state()
+
+    # ----- public surface --------------------------------------------------
+
+    @property
+    def highlight_id(self) -> str:
+        return self._highlight.highlight_id
+
+    def set_highlight(self, highlight: Highlight) -> None:
+        """Refresh the card's underlying highlight (e.g., after a render)."""
+        self._highlight = highlight
+        self._refresh_open_state()
+
+    # ----- build -----------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setFrameShadow(QFrame.Shadow.Plain)
+        self.setLineWidth(1)
+        self.setObjectName("HighlightCard")
+        self.setStyleSheet(
+            "QFrame#HighlightCard { "
+            f"border: 1px solid {MUTED}; border-radius: 6px; "
+            "padding: 4px; margin: 4px 0; }"
+        )
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(6, 6, 6, 6)
+        outer.setSpacing(4)
+
+        header = QLabel(self._format_header())
+        header.setWordWrap(True)
+        header.setStyleSheet("font-weight: bold;")
+        outer.addWidget(header)
+
+        time_lbl = QLabel(
+            _format_duration(
+                self._highlight.span_source_start,
+                self._highlight.span_source_end,
+            )
+        )
+        time_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        outer.addWidget(time_lbl)
+
+        reason_lbl = QLabel(f"Reason: {self._highlight.reason}")
+        reason_lbl.setWordWrap(True)
+        reason_lbl.setStyleSheet(f"color: {MUTED};")
+        outer.addWidget(reason_lbl)
+
+        self._status_lbl = QLabel(self._initial_status_text())
+        self._status_lbl.setWordWrap(True)
+        self._status_lbl.setStyleSheet(f"color: {self._initial_status_color()};")
+        outer.addWidget(self._status_lbl)
+
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setVisible(False)
+        outer.addWidget(self._progress)
+
+        controls = QHBoxLayout()
+        controls.setSpacing(6)
+        self._render_btn = QPushButton("Render")
+        self._render_btn.clicked.connect(self._on_render_clicked)
+        self._render_btn.setStyleSheet(
+            f"QPushButton:enabled {{ background-color: {ACCENT}; color: white; "
+            "padding: 4px 12px; border-radius: 4px; }}"
+        )
+        controls.addWidget(self._render_btn)
+
+        self._open_btn = QPushButton("Open")
+        self._open_btn.clicked.connect(self._on_open_clicked)
+        controls.addWidget(self._open_btn)
+        controls.addStretch(1)
+        outer.addLayout(controls)
+
+    def _format_header(self) -> str:
+        captions = " · captions on" if self._highlight.captions_enabled else ""
+        return (
+            f"{self._highlight.reframe_mode}{captions} · "
+            f"{self._highlight.highlight_id[:15]}"
+        )
+
+    def _initial_status_text(self) -> str:
+        if self._is_rendered():
+            return "Rendered."
+        return "Not yet rendered."
+
+    def _initial_status_color(self) -> str:
+        if self._is_rendered():
+            return SUCCESS
+        return MUTED
+
+    # ----- state helpers --------------------------------------------------
+
+    def _is_rendered(self) -> bool:
+        rp = self._highlight.rendered_output_path
+        return rp is not None and Path(rp).is_file()
+
+    def _refresh_open_state(self) -> None:
+        rendered = self._is_rendered()
+        self._open_btn.setEnabled(rendered)
+        if rendered:
+            self._status_lbl.setText("Rendered.")
+            self._status_lbl.setStyleSheet(f"color: {SUCCESS};")
+        elif self._worker is None:
+            self._status_lbl.setText("Not yet rendered.")
+            self._status_lbl.setStyleSheet(f"color: {MUTED};")
+
+    # ----- actions ---------------------------------------------------------
+
+    def _on_render_clicked(self) -> None:
+        if self._worker is not None:
+            return
+        self._render_btn.setEnabled(False)
+        self._progress.setValue(0)
+        self._progress.setVisible(True)
+        self._status_lbl.setText("Rendering…")
+        self._status_lbl.setStyleSheet(f"color: {ACCENT};")
+
+        self._thread = QThread(self)
+        self._worker = _RenderWorker(self._highlight, self._document)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.failed.connect(self._on_failed)
+        # Cleanup chain: worker + thread teardown in lockstep.
+        self._worker.finished.connect(self._cleanup_worker)
+        self._worker.failed.connect(self._cleanup_worker)
+        self._thread.start()
+
+    def _on_progress(self, value: float) -> None:
+        pct = int(round(max(0.0, min(1.0, value)) * 100))
+        self._progress.setValue(pct)
+
+    def _on_finished(self, _metadata) -> None:
+        # Reload the highlight's sidecar JSON to pick up the new
+        # rendered_output_path that render_highlight wrote via mark_rendered.
+        try:
+            self._highlight = read_highlight(self._document_path, self._highlight.highlight_id)
+        except FileNotFoundError:
+            # Sidecar gone (unlikely) — leave the in-memory copy alone
+            # and rely on the metadata's output_path.
+            pass
+        self._progress.setVisible(False)
+        self._refresh_open_state()
+        self._render_btn.setEnabled(True)
+        self.rendered.emit(self._highlight.highlight_id)
+
+    def _on_failed(self, message: str) -> None:
+        self._progress.setVisible(False)
+        self._status_lbl.setText(f"Render failed: {message}")
+        self._status_lbl.setStyleSheet(f"color: {DANGER};")
+        self._render_btn.setEnabled(True)
+
+    def _cleanup_worker(self) -> None:
+        if self._thread is not None:
+            self._thread.quit()
+            self._thread.wait()
+            self._thread.deleteLater()
+            self._thread = None
+        if self._worker is not None:
+            self._worker.deleteLater()
+            self._worker = None
+
+    def _on_open_clicked(self) -> None:
+        rp = self._highlight.rendered_output_path
+        if rp is None:
+            return
+        # Use QDesktopServices.openUrl with file:// — opens in the OS
+        # default player (QuickTime on macOS, Movies & TV on Windows).
+        url = QUrl.fromLocalFile(str(Path(rp).resolve()))
+        QDesktopServices.openUrl(url)
+
+
+# ---------------------------------------------------------------------------
+# HighlightsPanel
+# ---------------------------------------------------------------------------
+
+
+class HighlightsPanel(QWidget):
+    """The full highlights surface: title + scrollable card list.
+
+    Read-only — no accept/reject, no editing of highlight specs.
+    Re-proposing happens via Claude Desktop, not the GUI.
+
+    Signals:
+        highlights_present(bool, str): Emitted after every reload with
+            ``(has_highlights, latest_highlight_id)``. Hosts use this
+            to auto-show the dock when a document with highlights
+            loads (mirrors the proposal-review pane's auto-show logic).
+            ``latest_highlight_id`` is empty when the doc has none.
+        rendered(str): Forwarded from any card's ``rendered`` signal so
+            the host can react (e.g., refresh some external listing).
+    """
+
+    highlights_present = Signal(bool, str)
+    rendered = Signal(str)
+
+    EMPTY_TEXT = (
+        "No highlights for this document.\n\n"
+        "Use the MCP `propose_highlights` tool (e.g. via Claude Desktop) "
+        "to author highlights, then re-open this pane."
+    )
+
+    NO_DOCUMENT_TEXT = "Open a transcript to view highlights."
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._doc: Document | None = None
+        self._doc_path: Path | None = None
+        self._cards: list[_HighlightCard] = []
+        self._build_ui()
+        self.setMinimumWidth(260)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+
+    # ----- build -----------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(6)
+
+        title = QLabel("Highlights")
+        title_font: QFont = title.font()
+        title_font.setBold(True)
+        title_font.setPointSize(title_font.pointSize() + 1)
+        title.setFont(title_font)
+        outer.addWidget(title)
+
+        self._empty_label = QLabel(self.NO_DOCUMENT_TEXT)
+        self._empty_label.setWordWrap(True)
+        self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_label.setStyleSheet(f"color: {MUTED}; padding: 20px;")
+        outer.addWidget(self._empty_label, 1)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._container = QWidget()
+        self._container_layout = QVBoxLayout(self._container)
+        self._container_layout.setContentsMargins(0, 0, 0, 0)
+        self._container_layout.setSpacing(2)
+        self._container_layout.addStretch(1)
+        self._scroll.setWidget(self._container)
+        self._scroll.setVisible(False)
+        outer.addWidget(self._scroll, 1)
+
+    # ----- public surface --------------------------------------------------
+
+    def set_document(self, doc: Document | None, doc_path: Path | None) -> None:
+        """Bind the panel to ``doc`` (or unbind on ``None``).
+
+        ``doc_path`` is the on-disk location of the .transcribe.json so
+        the panel can locate ``<doc_path>.highlights/``. When either is
+        None the panel reverts to the no-document state.
+        """
+        self._doc = doc
+        self._doc_path = doc_path
+        self.reload_highlights()
+
+    def reload_highlights(self) -> None:
+        """Re-scan ``<doc>.highlights/`` and refresh the card list.
+
+        Called on document load and whenever the host suspects the
+        sidecar dir has changed (e.g., a new highlight landed via the
+        MCP path, or a render just completed).
+        """
+        # Drop existing cards.
+        for card in self._cards:
+            card.setParent(None)
+            card.deleteLater()
+        self._cards = []
+
+        if self._doc is None or self._doc_path is None:
+            self._empty_label.setText(self.NO_DOCUMENT_TEXT)
+            self._empty_label.setVisible(True)
+            self._scroll.setVisible(False)
+            self.highlights_present.emit(False, "")
+            return
+
+        items = list_highlights_for_document(self._doc_path)
+        if not items:
+            self._empty_label.setText(self.EMPTY_TEXT)
+            self._empty_label.setVisible(True)
+            self._scroll.setVisible(False)
+            self.highlights_present.emit(False, "")
+            return
+
+        # Rebuild card list. Insert before the trailing stretch.
+        insert_at = self._container_layout.count() - 1
+        for h in items:
+            card = _HighlightCard(
+                h, self._doc, self._doc_path, parent=self._container
+            )
+            card.rendered.connect(self._on_card_rendered)
+            self._cards.append(card)
+            self._container_layout.insertWidget(insert_at, card)
+            insert_at += 1
+
+        self._empty_label.setVisible(False)
+        self._scroll.setVisible(True)
+        latest = items[-1].highlight_id  # list is sorted chronologically
+        self.highlights_present.emit(True, latest)
+
+    @property
+    def cards(self) -> list[_HighlightCard]:
+        """Test surface — exposes the per-card list for assertions."""
+        return list(self._cards)
+
+    # ----- signals ---------------------------------------------------------
+
+    def _on_card_rendered(self, highlight_id: str) -> None:
+        """Refresh the affected card from disk after its render finishes.
+
+        We don't tear down the panel — only the highlight whose render
+        completed needs its sidecar re-read for the new
+        ``rendered_output_path``. Mirrors the proposal pane's
+        ``mark_applied`` minimal-disturb pattern.
+        """
+        if self._doc_path is None:
+            return
+        for card in self._cards:
+            if card.highlight_id == highlight_id:
+                try:
+                    fresh = read_highlight(self._doc_path, highlight_id)
+                except FileNotFoundError:
+                    return
+                card.set_highlight(fresh)
+                break
+        self.rendered.emit(highlight_id)
