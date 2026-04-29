@@ -115,9 +115,16 @@ def _make_doc_file(tmp_path: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def test_eight_tools_registered():
-    """Phase 6a final: ``get_timeline`` joins the surface as the v3-aware
-    counterpart to ``get_ranges``."""
+def test_twenty_tools_registered():
+    """Tool count by phase: 8 (6a) + 6 (6b-2 proposals) + 6 (6c-2
+    highlights) = 20.
+
+    The Phase 6c-2 surface adds: propose_highlights, list_highlights,
+    read_highlight, apply_highlight, list_highlight_renders,
+    read_highlight_render. The order is deliberate — proposals
+    register before highlights so a client scanning the tool list
+    encounters the older lifecycle first.
+    """
     descs = _tool_descriptors()
     names = [d.name for d in descs]
     assert names == [
@@ -129,6 +136,18 @@ def test_eight_tools_registered():
         "apply_cuts",
         "restore_ranges",
         "render",
+        "propose_moves",
+        "list_proposals",
+        "read_proposal",
+        "apply_proposal",
+        "list_apply_results",
+        "read_apply_result",
+        "propose_highlights",
+        "list_highlights",
+        "read_highlight",
+        "apply_highlight",
+        "list_highlight_renders",
+        "read_highlight_render",
     ]
 
 
@@ -176,7 +195,7 @@ def test_load_document_returns_summary(tmp_path):
     assert summary.duration_s == 4.0
     assert summary.word_count == 4
     assert summary.range_count == 1
-    assert summary.schema_version == 3
+    assert summary.schema_version == 3.1
 
 
 def test_load_document_missing_file(tmp_path):

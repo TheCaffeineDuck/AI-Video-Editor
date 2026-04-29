@@ -32,10 +32,34 @@ from mcp_server.errors import raise_mcp
 from mcp_server.schemas import (
     ApplyCutsRequest,
     ApplyCutsResult,
+    ApplyHighlightRequest,
+    ApplyHighlightResult,
+    ApplyProposalRequest,
+    ApplyProposalResult,
     DocumentSummary,
     GetTranscriptRequest,
+    HighlightSummary,
     JsonPathRequest,
+    ListApplyResultsRequest,
+    ListApplyResultsResult,
+    ListHighlightRendersRequest,
+    ListHighlightRendersResult,
+    ListHighlightsRequest,
+    ListHighlightsResult,
+    ListProposalsRequest,
+    ListProposalsResult,
+    ProposeHighlightsRequest,
+    ProposeHighlightsResult,
+    ProposeMovesRequest,
+    ProposeMovesResult,
     RangesResult,
+    ReadApplyResultRequest,
+    ReadApplyResultResult,
+    ReadHighlightRenderRequest,
+    ReadHighlightRenderResult,
+    ReadHighlightRequest,
+    ReadProposalRequest,
+    ReadProposalResult,
     RenderRequest,
     RenderResult,
     RestoreRangesRequest,
@@ -52,6 +76,22 @@ from mcp_server.tools.document import (
     get_transcript,
     load_document,
     restore_ranges,
+)
+from mcp_server.tools.highlights import (
+    apply_highlight,
+    list_highlight_renders,
+    list_highlights,
+    propose_highlights,
+    read_highlight,
+    read_highlight_render,
+)
+from mcp_server.tools.proposals import (
+    apply_proposal,
+    list_apply_results,
+    list_proposals,
+    propose_moves,
+    read_apply_result,
+    read_proposal,
 )
 from mcp_server.tools.render import render
 from mcp_server.tools.transcribe import transcribe
@@ -194,6 +234,180 @@ TOOLS: tuple[ToolDef, ...] = (
         input_model=RenderRequest,
         output_model=RenderResult,
         handler=render,  # type: ignore[arg-type]
+    ),
+    # ----- Phase 6b-2 — proposal lifecycle -----
+    ToolDef(
+        name="propose_moves",
+        description=(
+            "Propose a batch of MoveClipSpan operations against a "
+            ".transcribe.json document. Each move references a contiguous "
+            "span of clips by source identity (path + source_start_s + "
+            "source_end_s) and a target clip to land before (or null to "
+            "move to the end of the playlist). Reasons must pass the "
+            "is_valid_reason validator. Persists the proposal to a "
+            "sidecar file and returns its proposal_id; no document edits "
+            "yet — call apply_proposal to commit."
+        ),
+        input_model=ProposeMovesRequest,
+        output_model=ProposeMovesResult,
+        handler=propose_moves,  # type: ignore[arg-type]
+    ),
+    ToolDef(
+        name="list_proposals",
+        description=(
+            "List every proposal authored against a .transcribe.json "
+            "document. Returns proposal_id, parent_document_state_hash, "
+            "move_count, created_at, and the latest_apply_result_id "
+            "(null when no apply-result has been written for that "
+            "proposal). Sorted chronologically (proposal_id is "
+            "timestamp-prefixed)."
+        ),
+        input_model=ListProposalsRequest,
+        output_model=ListProposalsResult,
+        handler=list_proposals,  # type: ignore[arg-type]
+    ),
+    ToolDef(
+        name="read_proposal",
+        description=(
+            "Read the full contents of a proposal: its parent_document_state_hash, "
+            "created_at, and the ordered list of moves with their span / "
+            "target / reason / move_id. Use this after list_proposals to "
+            "inspect what would be applied."
+        ),
+        input_model=ReadProposalRequest,
+        output_model=ReadProposalResult,
+        handler=read_proposal,  # type: ignore[arg-type]
+    ),
+    ToolDef(
+        name="apply_proposal",
+        description=(
+            "Apply (a subset of) a proposal's moves to the document. "
+            "move_ids null applies every move; an empty list applies "
+            "none (every outcome is marked skipped). The filter is "
+            "order-irrelevant — moves apply in proposal order regardless "
+            "of how the ids appear in move_ids. Per-move all-or-nothing, "
+            "partial across moves: a failed move records an error and "
+            "subsequent moves still attempt against the pre-failure "
+            "state. Writes the document back to disk when at least one "
+            "move applies, and always writes an apply-result file "
+            "recording the run."
+        ),
+        input_model=ApplyProposalRequest,
+        output_model=ApplyProposalResult,
+        handler=apply_proposal,  # type: ignore[arg-type]
+    ),
+    ToolDef(
+        name="list_apply_results",
+        description=(
+            "List apply-results for a document, optionally filtered to a "
+            "specific proposal_id. Each entry summarizes applied / "
+            "skipped / failed counts; use read_apply_result for the "
+            "full per-move outcomes."
+        ),
+        input_model=ListApplyResultsRequest,
+        output_model=ListApplyResultsResult,
+        handler=list_apply_results,  # type: ignore[arg-type]
+    ),
+    ToolDef(
+        name="read_apply_result",
+        description=(
+            "Read the full per-move outcomes of a single apply-result. "
+            "Each outcome carries move_id / index / applied / skipped / "
+            "error / error_code / post_state_hash / "
+            "human_rejection_reason. post_state_hash chains to the "
+            "document state immediately after that move applied (sha256 "
+            "over the full Document JSON including edit_log)."
+        ),
+        input_model=ReadApplyResultRequest,
+        output_model=ReadApplyResultResult,
+        handler=read_apply_result,  # type: ignore[arg-type]
+    ),
+    # ----- Phase 6c-2 — highlight lifecycle -----
+    ToolDef(
+        name="propose_highlights",
+        description=(
+            "Author one or more highlight specs against a .transcribe.json "
+            "document. Each spec is {source_path, source_start_s, "
+            "source_end_s, reason, reframe_mode, captions_enabled}; "
+            "reframe_mode is 'speaker_locked' (default) or 'center'; "
+            "reason must pass core.edit_events.is_valid_reason. Single-pass "
+            "validation — INVALID_HIGHLIGHT names the offending index "
+            "and no entries are persisted on failure. Returns a list of "
+            "{highlight_id, json_path} pairs in the same order as the "
+            "input. No render is triggered yet — call apply_highlight on "
+            "each id."
+        ),
+        input_model=ProposeHighlightsRequest,
+        output_model=ProposeHighlightsResult,
+        handler=propose_highlights,  # type: ignore[arg-type]
+    ),
+    ToolDef(
+        name="list_highlights",
+        description=(
+            "List every highlight authored against a .transcribe.json "
+            "document. Each entry carries highlight_id, source-time span, "
+            "reason, reframe_mode, captions_enabled, and the current "
+            "rendered_output_path (null if no render has run for that "
+            "id). Sorted chronologically (highlight_id is timestamp-"
+            "prefixed)."
+        ),
+        input_model=ListHighlightsRequest,
+        output_model=ListHighlightsResult,
+        handler=list_highlights,  # type: ignore[arg-type]
+    ),
+    ToolDef(
+        name="read_highlight",
+        description=(
+            "Read one stored highlight by id. Returns the same per-entry "
+            "shape as list_highlights. HIGHLIGHT_NOT_FOUND on miss."
+        ),
+        input_model=ReadHighlightRequest,
+        output_model=HighlightSummary,
+        handler=read_highlight,  # type: ignore[arg-type]
+    ),
+    ToolDef(
+        name="apply_highlight",
+        description=(
+            "Render a highlight to a 9:16 .mp4 (1080×1920) and write a "
+            "render-result sidecar recording wall clock, face-detect "
+            "outcome, and crop box. Re-running on the same id produces "
+            "a fresh render-result file each call; the .mp4 output is "
+            "overwritten in place. STALE_HIGHLIGHT fires when the live "
+            "source file's cache_key has drifted from what the highlight "
+            "recorded at author time (file replacement at the OS layer); "
+            "RENDER_FAILED for ffmpeg / smartcut errors. Synchronous: "
+            "blocks until the render finishes."
+        ),
+        input_model=ApplyHighlightRequest,
+        output_model=ApplyHighlightResult,
+        handler=apply_highlight,  # type: ignore[arg-type]
+    ),
+    ToolDef(
+        name="list_highlight_renders",
+        description=(
+            "List every render-result for a document, optionally "
+            "filtered to one highlight_id. Each entry summarizes "
+            "render_result_id, highlight_id, created_at, output_path, "
+            "wall_clock_s, and face_detection_used (one of "
+            "speaker_locked / speaker_locked_fallback_to_center / "
+            "center). Sorted chronologically."
+        ),
+        input_model=ListHighlightRendersRequest,
+        output_model=ListHighlightRendersResult,
+        handler=list_highlight_renders,  # type: ignore[arg-type]
+    ),
+    ToolDef(
+        name="read_highlight_render",
+        description=(
+            "Read one render-result by id. Carries the full record: "
+            "render_result_id, highlight_id, created_at, output_path, "
+            "parent_source_hash (the cache_key matched at render time), "
+            "face_detection_used, crop_box {x, y, w, h}, and "
+            "wall_clock_s. RENDER_RESULT_NOT_FOUND on miss."
+        ),
+        input_model=ReadHighlightRenderRequest,
+        output_model=ReadHighlightRenderResult,
+        handler=read_highlight_render,  # type: ignore[arg-type]
     ),
 )
 
