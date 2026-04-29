@@ -115,6 +115,40 @@ If a rule looks wrong while you're modifying code that touches it, change the ru
 
 **Where.** `core/[render.py](http://render.py):_to_fraction_seconds`
 
+### Highlight stale-guard hashes the source file, not document state
+
+**Rule.** A `Highlight` records the parent's source media file's
+`core.cache.cache_key` (path + mtime + size) at author time. The
+renderer compares this against the live `cache_key` at apply time
+and refuses with `StaleHighlightError` on mismatch. The stale-guard
+deliberately does *not* track Document state.
+
+**Why.** Highlights are *source-time spans* — coordinates in the
+source media. Intra-doc edits (cuts, restores, moves) on the parent
+Document don't shift those coordinates, so they shouldn't invalidate
+unrelated highlights. Only file-replacement at the OS layer
+(different bytes at the same path, or the file was renamed/replaced)
+genuinely invalidates a span: the bytes the span referenced may no
+longer be there. Phase 6c-1's first cut of `Highlight` mistakenly
+hashed the full Document JSON (`document_state_hash`) — every cut
+to the parent doc would have spuriously invalidated every highlight
+against that source. v2 fixes this; v1 files raise
+`UnsupportedSchemaError` on load with a re-propose remediation
+message.
+
+This is the inverse semantics from `Proposal`'s
+`parent_document_state_hash` (which *correctly* hashes the full
+Document JSON, because moves *are* document-state operations and
+must invalidate on intra-doc drift). The two artifacts intentionally
+differ here.
+
+**Status.** `PASS` — Phase 6c Section A.
+
+**Where.** `core/highlight.py:Highlight.parent_source_hash`,
+`core/highlight_render.py:render_highlight` (live `cache_key` check
+at the top of the render path), `tests/test_phase_6c1.py::test_highlight_from_json_rejects_v1_schema`,
+`tests/test_phase_6c1.py::test_render_does_not_invalidate_on_intra_doc_edit`.
+
 ### Smartcut's `emit()` is non-monotonic; wrap it
 
 **Rule.** Smartcut's progress callbacks emit non-uniform increments and can briefly exceed the announced total. Any progress signal piped to the UI must be clamped to `[0, 1]` and made monotonic by an adapter, never trusted raw.

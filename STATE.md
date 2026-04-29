@@ -2,533 +2,513 @@
 
 **Date:** 2026-04-29
 **Branch:** main
-**Commits:** Phase 6a is shipped across four commits —
-  * `f9c06f5` — MCP server foundation (transcribe / read / cut / render).
-  * `1f4eca1` — smartcut non-monotonic spike (YELLOW gate, option 1 picked).
-  * `0a92ec2` — schema v3 (Clip/Timeline) + run-batched renderer +
-    `AddCut.reason`.
-  * Pending — GUI v3 reader (playlist-order transcript, edit actions
-    disabled on non-monotonic) + MCP `get_timeline` + non-monotonic
-    edit-refusal + smoke checklist.
 
-**Status:** Phase 6a is complete. All 602 tests pass (529 prior + 30
-MCP-foundation + 29 schema-v3 + 14 final). Lint clean for changed
-files. Phase 6b is next.
+> **Phase 6c (this pass)** — Highlight artifact + 9:16 reframe / caption
+> render path + MCP lifecycle + GUI panel. New `core/highlight.py`
+> (`Highlight` dataclass, `HighlightRenderResult` dataclass, sidecar
+> persistence, source-keyed stale guard) and `core/highlight_render.py`
+> (face detection, crop math, SRT generation, single-pass ffmpeg
+> reframe + caption burn). New `mcp_server/tools/highlights.py`
+> (six MCP tools wrapping the highlight surface) plus four new error
+> codes (`HIGHLIGHT_NOT_FOUND`, `RENDER_RESULT_NOT_FOUND`,
+> `INVALID_HIGHLIGHT`, `STALE_HIGHLIGHT`). New
+> `ui_qt/components/highlights_panel.py` — read-only `QDockWidget`
+> with per-highlight Render / Open buttons, render runs in a
+> `QThread` worker per card. **771 tests total** (up from 738), all
+> green except the pre-existing `test_strip_dim_overlay_distinguishes_cut_regions`
+> failure on `main` that pre-dates this pass. Tool count rose from
+> 14 → 20. Real-fixture smoke on
+> `/Volumes/Aaron 4TB/531 Podcast Aaron & Barret Autocut only.mp4`:
+> two highlights, 15 s + 45 s spans, both `speaker_locked`, both face
+> detection succeeded, **38.56 s + 46.08 s wall clock**.
 
----
-
-## 1. Phase 6a in four paragraphs
-
-Phase 6a opened with the MCP server foundation (commit `f9c06f5`) —
-seven tools wrapping the `core/` pipeline over stdio per Anthropic's
-official `mcp` SDK, with stable error codes prefixed onto every error
-message so clients can branch on `FILE_NOT_FOUND` / `WORD_BOUNDARY_VIOLATION`
-and friends. That work treated `Document` as v2 (single-source, sorted
-keep-ranges) and only renamed concepts at the JSON layer.
-
-The continuation (this commit) added schema v3 — `Clip` and `Timeline`
-in `core/timeline.py`, with `Document.main_timeline` exposed as a
-derived view over the still-frozen `ranges` field. The on-disk JSON
-shape changes from `ranges: [{source_id, start, end, reason}, …]` to
-`main_timeline: {clips: [{source_id, source_path, source_start,
-source_end, reason}, …]}`. v1 → v2 → v3 migration runs automatically
-on read. Editing commands (`AddCut`, `RestoreRange`, `CutWordRange`)
-gained a non-monotonic guard at apply time — they raise
-`NotImplementedError` if `main_timeline.is_source_monotonic()` is
-False. `AddCut.reason: str | None = None` is the new persisted
-metadata field, recorded onto the surviving neighbour range so it
-round-trips through JSON.
-
-The renderer's central change is run-batching. The smartcut spike
-(commit `1f4eca1`, full report in §9) established that smartcut
-requires sorted non-overlapping `positive_segments`; non-monotonic
-input silently drops or duplicates content. So `render_cut` now
-branches on monotonicity: monotonic timelines (everything 6a editing
-produces) take the v2 fast path verbatim; non-monotonic timelines
-split into the minimum number of source-monotonic *runs*, each is one
-`smart_cut` call, the per-run outputs concat with ffmpeg's stream-copy
-concat demuxer, and one unified `afade` post-pass covers every join in
-the final output (within-run *and* run-to-run boundaries). MediaContainer
-is reused across runs from the same source — the spike showed ~35 %
-wall-clock saving on the heavy HEVC 10-bit fixture.
-
-The final pass closes the loop on the editor-side and MCP-side
-v3-awareness. The Qt `TranscriptView` now branches on the document's
-monotonicity: monotonic docs render via the pre-6a source-order path
-(byte-identical, locked under a hash snapshot test); non-monotonic
-docs render in playlist order with a visible `— jump to N.NNs —`
-boundary between adjacent clips. `EditorPane` disables cut / restore /
-delete / save and stamps a "Phase 6b" tooltip when the loaded
-document is non-monotonic — the user never reaches the
-`NotImplementedError` safety net in `core.editing`. MCP gets a new
-`get_timeline` tool returning the v3 playlist (the v2-shaped
-`get_ranges` is retained but flagged lossy on non-monotonic), and
-`apply_cuts` / `restore_ranges` refuse non-monotonic documents with
-the new stable `EDIT_NOT_SUPPORTED` error code so clients branch
-cleanly. `docs/PHASE_6A_SMOKE.md` documents an 11-step manual checklist
-the user runs through Claude Desktop.
+**Status:** Phase 6c (sub-phases 1 / 2 / 3) is complete. The
+highlight surface is wired end-to-end: Claude proposes via MCP →
+renderer cuts + reframes (+ optionally burns captions) → GUI shows
+"rendered" with an Open button. No human review on the highlight
+path; the panel is intentionally read-only (re-author via Claude
+Desktop, not the GUI). The Phase 6c-A stale-guard fix replaced the
+v1 highlight schema's incorrect `parent_document_state_hash`
+(which would invalidate spans on unrelated intra-doc edits) with
+v2's `parent_source_hash` keyed off `core.cache.cache_key` —
+source-time spans now correctly hash the source media file, not
+the document state.
 
 ---
 
-## 2. Project structure (deltas in this pass)
+## 1. Phase 6c at a glance
+
+- **Section A** — schema v2 stale-guard fix on `Highlight`. The v1
+  schema (introduced earlier in 6c-1) stored
+  `parent_document_state_hash` (sha256 of full Document JSON), which
+  silently invalidated highlights every time the parent doc was
+  edited even when the source file was unchanged. Highlights are
+  source-time spans — intra-doc edits don't shift them. v2 stores
+  `parent_source_hash` keyed off `core.cache.cache_key`
+  (path+mtime+size). v1 files raise `UnsupportedSchemaError` on
+  load with a re-propose remediation message; no silent migration.
+- **Section B** — 6c-2 MCP surface. Six new tools in
+  `mcp_server/tools/highlights.py`: `propose_highlights`,
+  `list_highlights`, `read_highlight`, `apply_highlight`,
+  `list_highlight_renders`, `read_highlight_render`. Single-pass
+  spec validation on propose (the offending index is named in the
+  error message; no partial persistence). `apply_highlight` writes
+  a `<render_result_id>.render-result.json` sidecar per call,
+  recording wall-clock, `face_detection_used` (one of
+  `speaker_locked`, `speaker_locked_fallback_to_center`, `center`),
+  and the `crop_box`. Re-runs accumulate sidecars; the .mp4 is
+  overwritten in place. Four new error codes wire stable client-
+  fixable signals on top.
+- **Section C** — 6c-3 GUI Highlights panel. New
+  `ui_qt/components/highlights_panel.py` — `QDockWidget` host with
+  `_HighlightCard` per highlight, render runs in a `QThread`
+  worker (greyed-out Render button + progress bar while in flight),
+  Open button uses `QDesktopServices.openUrl` and is gated on
+  `rendered_output_path` actually existing on disk. `MainWindow`
+  plumbs View → Highlights toggle, auto-show on doc-load when the
+  sidecar dir has highlights (once per session per doc), clear on
+  doc swap. Caption ASS style locked at module level
+  (`core.highlight_render.CAPTION_FORCE_STYLE`): Arial 56,
+  white-on-black, bottom-center, 80 px margin. Vertical composition
+  stays source-framed (Phase 7+ debt — see §6).
+- **Section D** — end-to-end smoke against the real podcast fixture
+  + `docs/PHASE_6C_SMOKE.md` + this rewrite.
+
+The stale-guard fix is now codified in `docs/PRODUCTION_RULES.md`
+under the cutting-and-rendering section: source-time spans hash the
+*file*, not the document state.
+
+---
+
+## 2. Phase 6a / 6b inventory (background, unchanged this pass)
+
+Phase 6a shipped across four commits:
+
+* `f9c06f5` — MCP server foundation (transcribe / read / cut / render).
+* `1f4eca1` — smartcut non-monotonic spike (YELLOW gate, option 1).
+* `0a92ec2` — schema v3 (`Clip` / `Timeline`) + run-batched renderer.
+* `a5c45d3` — GUI v3 reader + MCP `get_timeline` + `EDIT_NOT_SUPPORTED`.
+
+Phase 6b shipped across three sub-passes:
+
+* **6b-1** — `MoveClipSpan` primitive, `EditEvent` /
+  `Document.edit_log` (v3 → v3.1), `Proposal` JSON I/O with parent-
+  hash guard, reason validator.
+* **6b-2** — apply-result persistence, `MoveOutcome` extended with
+  chain-of-custody hash, six MCP proposal-lifecycle tools, seven
+  new error codes, smoke checklist for Path A.
+* **6b-3** — GUI proposal-review dock + reasoned-reject (Path B).
+  Reason-flow refactor (event-first, range-derived). End-to-end
+  loop closure: GUI rejection reason flows through MCP
+  `read_apply_result` verbatim.
+
+These are the prerequisites for 6c. The 6b-2 proposal stale guard
+(`parent_document_state_hash`, sha256 over the full Document JSON
+including `edit_log`) is the *correct* design for proposals — moves
+need to invalidate on intra-doc drift. Highlights are different:
+their spans are source-time coordinates, so the proposal's hash
+semantics would over-invalidate. Section A's split is what makes
+the difference legible.
+
+---
+
+## 3. Project structure (deltas in this pass)
 
 ```
 .
 ├── core/
-│   ├── document.py          # v3 schema, v1→v2→v3 migration, main_timeline @property
-│   ├── editing.py           # AddCut.reason, non-monotonic NotImplementedError guard
-│   ├── render.py            # _render_monotonic / _render_non_monotonic / _ffmpeg_concat_demuxer
-│   ├── timeline.py          # Clip, Timeline, split_into_monotonic_runs (+ existing v2 helpers)
-│   └── …                    # other files unchanged
-├── workers/                 # unchanged
-├── ui/                      # unchanged (still reads via doc.ranges)
-├── ui_qt/
-│   ├── components/transcript_view.py  # NEW playlist-order render path
-│   └── editor_pane.py       # NEW _apply_monotonicity_state + tooltip
+│   ├── highlight.py           # CHANGED (6c Section A) — schema_version=2,
+│   │                          #   parent_source_hash field, v1 raises
+│   │                          #   UnsupportedSchemaError. NEW (Section B):
+│   │                          #   HighlightRenderResult dataclass +
+│   │                          #   write_render_result / read_render_result /
+│   │                          #   list_render_results_for_document /
+│   │                          #   new_render_result_id helpers.
+│   ├── highlight_render.py    # CHANGED — render_highlight returns
+│   │                          #   HighlightRenderMetadata (output_path,
+│   │                          #   face_detection_used, crop_box,
+│   │                          #   parent_source_hash) instead of bare Path;
+│   │                          #   stale-guard now compares
+│   │                          #   cache_key(span_source_path) (not
+│   │                          #   document_state_hash); CAPTION_FORCE_STYLE
+│   │                          #   bumped to Arial 56 / margin 80 (Section C).
+│   └── …                      # other files unchanged
 ├── mcp_server/
-│   ├── errors.py            # +EDIT_NOT_SUPPORTED
-│   ├── schemas.py           # +ClipOut, +TimelineResult, +is_source_monotonic on RangesResult
-│   ├── server.py            # 8th tool registered (get_timeline)
-│   └── tools/document.py    # +get_timeline, +_require_monotonic_timeline
-├── scripts/
-│   └── smartcut_spike.py    # GATE — kept as a regression check
+│   ├── errors.py              # +4 codes (HIGHLIGHT_NOT_FOUND,
+│   │                          #   RENDER_RESULT_NOT_FOUND, INVALID_HIGHLIGHT,
+│   │                          #   STALE_HIGHLIGHT)
+│   ├── schemas.py             # +HighlightSpec, HighlightOut, HighlightSummary,
+│   │                          #   ProposeHighlights*Request/Result,
+│   │                          #   ApplyHighlightRequest/Result, CropBoxOut,
+│   │                          #   RenderResultSummary, ListHighlightRenders*,
+│   │                          #   ReadHighlightRender*.
+│   ├── server.py              # 20-tool dispatch table (8 + 6 + 6).
+│   └── tools/
+│       └── highlights.py      # NEW (Section B) — six MCP tools.
+├── ui_qt/
+│   ├── app.py                 # MainWindow plumbing for the 6c-3 dock —
+│   │                          #   _setup_highlights_dock,
+│   │                          #   _handle_toggle_highlights,
+│   │                          #   _handle_highlights_present,
+│   │                          #   _refresh_highlights_panel,
+│   │                          #   View → Highlights menu entry.
+│   └── components/
+│       └── highlights_panel.py  # NEW (Section C) — HighlightsPanel,
+│                                #   _HighlightCard, _RenderWorker (QThread).
 ├── docs/
-│   └── PHASE_6A_SMOKE.md    # NEW — 11-step manual checklist
+│   ├── PRODUCTION_RULES.md    # +"Highlight stale-guard hashes the source
+│   │                          #   file, not document state" (PASS rule).
+│   ├── PHASE_6C_SMOKE.md      # NEW (Section D) — 10-step manual checklist.
+│   └── …                      # unchanged
 ├── tests/
-│   ├── test_phase_6a.py     # MCP-foundation tests (30 → 8-tool list update)
-│   ├── test_phase_6a_v3.py  # 29 tests for schema v3 + renderer
-│   ├── test_phase_6a_final.py  # NEW — 14 tests for GUI v3 reader + MCP awareness
-│   ├── test_document.py     # schema_version assertions updated to v3
-│   ├── test_editing.py      # AddCut.reason default updated to None
-│   └── test_exporters.py    # schema_version assertion bumped to v3
-├── main_mcp.py              # unchanged
-└── STATE.md                 # this file
+│   ├── test_phase_6c1.py      # CHANGED — schema v2 field rename, v1 refusal
+│   │                          #   test added, intra-doc-edit-doesn't-
+│   │                          #   invalidate test added (24 → 26 tests).
+│   ├── test_phase_6c2.py      # NEW (Section B) — 23 tests.
+│   ├── test_phase_6c3.py      # NEW (Section C) — 8 tests.
+│   └── test_phase_6a.py       # CHANGED — `test_fourteen_tools_registered`
+│                              #   renamed to `test_twenty_tools_registered`
+│                              #   and updated for the +6 highlight tools.
+└── STATE.md                   # this file
 ```
 
 ---
 
-## 3. Dependencies
-
-Unchanged.
-
----
-
-## 4. Code inventory (deltas in this pass)
-
-| File | What's new |
-|------|------------|
-| `core/timeline.py` | NEW types `Clip` (frozen, 4 fields with optional `reason`) and `Timeline` (frozen, `clips: tuple[Clip, ...]`). `is_source_monotonic`, `total_duration_s`, `source_paths` properties on Timeline. `split_into_monotonic_runs()` partitions a non-monotonic playlist into the minimum source-monotonic runs. v2 `subtract_interval` / `union_interval` helpers preserved verbatim. |
-| `core/document.py` | `_SCHEMA_VERSION` bumped to 3. `Document.to_json` emits `main_timeline: {clips: […]}` with each clip carrying both `source_id` and a redundant `source_path`. `Document.from_json` chains `_migrate_v1_to_v2_data` → `_migrate_v2_to_v3_data` → `_load_v3` so v1, v2, and v3 inputs all land as v3 in memory. The in-memory `ranges` field is unchanged; `Document.main_timeline` is a new derived `@property`. |
-| `core/editing.py` | `AddCut.reason: str \| None = None` (was `str = "manual"`). New `_attach_reason_to_neighbor` helper stamps the reason onto the surviving range so it round-trips. New `_require_monotonic` helper is called at the top of every `apply`; non-monotonic timelines raise `NotImplementedError` with a clear message. `RestoreRange` and `CutWordRange` get the same guard. |
-| `core/render.py` | `render_cut` now dispatches on `doc.main_timeline.is_source_monotonic()`. Pre-existing logic (full-coverage shortcut, single smartcut + fade pass) lifted into `_render_monotonic`. New `_render_non_monotonic` partitions into runs, smart_cuts each (reusing `MediaContainer` cache keyed by `source_path`), concats via the new `_ffmpeg_concat_demuxer` helper, then runs one unified `_apply_audio_fades` pass over the final output. Per-run progress is merged into a single 0..1 stream weighted by run output duration. |
-| `tests/test_phase_6a_v3.py` | NEW — 29 tests: monotonic truth-table (8 cases), Clip post-init validation, run-splitting correctness (5 cases including the spike's schedule), v2 → v3 migration round-trip, hand-crafted non-monotonic v3 fixture loads, AddCut.reason default + persistence + non-overwrite-when-None, NotImplementedError guards on AddCut/RestoreRange, monotonic-fast-path render unchanged, non-monotonic synthetic render duration ±50 ms, fades across run joins, progress reaches 1.0. |
-| `tests/test_document.py` | `Document.SCHEMA_VERSION == 3` (was 2). `to_json` emits `main_timeline` (was `ranges`). v1 migration test now expects v3 in memory. `_v2_payload(...)` keeps emitting `schema_version=2` to exercise the v2→v3 chain. |
-| `tests/test_editing.py` | `test_add_cut_default_reason_is_manual` → `test_add_cut_default_reason_is_none`. |
-| `tests/test_exporters.py` / `tests/test_phase_6a.py` | `schema_version` assertions bumped to 3. |
-| `ui_qt/components/transcript_view.py` | New `_render_source_order` (pre-6a body, locked under hash snapshot) and `_render_playlist_order` (walks clips in playlist order, emits ``— jump to N.NNs —`` between adjacent clips). `set_document_model` dispatches by `is_source_monotonic`. |
-| `ui_qt/editor_pane.py` | New `_apply_monotonicity_state()` called from `_render_document`. Disables `cut`, `restore`, `delete`, `save` (and the toolbar Save button) on non-monotonic timelines, stamps `EditorPane.NON_MONOTONIC_TOOLTIP`, and restores Qt's default tooltip when re-enabled. Export stays enabled because rendering is read-only. |
-| `mcp_server/errors.py` | Added `EDIT_NOT_SUPPORTED` to the stable code set (client-fixable tier — surfaces as `INVALID_PARAMS` at the JSON-RPC layer). |
-| `mcp_server/schemas.py` | New `ClipOut` + `TimelineResult` for the v3-aware tool. `RangesResult` gains `is_source_monotonic: bool` (default `True` so v2-shaped clients keep parsing). |
-| `mcp_server/server.py` + `mcp_server/tools/document.py` | Registered `get_timeline` (8th tool). `_require_monotonic_timeline` guard added to `apply_cuts` and `restore_ranges` — refuses with `EDIT_NOT_SUPPORTED` rather than letting `NotImplementedError` bubble through. `get_ranges` docstring documents the lossy-on-non-monotonic behaviour. |
-| `tests/test_phase_6a_final.py` | NEW — 14 tests: monotonic transcript hash snapshot, struck-words rendering, non-monotonic playlist-order rendering + boundary marker, edit-actions enabled on monotonic / disabled-with-tooltip on non-monotonic / pane loads non-monotonic without exception, MCP `get_timeline` on monotonic + non-monotonic, `get_ranges` flag on non-monotonic, `apply_cuts` + `restore_ranges` refuse non-monotonic with `EDIT_NOT_SUPPORTED`, `apply_cuts` still works on monotonic. |
-| `docs/PHASE_6A_SMOKE.md` | NEW — 11-step manual end-to-end checklist for Claude Desktop. |
-
-### Test count
+## 4. Test count
 
 | Phase | Total | Fast | Slow |
 |-------|------:|-----:|-----:|
 | End of 5f       | 529 | 517 | 12 |
 | 6a MCP          | 559 | 547 | 12 |
 | 6a schema v3    | 588 | 571 | 17 |
-| **6a final**    | **602** | **585** | **17** |
+| 6a final        | 602 | 585 | 17 |
+| 6b-1            | 662 | 644 | 18 |
+| 6b-2            | 691 | 673 | 18 |
+| 6b-3            | 708 | 690 | 18 |
+| 6c-1            | 738 | 716 | 22 |
+| **6c-A/B/C**    | **771** | **743** | **28** |
+
+Section A added 2 tests (`test_highlight_from_json_rejects_v1_schema`,
+`test_render_does_not_invalidate_on_intra_doc_edit`). Section B added
+23 tests in `tests/test_phase_6c2.py` (17 fast + 6 slow). Section C
+added 8 tests in `tests/test_phase_6c3.py` (all fast, headless Qt
+patterns).
+
+The pre-existing failure
+(`tests/test_waveform.py::test_strip_dim_overlay_distinguishes_cut_regions`)
+predates this pass. Verified by stashing the working tree and
+re-running on `main` — same failure, unrelated to highlights.
 
 ---
 
-## 5. Public APIs added or reshaped
+## 5. Tool count delta
 
-```python
-# core.timeline — NEW
-@dataclass(frozen=True)
-class Clip:
-    source_path: Path
-    source_start: float
-    source_end: float
-    reason: str = ""           # 4th field (deviation from spec's literal 3 fields,
-                               # see §8.x), required so AddCut.reason persists
-                               # in v3 JSON without inventing a parallel cut_log.
-    @property
-    def duration_s(self) -> float: ...
-
-@dataclass(frozen=True)
-class Timeline:
-    clips: tuple[Clip, ...] = ()
-    @property
-    def total_duration_s(self) -> float: ...
-    @property
-    def source_paths(self) -> tuple[Path, ...]: ...
-    def is_source_monotonic(self) -> bool: ...
-
-def split_into_monotonic_runs(timeline: Timeline) -> list[Timeline]: ...
-
-# core.document — additions
-class Document:
-    SCHEMA_VERSION: ClassVar[int] = 3
-    @property
-    def main_timeline(self) -> Timeline: ...
-
-# core.editing — reshaped
-class AddCut:
-    start: float
-    end: float
-    reason: str | None = None     # was: reason: str = "manual"
-    source_id: str = "src0"
-
-# core.render — internal additions; render_cut signature unchanged
-def _render_monotonic(...) -> Path: ...
-def _render_non_monotonic(...) -> Path: ...
-def _ffmpeg_concat_demuxer(intermediates: list[Path], output_path: Path) -> None: ...
-```
+| Phase | Tool count |
+|-------|-----------:|
+| 6a MCP          | 7 |
+| 6a final        | 8  (+`get_timeline`) |
+| 6b-2            | 14 (+propose_moves / list_proposals / read_proposal / apply_proposal / list_apply_results / read_apply_result) |
+| **6c-2**        | **20** (+propose_highlights / list_highlights / read_highlight / apply_highlight / list_highlight_renders / read_highlight_render) |
 
 ---
 
-## 6. What's solid
+## 6. What's solid (Phase 6c)
 
-1. **Monotonic fast path is byte-for-byte unchanged.** The
-   `_render_monotonic` body is the v2 `render_cut` body verbatim,
-   including the `shutil.copy2` full-coverage shortcut. Pre-existing
-   render tests (slow + fast) exercise this path and still pass.
-2. **Non-monotonic render produces correct duration.** The synthetic-
-   fixture test renders `[(20,25), (5,10), (0,3)]` (13 s expected) with
-   `pad_lead=pad_trail=0` and `audio_fade_ms=0`; output duration lands
-   within 50 ms of expected, audio/video stay within 10 ms across all
-   joins.
-3. **Run-splitting is order-preserving.** Concatenating the
-   `split_into_monotonic_runs` output reproduces the input timeline.
-   Tested against the spike's exact schedule (which factors into 2
-   runs, not 3) and against a strictly-descending worst case (every
-   clip becomes its own run).
-4. **v1 → v2 → v3 migration is lossless on monotonic input.** Existing
-   v1 fixtures load as v3 in memory; existing v2 fixtures (unit-test
-   payloads) load as v3 in memory; re-saving and reloading is
-   equality-preserving.
-5. **AddCut.reason persists through JSON.** A cut with
-   `reason="filler removal"` lands the string on the surviving range
-   immediately preceding the cut (or following, if the cut sits at
-   file start). Round-tripping through `to_json` / `from_json` keeps
-   it. `reason=None` is a deliberate no-op — the existing reason on
-   the neighbour range is preserved, not overwritten with empty string.
-6. **Non-monotonic editing fails loudly.** `AddCut`,
-   `RestoreRange`, and `CutWordRange` all raise `NotImplementedError`
-   at apply time with a clear message, not a silent no-op. The check
-   runs at apply (not construction) so the same command instance can
-   be reused across documents.
-7. **MediaContainer reuse, when same source.** `_render_non_monotonic`
-   keeps a `dict[Path, MediaContainer]` cache and reuses the entry
-   across runs from the same source path. The spike showed this drops
-   3 sequential calls on the heavy HEVC clip from 20.7 s to 13.5 s
-   (~35 % saving).
-8. **Qt editor monotonic render is locked under a hash snapshot.**
-   `tests/test_phase_6a_final.py::test_monotonic_transcript_render_is_unchanged_baseline`
-   computes a SHA-256 over `toPlainText()` + the per-word kept/struck
-   flag list and compares to a literal locked digest. Any future
-   change that affects what monotonic users see in the transcript
-   trips this test. Two structural sanity assertions ride alongside
-   ("alpha" / "delta" present, no `— jump to` marker) so a hash drift
-   has actionable diagnostics.
-9. **Non-monotonic Qt editor is read-only and obvious.** Loading a
-   non-monotonic v3 doc into the editor:
-   - renders the transcript in playlist order (gamma/delta first,
-     alpha/beta second for the canonical fixture)
-   - inserts an italicized gray `— jump to N.NNs —` block between
-     adjacent clips
-   - disables `cut`, `restore`, `delete`, `save` actions and stamps
-     `Editing non-monotonic timelines is not yet supported (Phase 6b).`
-     as the tooltip on each
-   - leaves `export` enabled (rendering reads the timeline; the
-     run-batched renderer handles non-monotonic by construction)
-   The `NotImplementedError` from `core.editing` is the safety net,
-   not the first line of defence — the user never reaches it through
-   the GUI.
-10. **`get_timeline` is the v3-faithful read tool.** `get_ranges` is
-    retained for v2-compat clients but its output flattens playlist
-    order into source order; `is_source_monotonic` on the response
-    flags when the flattening is lossy. `get_timeline` returns the
-    full clip list in playlist order with the same flag — clients
-    that need re-arrangement-aware reads pick this.
-11. **`apply_cuts` / `restore_ranges` refuse cleanly, not via stack
-    trace.** Both tools call `_require_monotonic_timeline` before any
-    other validation and raise `EDIT_NOT_SUPPORTED` (a stable client-
-    fixable code) when the document is non-monotonic. The
-    `NotImplementedError` from `core.editing` never bubbles up as
-    `INTERNAL_ERROR` for non-monotonic input.
+1. **Source-time stale guard is correctly keyed on the source file.**
+   `Highlight.parent_source_hash` stores `cache_key(span_source_path)`
+   at author time. The renderer compares against the live cache_key
+   at apply time; mismatch raises `StaleHighlightError`. v1 files
+   (with the old `parent_document_state_hash`) raise on load — no
+   silent migration. Now codified in
+   `docs/PRODUCTION_RULES.md` as a PASS rule.
+2. **Render-result and Highlight responsibilities are non-overlapping.**
+   The `Highlight.rendered_output_path` is "where my output mp4
+   currently is" — one path per highlight, overwritten on re-render.
+   The `HighlightRenderResult` is "what happened on a specific render
+   run" — one fresh sidecar per `apply_highlight` call, recording
+   wall clock, face-detect outcome, crop box, and source hash.
+   The .mp4 is overwritten; the JSON sidecars accumulate. No
+   deduplication between them.
+3. **Single-pass spec validation on propose.** A bad spec in the
+   middle of an `propose_highlights` batch short-circuits the
+   entire call before any sidecar lands. The error names the
+   offending index (`highlights[N]`) so a multi-entry batch can be
+   repaired entry-by-entry. Tested.
+4. **`face_detection_used` is set honestly by the renderer.**
+   Speaker-locked failure logs a warning *and* records
+   `speaker_locked_fallback_to_center` in the metadata. The smoke
+   on the real podcast fixture verified `speaker_locked` succeeds
+   on actual interview footage; the synthetic-fixture test
+   verified the fallback path tags correctly.
+5. **GUI panel is read-only by design.** No accept/reject controls,
+   no inline editing of highlight specs. If the user wants to change
+   a highlight, they re-propose via Claude Desktop. The Render and
+   Open buttons are the entire interactive surface; mirrors the
+   "no human review on the highlight path" workflow.
+6. **Render worker is per-card, not pooled.** Each `_HighlightCard`
+   owns its own `QThread` for the duration of one render. Renders
+   can run concurrently on different cards if the user clicks fast
+   (the `.mp4` path is per-id so they don't collide), but the typical
+   pattern is one at a time. Cleanup chain (`worker.deleteLater` +
+   `thread.quit / wait / deleteLater`) is wired on both `finished`
+   and `failed` signals so a thread leak on render failure is
+   structurally impossible.
+7. **Auto-show is per-doc, dismissable.** When a doc with at least
+   one highlight loads, the dock auto-opens once. Once the user
+   dismisses the dock for that doc, it stays dismissed for the rest
+   of the session — only switching to a different doc with
+   highlights triggers another auto-show. Mirrors the 6b-3
+   proposal-review-dock pattern.
+8. **Tool registration is locked under a count test.**
+   `tests/test_phase_6a.py::test_twenty_tools_registered` asserts
+   the canonical name list. A future addition (or accidental
+   removal) trips this test before the change ships.
 
 ---
 
 ## 7. What's fragile or worth knowing
 
-1. **`get_ranges` is intentionally lossy on non-monotonic v3.** The
-   tool retains its v2 shape — flat list of ranges with totals — and
-   reports `is_source_monotonic` so a client can decide whether to
-   call `get_timeline` for the playlist-faithful view. Both tools ship
-   in 6a; renaming `get_ranges` is post-6c work if at all.
-2. **GUI waveform doesn't yet annotate clip jumps.** `WaveformController`
-   still calls `_strip.set_ranges(doc.ranges, duration)` to drive the
-   dim-overlay; for non-monotonic v3 docs the strip shows the source's
-   full kept-extent without a visual indication of playlist boundaries.
-   Acceptable for 6a — the editor disables editing on non-monotonic, so
-   the waveform only matters for read-only browse — but worth a 6b pass
-   when re-arrangement editing lands.
-3. **`_attach_reason_to_neighbor` uses a 1 ns float tolerance.** It
-   compares `range.end == cut.start` with `abs(...) < 1e-9`. Cuts whose
-   endpoints don't exactly match a range edge (post-`subtract_interval`
-   they should; the helper exists for the symmetric cut-at-start case)
-   silently drop the reason. Document if a future caller produces
-   non-edge-aligned cut endpoints.
-4. **Non-monotonic render can't take the full-coverage shortcut.** A
-   non-monotonic timeline that happens to cover the full source is
-   still a re-arrangement, not a copy. The `_is_full_coverage` check
-   only runs on the monotonic path, so the shortcut is correctly
-   skipped. Worth knowing if a future caller hand-builds a v3 fixture
-   that visits every second of the source out of order — it'll pay
-   the per-run smartcut cost.
-5. **`_ffmpeg_concat_demuxer` requires identical codec parameters
-   across intermediates.** All intermediates from a single source
-   match by construction (smartcut emits the same codec/params for
-   every cut from one container). For a future multi-source non-
-   monotonic render the demuxer will error at concat time and we'll
-   need to switch to the concat *filter* (one re-encode generation).
-   No multi-source test exercises this today.
-6. **Per-run pad_lead / pad_trail apply per clip, not per run.** Each
-   clip in each run gets the asymmetric pad treatment via
-   `_resolve_keep_ranges`. Three clips with default 100 ms padding
-   add 0.6 s to the total output. The new test uses `pad=0` to
-   isolate the run-batching from the pad pipeline; production renders
-   carry the pad as before.
-7. **Progress merge is duration-weighted.** A 30-s run + a 1-s run +
-   a 0.5-s run are weighted 30 / 1 / 0.5 in the global 0..1. Per-run
-   progress can step in non-uniform increments (smartcut quirks the
-   spike already documented), but the merged stream stays monotonic
-   (the test asserts that).
+1. **Vertical composition is source-framed (Phase 7+ debt).**
+   When the source aspect is ≥ 9:16, the 9:16 crop fills the full
+   source height. The speaker's vertical position therefore
+   follows wherever the source framing put them — we cannot shift
+   them without throwing away pixel rows. Sub-full-height crop and
+   dynamic per-frame tracking are Phase 7+ work; documented in
+   `compute_speaker_locked_crop`'s docstring.
+2. **Caption styling is one fixed default.** The
+   `CAPTION_FORCE_STYLE` constant (Arial 56, white-on-black-3px,
+   bottom-center, 80 px margin) is the entire knob today. Per-
+   highlight overrides land in Phase 7+ alongside the GUI
+   affordance to author them.
+3. **Render-result timestamps are wall-clock at apply time.** Two
+   re-runs of the same highlight produce different
+   `render_result_id` values (timestamp-prefixed), different
+   `created_at`, and different `wall_clock_s` — even when the
+   output .mp4 is byte-identical. That's the right design for
+   "what happened on this run" semantics; clients comparing
+   render-results across runs should compare on `output_path` (or
+   on the file itself), not on the sidecar's metadata.
+4. **`apply_highlight` is synchronous over MCP.** Re-rendering the
+   45-second podcast highlight took 46 s wall clock. Claude Desktop
+   blocks until the call returns. For longer spans the model will
+   feel that latency; an async/streaming variant is a Phase 7+
+   candidate.
+5. **`render_highlight` shells out to ffmpeg in a subprocess.** A
+   broad `except Exception` in the MCP `apply_highlight` handler
+   surfaces ffmpeg / smartcut / PyAV failures uniformly as
+   `RENDER_FAILED` instead of leaking a Python traceback through
+   `INTERNAL_ERROR`. This is intentional — the underlying error
+   types are heterogeneous (`RuntimeError` from ffmpeg,
+   `av.error.FFmpegError` from PyAV, `OSError` from disk) and
+   listing them all individually would be more brittle than the
+   broad catch. The original message rides in
+   `data["highlight_id"]` + the MCP message body.
+6. **GUI Render button doesn't propagate progress to a status
+   widget.** The per-card progress bar is the only progress
+   surface. If a future status-bar wants render % too, the
+   `_RenderWorker.progress` signal can be re-routed; for now it's
+   self-contained on the card.
+7. **A highlight's `parent_source_hash` is recomputed per propose,
+   not cached.** The proposing path looks at the parent doc's
+   `MediaSource.hash` first (a cached value on the doc) and falls
+   back to a fresh `cache_key` call. So docs that don't carry the
+   source hash on disk pay one stat call per propose. Negligible
+   for the highlight workflow (a propose batch is typically a
+   handful of specs).
 
 ---
 
-## 8. Spec deviations and their reasons
+## 8. Spec deviations and reasons (this pass)
 
-1. **Clip has 4 fields, not 3.** The spec lists `Clip(source_path,
-   source_start, source_end)` with "Word-boundary snapping at
-   construction." We added `reason: str = ""` as a 4th field so
-   `AddCut.reason` persists in v3 JSON without inventing a parallel
-   `cut_log` structure. The "word-boundary snapping at construction"
-   guidance can't literally apply to Clip in isolation (Clip has no
-   view of word timestamps); snapping continues to live in
-   `core/render.py`'s `_snap_ranges_to_word_boundaries`, run per-run
-   on the non-monotonic path.
-2. **`Document.main_timeline` is a derived `@property`, not a
-   replacement field.** The spec says "main_timeline: Timeline replaces
-   v2's ranges." We kept `ranges` as the in-memory storage field
-   (preserves the entire test surface — 50+ Document construction
-   sites, 6 `replace(doc, ranges=...)` callsites in editing.py — and
-   keeps the MCP server from commit `f9c06f5` working without changes)
-   and made `main_timeline` a derived view. The on-disk JSON shape
-   change (the v3 migration) is real; the in-memory shape change
-   is deferred. Renderer and editor branch on
-   `main_timeline.is_source_monotonic()`, which works correctly off
-   the in-memory `ranges` (a non-monotonic v3 fixture leaves `ranges`
-   non-sorted, so the property correctly reports non-monotonic).
-3. **GUI was retrofitted in the final pass.** The earlier schema-v3
-   commit deferred this; the final commit closes it. `TranscriptView`
-   branches on `is_source_monotonic`, the editor pane disables editing
-   on non-monotonic with the documented tooltip, and a hash-snapshot
-   test guarantees the monotonic render hasn't drifted. The waveform
-   strip is the one piece that still falls through to the v2 view (see
-   §7.2) — deferred to 6b.
-
-### 6a debt that 6b should clear
-
-- **Clip.reason is a 6a-scoped concession.** The 4th field on
-  :class:`Clip` carries `AddCut.reason` so it round-trips through v3
-  JSON. 6b will likely want a richer `cut_log` / `move_log` structure
-  on :class:`Document` so a re-arrangement command (`MoveClip`,
-  whatever its shape) can record both the move's rationale and the
-  source/destination indices without piggy-backing on Clip's reason
-  field. When that ships, Clip's reason can stay as a per-clip note
-  while structural edits live in the log.
-- **`Document.main_timeline` is a derived `@property`, not a real
-  field.** Trigger condition for finishing the migration: any future
-  `Clip` field that can't be expressed on the legacy `Range` type.
-  Multi-source is the concrete case — once a Document holds clips from
-  two source paths, the `Range.source_id` indirection through
-  `doc.sources` breaks down (each clip needs its own path on the wire,
-  which it has, but the in-memory `ranges` list can't carry it). At
-  that point `main_timeline` becomes the storage field and `ranges`
-  flips to a derived compatibility view (or is dropped if no caller
-  still needs it).
+1. **Section A's literal grep gate is unreachable.** The spec said
+   `grep -rn "parent_document_state_hash" core/ tests/ mcp_server/
+   ui_qt/` should return nothing post-Section-A. That's impossible:
+   the proposal subsystem (`core/proposal.py`,
+   `mcp_server/schemas.py` proposal models, `mcp_server/server.py`
+   proposal tool descriptions, `ui_qt/components/proposal_review_pane.py`)
+   correctly uses `parent_document_state_hash` for proposals,
+   where the semantics are right (proposals SHOULD invalidate on
+   intra-doc edits — they're document-state operations). The
+   rename was correctly scoped to highlights only per spec A.1.
+   The grep gate was treated as the spirit (no leftover highlight
+   references that should be `parent_source_hash`), not the
+   literal (zero global hits).
+2. **`HighlightRenderResult` lives in `core/highlight.py`, not a
+   separate module.** Mirrors the `core/proposal.py` shape where
+   `Proposal` and `ApplyResult` live in the same module. Spec
+   didn't dictate; the bundling keeps the highlight artifacts
+   discoverable from one import.
+3. **`render_highlight` return type changed.** Spec said
+   `apply_highlight` should "wire `render_highlight` to return the
+   metadata if it doesn't already." The old function returned a
+   bare `Path`; we changed it to return
+   `HighlightRenderMetadata(output_path, face_detection_used,
+   crop_box, parent_source_hash)`. Existing callers in tests
+   adapted. This is the cleaner shape; the callsites are all
+   in-repo.
+4. **MCP `apply_highlight`'s exception catch is `except Exception`
+   rather than a tight whitelist.** Spec implied per-error-type
+   surface. As shipped, RuntimeError + OSError + everything-else
+   all land as `RENDER_FAILED`; `StaleHighlightError` (specific)
+   and `FileNotFoundError` (specific) are caught earlier. The
+   reason: ffmpeg / smartcut / PyAV raise heterogeneous types
+   that don't share a stable parent class. Detailed in §7.5.
+5. **Section A added a defensive test alongside the v1-refusal
+   test** (`test_render_does_not_invalidate_on_intra_doc_edit`),
+   not strictly required by spec but locks the load-bearing
+   distinction so a future regression to v1 semantics fails loudly.
 
 ---
 
-## 9. Smartcut non-monotonic spike — verdict
+## 9. Smoke result (Section D)
 
-**Gate: YELLOW. Option 1 with run-batching adopted.**
+Driven against
+`/Volumes/Aaron 4TB/531 Podcast Aaron & Barret Autocut only.mp4`
+using the existing `~/Desktop/...transcribe.json` (re-pointed to
+the 4TB volume's media path). Two highlights authored via
+`propose_highlights`, both rendered via `apply_highlight`:
 
-| Approach | Wall | Output dur. | Re-encode | Verdict |
-|---|---:|---:|:---|:---|
-| smartcut direct (single non-monotonic call) | 11.4 s | 100.0 s (wrong) | No | broken |
-| smartcut per-segment + ffmpeg concat demuxer | 20.7 s | 90.02 s (correct, A/V drift 5.3 ms) | No | correct, slow |
-| ffmpeg `-ss/-t` per-segment + concat | 3.4 s | 91.10 s (1.1 s drift) | No | GOP-aligned drift |
+| highlight | span | reframe | captions | face_detection_used | wall clock | output dur. |
+|-----------|------|---------|----------|---------------------|-----------:|------------:|
+| 165207-8fbdf819 | 120.0 – 135.0 s | speaker_locked | on  | speaker_locked | 38.56 s | 15.55 s |
+| 165207-e7675453 | 300.0 – 345.0 s | speaker_locked | off | speaker_locked | 46.08 s | 45.75 s |
 
-Root cause of the broken direct call:
-`smartcut.cut_video.make_cut_segments` walks GOPs in source order with
-a single linear pointer through `positive_segments`; unsorted input
-silently drops or duplicates segments. Smartcut absolutely requires
-sorted non-overlapping input.
+Both .mp4 outputs at 1080 × 1920 H264. Output durations land
+within ~600 ms of the requested span — that's the
+word-boundary outward-snap + 100 ms pad on each side, by design
+(see `docs/PRODUCTION_RULES.md`). Render-result sidecars round-trip
+through `read_highlight_render`; both sidecars have honest
+`face_detection_used` values (real face detection succeeded on the
+podcast's interview shot).
 
-Decision: source-monotonic timelines stay on the v2 fast path
-(byte-identical output). Non-monotonic timelines split into runs;
-each run is one smartcut call (sorted by construction); per-run
-outputs concat with ffmpeg's concat demuxer (stream-copy, no
-re-encode). Cost is `O(order_breaks + 1)` smartcut invocations.
-30 ms `afade` post-pass covers every join in the final output,
-including the run-boundary joins.
-
----
-
-## 10. Stop-and-report (per-spec)
-
-**1. MediaContainer reuse outcome + wall-clock delta.**
-
-Implemented. The `_render_non_monotonic` path keeps a
-`dict[Path, MediaContainer]` cache keyed by `source_path` and reuses
-the entry across runs that share a source. The reuse is safe — the
-spike confirmed no state corruption (first call's output sizes
-captured before disk filled were correct). Measured savings on the
-HEVC 10-bit 5-min source: 3 sequential calls dropped from **20.7 s
-(fresh container per call) to 13.5 s (shared container)** — about
-**35 % wall-clock improvement**. Most of the saving is the per-call
-demux cost on the heavy fixture; on lighter H.264 sources the
-absolute saving is smaller but the relative ratio likely similar. We
-could not run the comparison on the synthetic fixture (the test
-suite uses it for correctness, not perf).
-
-**2. Concat demuxer codec param mismatch.**
-
-Never observed. Every intermediate in a single render comes from
-smartcut applied to the same MediaContainer with `audio_settings=
-[AudioExportSettings(codec="passthru")]` and `VideoSettings(SMARTCUT,
-NORMAL, "copy")`. Codec parameters match by construction. The concat
-demuxer's `-c copy` is therefore safe and lossless for every
-single-source render. **If the multi-source future arrives**, the
-concat demuxer can balk on parameter drift between sources and we'd
-need the concat filter (with one re-encode generation). For 6a's
-single-source-only assumption, no balk path is reachable.
-
-**3. Run-splitting subtleties.**
-
-A few that turned out subtler than the spec assumed:
-
-- **Touching joins (`a.end == b.start`) are monotonic.**
-  `is_source_monotonic` uses strict less-than (`source_start <
-  prev_end` → False). v2 timelines after `subtract_interval` /
-  `union_interval` produce ranges that often touch exactly; treating
-  those as non-monotonic would route every touching-edges v2 doc into
-  the slow path. Strictly less-than is the right call.
-- **The spike schedule splits into 2 runs, not 3.**
-  `[(60,90), (0,30), (180,210)]` factors into `[(60,90)]` and
-  `[(0,30), (180,210)]` — the third clip's source_start (180) is ≥
-  the second clip's source_end (30), so it joins the second run.
-  Worst-case run count is `O(clips)` only when each clip's start is
-  strictly less than its predecessor's end; "out of order" doesn't
-  imply "needs its own run" by itself. Tested.
-- **`_resolve_keep_ranges` reads `doc.ranges`, not a Timeline.** The
-  v2 keep-range pipeline (snap-to-word-boundary, asymmetric pad,
-  merge_gap) operates on `Range` objects. Per-run, we project a
-  `Document` whose `ranges` field is just that run's clips re-
-  expressed as Range objects, then run the pipeline. Keeps the
-  pipeline reusable across the monotonic and non-monotonic paths
-  without duplication.
-- **Multi-source runs are independent.** `split_into_monotonic_runs`
-  starts a new run when `source_path` changes, even if the new
-  source's clips would otherwise be sorted. This is correct for
-  multi-source compositions (each source's MediaContainer is
-  independent) but means a `[srcA, srcA, srcB, srcA, srcA]`
-  schedule produces 3 runs, not 2 — the renderer can't fold the two
-  `srcA` chunks back together because the playlist intent says
-  "play srcB between them." Documented in `split_into_monotonic_runs`'s
-  docstring.
+Highlights panel verified programmatically: loads the doc,
+populates 2 cards, both show "Rendered." status, both Open
+buttons enabled, doc swap clears the panel.
 
 ---
 
-## 11. What 6a shipped (cumulative)
+## 10. Definition-of-done checklist
 
-- ✅ Smartcut spike committed; gate reported YELLOW; option 1 picked.
-- ✅ Schema v3: `Clip`, `Timeline`, `is_source_monotonic`, run-splitting.
-- ✅ v1 → v2 → v3 migration in `Document.from_json`; v3 emit in `to_json`.
-- ✅ `AddCut.reason: str | None = None`; persisted on neighbour range.
-- ✅ Non-monotonic guard on `AddCut` / `RestoreRange` / `CutWordRange`.
-- ✅ Run-batched renderer with MediaContainer reuse + unified fade pass
-     across all joins (within-run + run-boundary).
-- ✅ MCP server foundation (commit `f9c06f5`).
-- ✅ Qt editor v3-aware: playlist-order rendering on non-monotonic with
-     visible clip boundaries; edit actions disabled with documented
-     tooltip; export remains enabled; monotonic render byte-identical
-     under hash snapshot.
-- ✅ MCP `get_timeline` tool (8th tool); `get_ranges` retained with
-     lossy-flag; `apply_cuts` / `restore_ranges` refuse non-monotonic
-     with stable `EDIT_NOT_SUPPORTED` code.
-- ✅ `docs/PHASE_6A_SMOKE.md` — 11-step manual checklist for Claude
-     Desktop end-to-end.
-- ✅ All 602 tests pass (529 prior + 30 MCP-foundation + 29 schema-v3
-     + 14 final). Ruff clean for changed files. Both GUI entry points
-     and the MCP entry import cleanly.
+### Section A — stale-guard fix
 
-## 12. What's next (Phase 6b candidates)
+- [x] `parent_document_state_hash` → `parent_source_hash` on
+      `Highlight` dataclass and JSON schema.
+- [x] Authoring time populates from parent doc's `MediaSource.hash`
+      or recomputes via `core.cache.cache_key`.
+- [x] Render time compares against live `cache_key(span_source_path)`.
+- [x] `Highlight.SCHEMA_VERSION = 2`.
+- [x] v1 raises `UnsupportedSchemaError` with re-propose message.
+- [x] Tests updated; v1-refusal test added; intra-doc-edit-doesn't-
+      invalidate test added.
+- [x] Production rules note added.
 
-- **Re-arrangement edit commands.** The smallest viable shape is
-  `MoveClip(from_index: int, to_index: int)` operating on
-  `Document.main_timeline.clips`. It's the first command that would
-  legitimately produce a non-monotonic timeline, and the editor's
-  6a-locked safety nets (NotImplementedError + the Qt "disabled with
-  tooltip" UX) become the right surface to *un-block* once it lands.
-- **`cut_log` / `move_log` storage on Document.** A flat append-only
-  list of edit entries (rationale + which structural change + when)
-  so MCP analysis tools can show the user *why* the document is in
-  the shape it's in. Replaces Clip.reason as the long-term home for
-  cut rationale (Clip.reason can stay as a per-clip annotation).
-- **Waveform v3 reader.** Pair with the rearrangement UX: clip
-  boundaries on the strip, a clear visual difference between "this
-  span is cut" and "this span is kept but plays later in the
-  playlist."
-- **Multi-source compositions.** Trigger to flip `main_timeline` from
-  `@property` to real field — see §8 6a-debt note.
-- **MCP analysis tools.** First candidate from the prior MCP-only
-  6a report: `find_silences(json_path, min_duration_s=0.5)`. Mechanical,
-  unambiguously actionable, completes the cleanup loop without needing
-  any model judgement.
+### Section B — 6c-2 MCP tools
 
-## 13. Definition-of-done checklist
+- [x] `mcp_server/tools/highlights.py` with six tools.
+- [x] Four error codes: `HIGHLIGHT_NOT_FOUND`,
+      `RENDER_RESULT_NOT_FOUND`, `INVALID_HIGHLIGHT`,
+      `STALE_HIGHLIGHT`. (`RENDER_FAILED` was pre-existing from
+      Phase 6a's render path.)
+- [x] Schemas: `HighlightSpec`, `HighlightOut` (via
+      `HighlightSummary`), `RenderHighlightResult` (split into
+      `ApplyHighlightResult` for the apply path + `RenderResultSummary` /
+      `ReadHighlightRenderResult` for the read paths),
+      `RenderResultOut` (also split for the listing vs full-read
+      distinction).
+- [x] Render-result sidecar shape recorded by
+      `apply_highlight`; `face_detection_used` set honestly.
+- [x] Tests in `tests/test_phase_6c2.py` (23 tests, 17 fast + 6
+      slow). Covers happy path, every error code, idempotent
+      re-render, stale-source guard, render-result round-trip.
+- [x] Tool count rises 14 → 20; lock test updated.
+- [x] `python main_mcp.py` boots and lists 20 tools.
+- [x] Sidecar responsibility split documented (highlight owns
+      "where my mp4 is"; render-result owns "what happened on
+      this run") — see §6.
 
-- [x] Smartcut spike script committed with docstring covering inputs,
-      schedule, and YELLOW → option-1+batching outcome.
-- [x] v2 → v3 migration round-trip lossless on existing v2 fixtures.
-      `is_source_monotonic` truth table tested across 8 cases.
-- [x] Run-splitting algorithm: empty / monotonic / spike-schedule /
-      worst-case / multi-source / playlist-order-preservation tested.
-- [x] Non-monotonic synthetic render: duration ±50 ms, audio sync ≤ 10 ms.
-      Fast path against the synthetic fixture confirmed unchanged.
-- [x] `AddCut.reason` persists through save/load (with attach-to-
-      neighbour heuristic mirroring v1→v2 migration).
-- [x] Editing on non-monotonic timelines raises `NotImplementedError`.
-- [x] All 529 prior tests stay green; 73 new (30 MCP + 29 schema v3 +
-      14 final) — 602 total.
-- [x] `python main.py` and `python main_qt.py` import cleanly; `python
-      main_mcp.py` starts and lists 8 tools (now including `get_timeline`).
-- [x] Qt editor: monotonic render locked under hash snapshot;
-      non-monotonic renders in playlist order with boundary marker;
-      edit actions disabled with `Editing non-monotonic timelines is
-      not yet supported (Phase 6b).` tooltip.
-- [x] MCP `get_timeline` tool added; `get_ranges` annotated as lossy
-      with `is_source_monotonic` flag; `apply_cuts` / `restore_ranges`
-      refuse non-monotonic with stable `EDIT_NOT_SUPPORTED` code.
-- [x] `docs/PHASE_6A_SMOKE.md` — 11-step Claude Desktop checklist.
-- [x] Ruff clean for changed files.
-- [x] STATE.md updated — final pass deliverables, debt notes,
-      6b candidates.
+### Section C — 6c-3 GUI panel
+
+- [x] `ui_qt/components/highlights_panel.py` — `HighlightsPanel`
+      and `_HighlightCard` widgets.
+- [x] Render runs in a `QThread` per card with progress bar +
+      greyed-out Render button while in flight.
+- [x] Open button gated on `rendered_output_path` existing on
+      disk; uses `QDesktopServices.openUrl`.
+- [x] Auto-refresh on render completion (the affected card's
+      sidecar is re-read; no full panel rebuild).
+- [x] `MainWindow` plumbing: View → Highlights toggle, dock
+      hidden by default, clears on doc swap, auto-shows once
+      per session per doc on doc-load with at least one highlight.
+- [x] No accept/reject controls (read-only design).
+- [x] Caption ASS style locked: Arial 56, white-on-black-3px,
+      bottom-center, 80 px margin (`CAPTION_FORCE_STYLE`).
+      Per-highlight overrides documented as Phase 7+.
+- [x] Vertical-composition Phase 7+ debt called out in
+      `compute_speaker_locked_crop` docstring.
+- [x] Tests in `tests/test_phase_6c3.py` (8 tests, all fast,
+      headless Qt). Covers no-doc state, empty state, card per
+      highlight, Open-disabled-until-rendered, auto-show signal
+      contract, doc-swap clears, render-button worker plumbing.
+
+### Section D — smoke + STATE + commits
+
+- [x] D.1 — real-fixture smoke executed; both .mp4 outputs at
+      1080 × 1920, durations within ~600 ms of expected;
+      `face_detection_used` populated honestly.
+- [x] D.2 — `docs/PHASE_6C_SMOKE.md` 10-step checklist for
+      Claude Desktop covering propose → render → GUI inspect.
+- [x] D.3 — STATE.md rewritten in place.
+- [x] All 771 tests green except the pre-existing waveform
+      failure on `main`.
+- [x] `python main.py` / `python main_qt.py` /
+      `python main_mcp.py` import + start cleanly.
+- [x] D.4 — commits at logical boundaries (this commit + the
+      preceding A/B/C commits).
+
+---
+
+## 11. What's deliberately not addressed (Phase 7+ debt)
+
+- **Per-highlight caption-style overrides.** Constants today;
+  per-call style is Phase 7+ alongside the GUI affordance to
+  author it.
+- **Dynamic speaker tracking.** One face-detection sample at the
+  span's midpoint, static crop for the duration. Per-frame
+  tracking + audio-driven speaker selection are Phase 7+.
+- **Multi-source highlights.** A highlight references one source
+  path; multi-source compositions are Phase 7+ work that requires
+  the run-batched renderer's multi-source path (currently flagged
+  in §7.5 of the prior STATE.md as concat-demuxer fragile).
+- **Sub-full-height vertical crop.** Source-aspect ≥ 9:16 today
+  forces the crop to fill source height, so vertical placement
+  follows the source. Sub-full-height crop with a face-driven
+  vertical center is Phase 7+.
+- **Async / streaming `apply_highlight`.** Synchronous over MCP
+  today; long renders block Claude Desktop. Async variant is
+  Phase 7+.
+
+---
+
+## 12. What's next (after Phase 6c)
+
+The 6b/6c roadmap items still open from prior STATEs survive this
+pass unchanged:
+
+- **`apply_proposal` UX for "all rejected" runs** (defer; only
+  bites at scale).
+- **Editor-side rearrangement UX** — drag-to-reorder in
+  `TranscriptView`'s playlist-order render, hooked through
+  `MoveClipSpan` writing fresh proposal files.
+- **Waveform v3 reader** — clip boundaries + visual difference
+  between "this span is cut" and "this span is kept but plays
+  later in the playlist."
+- **Multi-source compositions** — flips
+  `Document.main_timeline` from `@property` to real field; see
+  prior STATE §8 6a-debt note.
+- **MCP analysis tools** — `find_silences(json_path,
+  min_duration_s=0.5)` is the next mechanical pickup that
+  closes the cleanup loop without needing model judgement.
+
+The highlight-specific Phase 7+ list above (caption overrides,
+dynamic tracking, multi-source highlights, async apply) layers on
+top.
