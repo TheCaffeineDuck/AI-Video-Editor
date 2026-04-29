@@ -173,7 +173,7 @@ def test_load_document_returns_summary(tmp_path):
     assert summary.duration_s == 4.0
     assert summary.word_count == 4
     assert summary.range_count == 1
-    assert summary.schema_version == 2
+    assert summary.schema_version == 3
 
 
 def test_load_document_missing_file(tmp_path):

@@ -392,25 +392,27 @@ def render_cut(
     """Render ``doc`` with its keep-ranges to ``output_path``.
 
     ``pad_lead`` widens each kept range on its start side; ``pad_trail``
-    on its end side. Both default to 100ms. The asymmetric defaults are
-    intentional: leading time before a kept range is "breath before the
-    next word" (too much drags pacing); trailing time is "decay of the
-    previous word" (too little clips consonants). Phase 4f-1 surfaces
-    them independently so per-project tuning is possible.
+    on its end side. Both default to 100ms.
 
-    ``audio_fade_ms`` (default 30) controls a linear ``afade`` applied at
-    every internal segment join. 30ms is below conscious "fade"
-    perception but above the threshold needed to suppress click/pop
-    discontinuities at sample boundaries. Values >50 are flagged with a
-    warning. 0 disables fades entirely.
+    ``audio_fade_ms`` (default 30) controls a linear ``afade`` applied
+    at every internal segment join — including the new run-boundary
+    joins introduced by the non-monotonic path. 30ms is below conscious
+    "fade" perception but above the threshold needed to suppress
+    click/pop discontinuities. Values >50 are flagged with a warning.
+    0 disables fades entirely.
 
-    ``pad`` is deprecated as of Phase 4f-1: passing a non-``None`` value
-    sets both ``pad_lead`` and ``pad_trail`` and emits a
-    :class:`DeprecationWarning`.
+    ``pad`` is deprecated as of Phase 4f-1.
 
-    Empty ``doc.ranges`` → :class:`ValueError` ("nothing to render").
-    Ranges that fully cover the source duration → byte-for-byte copy
-    (no edit ⇒ no transcoding). Otherwise smartcut + optional fade pass.
+    Empty ``doc.ranges`` → :class:`ValueError`.
+    Phase 6a (schema v3): ``main_timeline.is_source_monotonic()`` decides
+    the path. Monotonic timelines (everything 6a editing produces) take
+    the legacy single-call smartcut path — byte-for-byte identical to
+    pre-6a output, including the full-coverage ``shutil.copy2``
+    shortcut. Non-monotonic timelines (only reachable via hand-built v3
+    fixtures or 6b's rearrangement commands) split into source-monotonic
+    runs; each run is one smartcut call; runs concat with ffmpeg's
+    stream-copy concat demuxer; a single ``afade`` post-pass covers
+    every join, including the run-boundary ones the spec calls out.
     """
     if pad is not None:
         warnings.warn(
@@ -434,13 +436,55 @@ def render_cut(
     if not doc.ranges:
         raise ValueError("Document has no ranges to render")
 
+    output_path = Path(output_path)
+
+    if doc.main_timeline.is_source_monotonic():
+        return _render_monotonic(
+            doc,
+            output_path,
+            on_progress=on_progress,
+            pad_lead=pad_lead,
+            pad_trail=pad_trail,
+            merge_gap=merge_gap,
+            audio_fade_ms=audio_fade_ms,
+        )
+    return _render_non_monotonic(
+        doc,
+        output_path,
+        on_progress=on_progress,
+        pad_lead=pad_lead,
+        pad_trail=pad_trail,
+        merge_gap=merge_gap,
+        audio_fade_ms=audio_fade_ms,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Monotonic fast path (the v2 behaviour, lifted into a helper)
+# ---------------------------------------------------------------------------
+
+
+def _render_monotonic(
+    doc: Document,
+    output_path: Path,
+    *,
+    on_progress: Callable[[float], None] | None,
+    pad_lead: float,
+    pad_trail: float,
+    merge_gap: float,
+    audio_fade_ms: int,
+) -> Path:
+    """Single-call smartcut path, identical to v2's render_cut body.
+
+    Pre-6a Documents and every 6a-edited Document are source-monotonic
+    by construction; this is the path they hit. Output is byte-identical
+    to v2's render output for the same input.
+    """
     source = _select_single_source(doc)
     if not source.path.is_file():
         raise FileNotFoundError(
             f"MediaSource path does not exist: {source.path}"
         )
-
-    output_path = Path(output_path)
 
     if _is_full_coverage(doc.ranges, source.duration):
         shutil.copy2(source.path, output_path)
@@ -456,8 +500,6 @@ def render_cut(
             "Ranges + padding produced no keep-range to render"
         )
 
-    # Smartcut imports are deferred so importing core.render is cheap in
-    # tests that exercise only the helpers.
     from smartcut.cut_video import (
         AudioExportInfo,
         AudioExportSettings,
@@ -515,3 +557,283 @@ def render_cut(
                 pass
 
     return output_path
+
+
+# ---------------------------------------------------------------------------
+# Non-monotonic path (Phase 6a) — split into runs, smartcut each, concat
+# ---------------------------------------------------------------------------
+
+
+def _render_non_monotonic(
+    doc: Document,
+    output_path: Path,
+    *,
+    on_progress: Callable[[float], None] | None,
+    pad_lead: float,
+    pad_trail: float,
+    merge_gap: float,
+    audio_fade_ms: int,
+) -> Path:
+    """Run-batched render for non-monotonic v3 timelines.
+
+    Algorithm:
+
+    1. Split ``doc.main_timeline`` into maximal source-monotonic runs.
+       Each run is a contiguous slice of the playlist whose clips share
+       a source path and walk source-time forward without overlap.
+    2. For each run, compute the run's effective keep-ranges (the same
+       word-boundary snap + asymmetric pad + merge_gap pipeline as the
+       monotonic path) and feed them as one ``smart_cut`` call producing
+       a temp file. **Smartcut MediaContainer is reused** across runs
+       that share a source path — the YELLOW spike showed each fresh
+       container costs ~7s of HEVC 10-bit demux on the heavy fixture;
+       reuse drops 3 calls from 20.7s to 13.5s on that source.
+    3. Concat the per-run temp files with ffmpeg's concat demuxer
+       (stream-copy, no re-encode).
+    4. Compute every join time in the *final* output (within-run joins
+       across all runs, plus the run-to-run boundary joins) and apply
+       one unified ``afade`` pass via :func:`_apply_audio_fades`. This
+       satisfies the spec's "concat boundaries are new cut edges and
+       need the same 30 ms fade treatment."
+    5. Progress is merged across runs weighted by per-run output
+       duration so the caller sees a single 0.0–1.0 stream.
+    """
+    from core.timeline import split_into_monotonic_runs
+
+    timeline = doc.main_timeline
+    runs = split_into_monotonic_runs(timeline)
+    if not runs:
+        raise ValueError("Document has no ranges to render")
+
+    # Per-run resolution: every run reuses the doc's segments + sources
+    # for word-boundary snap and source duration lookup; the only thing
+    # that changes between runs is which clips participate.
+    per_run_keeps: list[list[tuple[float, float]]] = []
+    per_run_source_paths: list[Path] = []
+    per_run_durations: list[float] = []
+    for run_tl in runs:
+        # All clips in a run share source_path by construction.
+        run_source_path = run_tl.clips[0].source_path
+        run_doc = _project_doc_for_run(doc, run_tl)
+        keeps = _resolve_keep_ranges(
+            run_doc,
+            pad_lead=pad_lead,
+            pad_trail=pad_trail,
+            merge_gap=merge_gap,
+        )
+        if not keeps:
+            raise ValueError(
+                f"Ranges + padding produced no keep-range for run "
+                f"{run_source_path.name}"
+            )
+        per_run_keeps.append(keeps)
+        per_run_source_paths.append(run_source_path)
+        per_run_durations.append(sum(e - s for s, e in keeps))
+
+    total_run_duration = sum(per_run_durations)
+    if total_run_duration <= 0:
+        raise ValueError("Non-monotonic render produced zero total duration")
+
+    from smartcut.cut_video import (
+        AudioExportInfo,
+        AudioExportSettings,
+        VideoExportMode,
+        VideoExportQuality,
+        VideoSettings,
+        smart_cut,
+    )
+    from smartcut.media_container import MediaContainer
+
+    video_settings = VideoSettings(
+        VideoExportMode.SMARTCUT, VideoExportQuality.NORMAL, "copy"
+    )
+
+    # Reusable MediaContainer cache, keyed by source path. The spike
+    # confirmed reuse is safe (no observable state corruption) and the
+    # demux-cost saving is meaningful on heavy sources.
+    containers: dict[Path, MediaContainer] = {}
+    has_audio = False  # tracked for the final fade decision
+
+    workdir = output_path.parent
+    intermediates: list[Path] = []
+    audio_track_count: int = 0
+
+    progress_done = 0.0  # cumulative output seconds completed across runs
+    run_progress_carry = [0.0]  # mutable cell for closure access
+
+    def _make_run_progress(run_total_s: float) -> Callable[[float], None] | None:
+        """A per-run progress callback that maps the run's 0..1 onto a
+        weighted slice of the global progress space.
+        """
+        if on_progress is None:
+            return None
+        run_index_total = total_run_duration
+
+        def _emit(fraction: float) -> None:
+            run_progress_carry[0] = max(0.0, min(1.0, fraction))
+            global_fraction = (
+                progress_done + run_progress_carry[0] * run_total_s
+            ) / run_index_total
+            on_progress(max(0.0, min(1.0, global_fraction)))
+
+        return _emit
+
+    try:
+        # Per-run smartcut call.
+        for i, (run_keeps, src_path, run_dur) in enumerate(
+            zip(per_run_keeps, per_run_source_paths, per_run_durations, strict=False)
+        ):
+            container = containers.get(src_path)
+            if container is None:
+                container = MediaContainer(str(src_path))
+                containers[src_path] = container
+
+            audio_track_count = max(audio_track_count, len(container.audio_tracks))
+            has_audio = has_audio or bool(container.audio_tracks)
+            audio_settings = [
+                AudioExportSettings(codec="passthru")
+                for _ in container.audio_tracks
+            ]
+            audio_export_info = AudioExportInfo(output_tracks=audio_settings)
+            fraction_keeps = [
+                (_to_fraction_seconds(s), _to_fraction_seconds(e))
+                for s, e in run_keeps
+            ]
+
+            inter = workdir / f"{output_path.stem}.run{i}{output_path.suffix}"
+            adapter = _ProgressAdapter(_make_run_progress(run_dur))
+            try:
+                exc = smart_cut(
+                    container,
+                    fraction_keeps,
+                    str(inter),
+                    audio_export_info=audio_export_info,
+                    video_settings=video_settings,
+                    progress=adapter,
+                    log_level="error",
+                )
+                if exc is not None:
+                    raise exc
+            finally:
+                adapter.finalize()
+            intermediates.append(inter)
+            progress_done += run_dur
+            run_progress_carry[0] = 0.0
+
+        # Concat the per-run intermediates via the ffmpeg concat demuxer
+        # (stream-copy, no re-encode).
+        concat_target = (
+            workdir / f"{output_path.stem}.concat{output_path.suffix}"
+            if audio_fade_ms > 0 and has_audio
+            else output_path
+        )
+        _ffmpeg_concat_demuxer(intermediates, concat_target)
+
+        # Build the unified join list across all runs in playlist order.
+        # Every keep-range edge that isn't the file's outer boundary is a
+        # join in the final output — which sweeps in both within-run
+        # joins and the run-to-run boundary joins.
+        all_keeps_in_playlist_order: list[tuple[float, float]] = []
+        for run_keeps in per_run_keeps:
+            all_keeps_in_playlist_order.extend(run_keeps)
+        joins = _join_times_in_output(all_keeps_in_playlist_order)
+        needs_fade = audio_fade_ms > 0 and bool(joins) and has_audio
+
+        if needs_fade:
+            try:
+                _apply_audio_fades(concat_target, output_path, joins, audio_fade_ms)
+            finally:
+                try:
+                    concat_target.unlink()
+                except FileNotFoundError:
+                    pass
+
+        if on_progress is not None:
+            on_progress(1.0)
+        return output_path
+    finally:
+        for inter in intermediates:
+            try:
+                inter.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _project_doc_for_run(doc: Document, run_timeline: Timeline) -> Document:  # noqa: F821
+    """Build a Document-like projection holding only the run's ranges.
+
+    ``_resolve_keep_ranges`` reads ``doc.ranges`` to compute the
+    per-source keep-range pipeline. For the non-monotonic path we want
+    the same pipeline applied per-run, so we hand it a Document whose
+    ranges field is just this run's clips (in their playlist order,
+    which is also source-monotonic by construction). All other fields
+    pass through unchanged so segments-driven word-boundary snapping
+    still sees every word.
+    """
+    from dataclasses import replace as _replace
+
+    # Map each Clip back to its source_id by scanning the original
+    # ranges. The clip's source_path identifies the source registry
+    # entry; we pick the first matching range to read its source_id.
+    src_path_to_id: dict[Path, str] = {}
+    for sid, src in doc.sources.items():
+        src_path_to_id.setdefault(src.path, sid)
+
+    run_ranges: list[Range] = []
+    for c in run_timeline.clips:
+        sid = src_path_to_id.get(c.source_path)
+        if sid is None:
+            raise ValueError(
+                f"clip references source_path {c.source_path!r} not in doc.sources"
+            )
+        run_ranges.append(
+            Range(source_id=sid, start=c.source_start, end=c.source_end, reason=c.reason)
+        )
+    return _replace(doc, ranges=run_ranges)
+
+
+def _ffmpeg_concat_demuxer(intermediates: list[Path], output_path: Path) -> None:
+    """Glue ``intermediates`` into ``output_path`` via stream-copy.
+
+    The concat demuxer is the right tool when every intermediate was
+    produced from the same source via smartcut: codec parameters match
+    by construction, so ``-c copy`` is safe and lossless. If the inputs
+    ever differ in codec params (a multi-source future), this errors
+    loudly; we'd need to switch to the concat *filter* and accept a
+    re-encode for that path.
+    """
+    if not intermediates:
+        raise ValueError("ffmpeg concat called with no intermediates")
+    list_path = output_path.parent / f"{output_path.stem}.concat.txt"
+    list_path.write_text(
+        "\n".join(f"file '{p.resolve()}'" for p in intermediates) + "\n",
+        encoding="utf-8",
+    )
+    ffmpeg = get_ffmpeg_path()
+    cmd = [
+        str(ffmpeg),
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(list_path),
+        "-c",
+        "copy",
+        str(output_path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    finally:
+        try:
+            list_path.unlink()
+        except FileNotFoundError:
+            pass
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg concat demuxer failed (rc={result.returncode}): "
+            f"{result.stderr[-400:]}"
+        )

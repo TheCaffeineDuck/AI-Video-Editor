@@ -64,23 +64,80 @@ class EditCommand(Protocol):
 # ---------------------------------------------------------------------------
 
 
+def _require_monotonic(doc: Document, command_name: str) -> None:
+    """Raise NotImplementedError if the document's timeline is non-monotonic.
+
+    The v3 timeline allows non-monotonic playlists (clips visiting the
+    source out of order); 6a's editing commands explicitly do not
+    handle that case yet. The check runs at apply time, not at command
+    construction, because a Document might transition from monotonic
+    to non-monotonic between construction and apply (e.g., a user
+    loaded a different file). Single, explicit failure mode.
+    """
+    if not doc.main_timeline.is_source_monotonic():
+        raise NotImplementedError(
+            f"{command_name} is not supported on a non-monotonic timeline; "
+            "rearrangement-aware editing is scheduled for a later phase."
+        )
+
+
+def _attach_reason_to_neighbor(
+    ranges: list[Range], cut_start: float, cut_end: float, reason: str
+) -> list[Range]:
+    """Stamp ``reason`` onto the surviving range immediately preceding the
+    cut (or following it for cuts at file start), mirroring the v1→v2
+    migration's reason-attachment heuristic.
+
+    Returns the same list when no neighbor matches (cut consumed the
+    only range that could carry the reason). Empty / blank reason is a
+    no-op — callers passing ``None`` should not invoke this helper.
+    """
+    if not reason:
+        return ranges
+    preceding_idx: int | None = None
+    following_idx: int | None = None
+    for i, r in enumerate(ranges):
+        if abs(r.end - cut_start) < 1e-9:
+            preceding_idx = i
+            break
+    if preceding_idx is None:
+        for i, r in enumerate(ranges):
+            if abs(r.start - cut_end) < 1e-9:
+                following_idx = i
+                break
+    target_idx = preceding_idx if preceding_idx is not None else following_idx
+    if target_idx is None:
+        return ranges
+    return [
+        *ranges[:target_idx],
+        replace(ranges[target_idx], reason=reason),
+        *ranges[target_idx + 1 :],
+    ]
+
+
 @dataclass
 class AddCut:
     """Remove the interval ``[start, end]`` from the timeline.
 
-    Reduces to :func:`~core.timeline.subtract_interval`. The legacy v1
-    name is preserved so callers (and undo-history descriptions) read
-    the same; the implementation now operates on keep-ranges instead of
-    appending a CutMark.
+    Reduces to :func:`~core.timeline.subtract_interval` followed by an
+    optional ``reason`` stamp on the surviving range immediately
+    bordering the cut.
 
-    ``revert`` restores the pre-apply ``ranges`` list verbatim (captured
-    on apply) — simpler and obviously-correct than inverting the
-    subtraction in the multi-range / split case.
+    Phase 6a additions:
+
+    - ``reason: str | None``: free-form rationale. ``None`` (default)
+      records no reason. A string is persisted onto the surviving
+      neighbor range so it round-trips through ``to_json``/``from_json``.
+      The previous default of ``"manual"`` is gone — explicit None is
+      now the contract for "no reason given," distinguishing a deliberate
+      blank from the implicit "manual" stamp v2 added everywhere.
+    - Apply-time guard: raises :class:`NotImplementedError` if the
+      document's ``main_timeline`` is non-monotonic.
     """
 
     start: float
     end: float
-    reason: str = "manual"
+    reason: str | None = None
     source_id: str = _DEFAULT_SOURCE_ID
     _captured: list[Range] | None = field(default=None, repr=False, compare=False)
 
@@ -89,10 +146,15 @@ class AddCut:
         return f"Add cut [{self.start:.2f}–{self.end:.2f}]"
 
     def apply(self, doc: Document) -> Document:
+        _require_monotonic(doc, "AddCut")
         self._captured = list(doc.ranges)
         new_ranges = subtract_interval(
             doc.ranges, (self.start, self.end), self.source_id
         )
+        if self.reason:
+            new_ranges = _attach_reason_to_neighbor(
+                new_ranges, self.start, self.end, self.reason
+            )
         return replace(doc, ranges=new_ranges)
 
     def revert(self, doc: Document) -> Document:
@@ -109,9 +171,8 @@ class RestoreRange:
     something. Reduces to :func:`~core.timeline.union_interval`. The
     captured pre-apply ``ranges`` drives ``revert``.
 
-    Replaces v1's ``RemoveCut(index=…)``. v1 indexed into the cut list;
-    v2 has no cut list, so the API is now interval-based — same shape as
-    :class:`AddCut`, opposite operation.
+    Phase 6a: raises :class:`NotImplementedError` at apply time when
+    the document's ``main_timeline`` is non-monotonic.
     """
 
     start: float
@@ -124,6 +185,7 @@ class RestoreRange:
         return f"Restore range [{self.start:.2f}–{self.end:.2f}]"
 
     def apply(self, doc: Document) -> Document:
+        _require_monotonic(doc, "RestoreRange")
         self._captured = list(doc.ranges)
         new_ranges = union_interval(
             doc.ranges, (self.start, self.end), self.source_id
@@ -192,6 +254,7 @@ class CutWordRange:
         )
 
     def apply(self, doc: Document) -> Document:
+        _require_monotonic(doc, "CutWordRange")
         interval = self._resolve_interval(doc)
         self._captured = list(doc.ranges)
         new_ranges = subtract_interval(doc.ranges, interval, self.source_id)

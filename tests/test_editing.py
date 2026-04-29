@@ -32,7 +32,6 @@ from core.editing import (
     RestoreRange,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -124,11 +123,10 @@ def test_add_cut_revert_before_apply_raises():
         AddCut(start=10.0, end=11.0).revert(_doc())
 
 
-def test_add_cut_default_reason_is_manual():
-    """Reason is informational on the command instance; it doesn't have
-    to land anywhere visible since v2 reasons live on Range objects."""
+def test_add_cut_default_reason_is_none():
+    """Phase 6a: AddCut.reason defaults to None (was 'manual' in v2)."""
     cmd = AddCut(start=0.0, end=1.0)
-    assert cmd.reason == "manual"
+    assert cmd.reason is None
 
 
 def test_add_cut_description():

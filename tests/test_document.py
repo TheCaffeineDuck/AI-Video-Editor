@@ -26,7 +26,6 @@ from core.document import (
     build_document,
 )
 
-
 # ---------------------------------------------------------------------------
 # Word / Segment
 # ---------------------------------------------------------------------------
@@ -142,19 +141,23 @@ def _example_doc(**overrides) -> Document:
 
 
 def test_document_schema_version_constant():
-    assert Document.SCHEMA_VERSION == 2
+    # Phase 6a bumped to v3 (Clip/Timeline shape on disk; in-memory
+    # ``ranges`` field still drives state).
+    assert Document.SCHEMA_VERSION == 3
 
 
 # ---------------------------------------------------------------------------
-# Document.to_json / from_json — v2 round-trip
+# Document.to_json / from_json — v3 round-trip
 # ---------------------------------------------------------------------------
 
 
-def test_document_to_json_emits_schema_version_2():
+def test_document_to_json_emits_schema_version_3():
     data = _example_doc().to_json()
-    assert data["schema_version"] == 2
+    assert data["schema_version"] == 3
     assert "sources" in data
-    assert "ranges" in data
+    assert "main_timeline" in data
+    assert "clips" in data["main_timeline"]
+    assert "ranges" not in data  # v2 key gone
     assert "cuts" not in data
     assert "media_path" not in data
     assert "duration" not in data
@@ -163,7 +166,7 @@ def test_document_to_json_emits_schema_version_2():
 def test_document_to_json_is_json_serializable():
     data = _example_doc().to_json()
     parsed = json.loads(json.dumps(data))
-    assert parsed["schema_version"] == 2
+    assert parsed["schema_version"] == 3
     assert parsed["language"] == "en"
 
 
@@ -240,7 +243,7 @@ def test_from_json_missing_schema_version_raises():
         Document.from_json(payload)
     msg = str(excinfo.value)
     assert "schema_version" in msg
-    assert "2" in msg
+    assert "3" in msg  # v3-aware build's expected schema
 
 
 def test_from_json_null_schema_version_raises():
@@ -285,7 +288,8 @@ def _v1_payload(*, cuts: list[dict] | None = None, **override) -> dict:
 
 def test_migration_empty_cuts_yields_single_full_range():
     doc = Document.from_json(_v1_payload())
-    assert doc.SCHEMA_VERSION == 2
+    # v1 → v2 → v3 chain; the in-memory build version is v3.
+    assert doc.SCHEMA_VERSION == 3
     assert list(doc.sources.keys()) == ["src0"]
     assert doc.sources["src0"].path == Path("/tmp/example.wav")
     assert doc.sources["src0"].duration == 10.0
@@ -468,9 +472,9 @@ def test_build_document_serializes_with_schema_version():
         model_name="base",
     )
     data = doc.to_json()
-    assert data["schema_version"] == 2
+    assert data["schema_version"] == 3
     parsed = json.loads(json.dumps(data))
-    assert parsed["schema_version"] == 2
+    assert parsed["schema_version"] == 3
     restored = Document.from_json(parsed)
     assert restored.created_at.utcoffset().total_seconds() == 0.0
 
@@ -491,7 +495,7 @@ def test_build_document_accepts_iterable_segments():
 
 
 def test_build_document_default_initial_range_serialized():
-    """The serialized form has a single full-duration keep-range."""
+    """The serialized form has a single full-duration keep-range as a v3 clip."""
     doc = build_document(
         media_path=Path("/tmp/x.wav"),
         duration=5.0,
@@ -500,8 +504,14 @@ def test_build_document_default_initial_range_serialized():
         model_name="tiny",
     )
     payload = doc.to_json()
-    assert payload["ranges"] == [
-        {"source_id": "src0", "start": 0.0, "end": 5.0, "reason": ""}
+    assert payload["main_timeline"]["clips"] == [
+        {
+            "source_id": "src0",
+            "source_path": "/tmp/x.wav",
+            "source_start": 0.0,
+            "source_end": 5.0,
+            "reason": "",
+        }
     ]
 
 

@@ -122,7 +122,7 @@ class UnsupportedSchemaError(ValueError):
     """Raised when ``Document.from_json`` is asked to load an unknown schema."""
 
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -130,8 +130,19 @@ class Document:
     """The canonical, serializable transcription project.
 
     SRT/TXT/VTT files written next to a media file are *derivatives* of this
-    model — the editor (Phase 5+) will round-trip through Document JSON, not
-    through the subtitle files.
+    model — the editor round-trips through Document JSON, not through the
+    subtitle files.
+
+    Phase 6a (schema v3): the on-disk shape replaces v2's
+    ``ranges: [{source_id, start, end, reason}, ...]`` with
+    ``main_timeline: {clips: [{source_path, source_start, source_end, reason}, ...]}``.
+    The in-memory Document keeps ``ranges: list[Range]`` as the storage
+    field for backward compat; :attr:`main_timeline` is a derived
+    :class:`~core.timeline.Timeline` view that renderers and editors use
+    to ask `is_source_monotonic()`. The list order on ``ranges`` is
+    preserved verbatim from v3 JSON load — for hand-built non-monotonic
+    fixtures this list is *not* sorted by start, and ``main_timeline``
+    will report ``is_source_monotonic() == False`` accordingly.
 
     Frozen: callers can't reassign ``doc.sources`` / ``doc.ranges`` /
     ``doc.segments``. The inner lists are still mutable Python lists, so
@@ -149,12 +160,48 @@ class Document:
 
     SCHEMA_VERSION: ClassVar[int] = _SCHEMA_VERSION
 
+    @property
+    def main_timeline(self) -> Timeline:  # noqa: F821 — forward ref to core.timeline
+        """The v3 :class:`~core.timeline.Timeline` view derived from ``ranges``.
+
+        Each :class:`~core.document.Range` becomes one
+        :class:`~core.timeline.Clip` in playlist order. The clip's
+        ``source_path`` is looked up in ``sources`` by ``source_id``;
+        a missing source is a hard error (the document's invariant is
+        that every range references a registered source).
+
+        The view is a fresh tuple per call — cheap, but callers that
+        access it in a hot loop should cache locally.
+        """
+        from core.timeline import Clip, Timeline  # local import to avoid cycle
+        clips: list[Clip] = []
+        for r in self.ranges:
+            src = self.sources.get(r.source_id)
+            if src is None:
+                # An unregistered source is a malformed Document; raise loudly
+                # rather than synthesize a path the renderer can't validate.
+                raise ValueError(
+                    f"Range references source_id={r.source_id!r} not in "
+                    f"sources ({list(self.sources)!r})"
+                )
+            clips.append(
+                Clip(
+                    source_path=src.path,
+                    source_start=float(r.start),
+                    source_end=float(r.end),
+                    reason=r.reason,
+                )
+            )
+        return Timeline(clips=tuple(clips))
+
     def to_json(self) -> dict[str, Any]:
         """Return a plain-dict representation safe for ``json.dumps``.
 
-        Always emits ``schema_version=2``. ``source_hash`` is omitted when
-        ``None`` (kept additive so v2 Documents lacking the field load and
-        round-trip cleanly).
+        Emits ``schema_version=3`` with the v3 ``main_timeline`` shape.
+        Each clip carries its source path explicitly (a redundant copy
+        of the data in ``sources[source_id].path``, but cheap and lets
+        a future multi-source loader skip the indirection).
+        ``source_hash`` is omitted when ``None``.
         """
         out: dict[str, Any] = {
             "schema_version": self.SCHEMA_VERSION,
@@ -187,15 +234,20 @@ class Document:
                 }
                 for s in self.segments
             ],
-            "ranges": [
-                {
-                    "source_id": r.source_id,
-                    "start": r.start,
-                    "end": r.end,
-                    "reason": r.reason,
-                }
-                for r in self.ranges
-            ],
+            "main_timeline": {
+                "clips": [
+                    {
+                        "source_id": r.source_id,
+                        "source_path": str(self.sources[r.source_id].path)
+                        if r.source_id in self.sources
+                        else "",
+                        "source_start": r.start,
+                        "source_end": r.end,
+                        "reason": r.reason,
+                    }
+                    for r in self.ranges
+                ],
+            },
         }
         if self.source_hash is not None:
             out["source_hash"] = self.source_hash
@@ -207,16 +259,16 @@ class Document:
 
         Schema-version handling:
 
-        - ``schema_version == 2`` — load directly.
-        - ``schema_version == 1`` — migrate via :func:`_migrate_v1_to_v2`.
-          The migrated Document is returned in memory; **the on-disk file
-          is not rewritten**. Migration on read, write-through on next save
-          (see ``PRODUCTION_RULES.md``).
+        - ``schema_version == 3`` — load directly.
+        - ``schema_version == 2`` — migrate via :func:`_migrate_v2_to_v3`.
+        - ``schema_version == 1`` — migrate via :func:`_migrate_v1_to_v2`,
+          then :func:`_migrate_v2_to_v3`.
         - missing / null / any other integer — raise
           :class:`UnsupportedSchemaError`.
 
-        Never silently coerce across schema versions: an unknown integer
-        is a hard error, not a "best-effort" load.
+        Migrations run on read; the on-disk file is not rewritten as a
+        side effect (write-through on next save). Never silently coerce
+        across schema versions: an unknown integer is a hard error.
         """
         if "schema_version" not in data:
             raise UnsupportedSchemaError(
@@ -230,9 +282,12 @@ class Document:
                 f"This build expects schema_version={cls.SCHEMA_VERSION}."
             )
         if version == 1:
-            return _migrate_v1_to_v2(cls, data)
+            v2 = _migrate_v1_to_v2_data(data)
+            return _load_v3(cls, _migrate_v2_to_v3_data(v2))
+        if version == 2:
+            return _load_v3(cls, _migrate_v2_to_v3_data(data))
         if version == cls.SCHEMA_VERSION:
-            return _load_v2(cls, data)
+            return _load_v3(cls, data)
         raise UnsupportedSchemaError(
             f"Document JSON schema_version={version!r} is not supported "
             f"by this build (expects schema_version={cls.SCHEMA_VERSION})."
@@ -263,7 +318,14 @@ def _parse_segments(seg_data: list[dict[str, Any]]) -> list[Segment]:
     ]
 
 
-def _load_v2(cls: type[Document], data: dict[str, Any]) -> Document:
+def _load_v3(cls: type[Document], data: dict[str, Any]) -> Document:
+    """Load a v3 (or up-migrated) document.
+
+    The clip list order from JSON is preserved verbatim onto
+    ``ranges`` — for non-monotonic v3 fixtures this list will *not*
+    be sorted by start, and ``main_timeline.is_source_monotonic()``
+    will report ``False``. Edit commands branch on that.
+    """
     sources_raw = data.get("sources", {})
     sources = {
         sid: MediaSource(
@@ -274,14 +336,16 @@ def _load_v2(cls: type[Document], data: dict[str, Any]) -> Document:
         )
         for sid, s in sources_raw.items()
     }
+    main_timeline = data.get("main_timeline", {})
+    clip_dicts = main_timeline.get("clips", []) if isinstance(main_timeline, dict) else []
     ranges = [
         Range(
-            source_id=str(r["source_id"]),
-            start=float(r["start"]),
-            end=float(r["end"]),
-            reason=str(r.get("reason", "")),
+            source_id=_resolve_source_id(c, sources),
+            start=float(c["source_start"]),
+            end=float(c["source_end"]),
+            reason=str(c.get("reason", "")),
         )
-        for r in data.get("ranges", [])
+        for c in clip_dicts
     ]
     return cls(
         sources=sources,
@@ -294,36 +358,83 @@ def _load_v2(cls: type[Document], data: dict[str, Any]) -> Document:
     )
 
 
-def _migrate_v1_to_v2(cls: type[Document], data: dict[str, Any]) -> Document:
-    """Migrate a v1 Document JSON to a v2 :class:`Document` in memory.
+def _resolve_source_id(clip_dict: dict[str, Any], sources: dict[str, MediaSource]) -> str:
+    """Find the matching ``source_id`` for a v3 clip by id or path.
 
-    Single-source: the v1 ``media_path`` / ``duration`` / ``source_hash``
-    triple becomes one :class:`MediaSource` with ``id="src0"``.
+    v3 JSON carries both ``source_id`` (preferred) and ``source_path``
+    (redundant copy). When ``source_id`` is present and registered we
+    use it; otherwise we look up by path. Hand-built fixtures may pass
+    only ``source_path``.
+    """
+    sid = clip_dict.get("source_id")
+    if sid is not None and str(sid) in sources:
+        return str(sid)
+    target_path = clip_dict.get("source_path")
+    if target_path is not None:
+        for entry_id, src in sources.items():
+            if str(src.path) == str(target_path):
+                return entry_id
+    if sid is not None:
+        # Fallback: trust the id even if not registered. The Document
+        # invariant check (in main_timeline) will catch it on first use.
+        return str(sid)
+    raise ValueError(
+        f"clip {clip_dict!r} could not be resolved against sources {list(sources)!r}"
+    )
 
-    Cuts → ranges: start with the full source as one keep-range, subtract
-    each v1 cut, attach each cut's ``reason`` to the range immediately
-    preceding the cut (or the range immediately following if the cut sits
-    at the file's start). If neither exists (the cut spans the entire
-    source), drop the reason and warn — there's no surviving range to
-    attach it to.
 
-    The on-disk JSON is **not** rewritten. The Document object that the
-    caller now holds is v2 in memory; the next ``to_json``/save will emit
-    v2 to disk. Aggressive auto-migrate-on-load would surprise users who
-    keep project files under version control.
+def _migrate_v2_to_v3_data(data: dict[str, Any]) -> dict[str, Any]:
+    """Migrate a v2 JSON dict to a v3 JSON dict.
+
+    Pure data-shape rewrite: ``ranges: [{source_id, start, end, reason}]``
+    becomes ``main_timeline: {clips: [{source_id, source_path,
+    source_start, source_end, reason}]}``. ``schema_version`` flips to
+    3. Source paths are looked up from the v2 ``sources`` dict and
+    copied onto each clip for redundancy. The migration is lossless
+    for source-monotonic v2 documents (every v2 doc is monotonic by
+    construction).
+    """
+    sources = data.get("sources", {})
+    clips: list[dict[str, Any]] = []
+    for r in data.get("ranges", []):
+        sid = str(r.get("source_id", ""))
+        src = sources.get(sid, {}) if isinstance(sources, dict) else {}
+        clips.append(
+            {
+                "source_id": sid,
+                "source_path": src.get("path", "") if isinstance(src, dict) else "",
+                "source_start": float(r["start"]),
+                "source_end": float(r["end"]),
+                "reason": str(r.get("reason", "")),
+            }
+        )
+    out = dict(data)
+    out["schema_version"] = 3
+    out["main_timeline"] = {"clips": clips}
+    out.pop("ranges", None)
+    return out
+
+
+def _migrate_v1_to_v2_data(data: dict[str, Any]) -> dict[str, Any]:
+    """Migrate a v1 JSON dict to a v2 JSON dict (cuts → ranges).
+
+    This used to return a Document directly; refactored in 6a so the
+    v1→v2→v3 chain composes cleanly. The cut-to-range derivation logic
+    is unchanged.
     """
     from core.timeline import subtract_interval
 
     duration = float(data["duration"])
     source_hash_raw = data.get("source_hash")
     media_source_hash = source_hash_raw if source_hash_raw is not None else ""
-    src = MediaSource(
-        id="src0",
-        path=Path(data["media_path"]),
-        duration=duration,
-        hash=media_source_hash,
-    )
-    sources = {"src0": src}
+    sources_dict = {
+        "src0": {
+            "id": "src0",
+            "path": str(data["media_path"]),
+            "duration": duration,
+            "hash": media_source_hash,
+        }
+    }
 
     ranges: list[Range] = [Range(source_id="src0", start=0.0, end=duration)]
     cuts_sorted = sorted(
@@ -341,15 +452,26 @@ def _migrate_v1_to_v2(cls: type[Document], data: dict[str, Any]) -> Document:
         ranges = subtract_interval(ranges, (cut.start, cut.end), "src0")
         ranges = _attach_cut_reason(ranges, cut)
 
-    return cls(
-        sources=sources,
-        segments=_parse_segments(data.get("segments", [])),
-        ranges=ranges,
-        language=data.get("language"),
-        created_at=datetime.fromisoformat(data["created_at"]),
-        model_name=data.get("model_name", ""),
-        source_hash=source_hash_raw,
-    )
+    out: dict[str, Any] = {
+        "schema_version": 2,
+        "sources": sources_dict,
+        "segments": data.get("segments", []),
+        "ranges": [
+            {
+                "source_id": r.source_id,
+                "start": r.start,
+                "end": r.end,
+                "reason": r.reason,
+            }
+            for r in ranges
+        ],
+        "language": data.get("language"),
+        "created_at": data["created_at"],
+        "model_name": data.get("model_name", ""),
+    }
+    if source_hash_raw is not None:
+        out["source_hash"] = source_hash_raw
+    return out
 
 
 def _attach_cut_reason(ranges: list[Range], cut: CutMark) -> list[Range]:

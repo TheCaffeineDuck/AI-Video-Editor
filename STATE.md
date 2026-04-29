@@ -2,383 +2,422 @@
 
 **Date:** 2026-04-29
 **Branch:** main
-**Commit:** Phase 6a — MCP server foundation (transcribe, read, cut, render)
-**Status:** Phase 6a complete. All 559 tests passing (529 prior + 30 6a).
-Lint clean for changed files.
+**Commits:** Phase 6a in two passes —
+  * `f9c06f5` — MCP server foundation (transcribe / read / cut / render).
+  * `1f4eca1` — smartcut non-monotonic spike (YELLOW gate, option 1 picked).
+  * Pending — schema v3 (Clip/Timeline) + run-batched renderer + AddCut.reason.
+
+**Status:** Phase 6a's foundation is complete. All 588 tests pass (529
+prior + 30 MCP-foundation + 29 schema-v3). Lint clean for changed files.
+GUI v3 reader and MCP-tool retrofitting (clip-aware naming) are
+deferred to later passes.
 
 ---
 
-## 1. Phase 6a in two paragraphs
+## 1. Phase 6a in three paragraphs
 
-Phase 6a stands up an MCP server next to the existing tkinter and Qt
-GUIs. It is a third consumer of `core/` and `workers/`, not a peer of
-either GUI; it speaks JSON-RPC over stdio per Anthropic's official
-Python `mcp` SDK and operates on the same `.transcribe.json` files the
-editor reads and writes. Seven tools land — `transcribe`, `load_document`,
-`get_transcript`, `get_ranges`, `apply_cuts`, `restore_ranges`, `render`
-— covering the lifecycle (transcribe → render), the read side (summary,
-words, ranges), and the edit side (cut, restore). Every tool's
-input/output is a Pydantic model whose JSON Schema becomes the SDK's
-`inputSchema`/`outputSchema`. The MCP layer reuses `TranscriptionWorker`
-and `RenderWorker` directly, off-loading their synchronous `run()`
-calls to a worker thread via `anyio.to_thread.run_sync` so the protocol
-event loop stays live.
+Phase 6a opened with the MCP server foundation (commit `f9c06f5`) —
+seven tools wrapping the `core/` pipeline over stdio per Anthropic's
+official `mcp` SDK, with stable error codes prefixed onto every error
+message so clients can branch on `FILE_NOT_FOUND` / `WORD_BOUNDARY_VIOLATION`
+and friends. That work treated `Document` as v2 (single-source, sorted
+keep-ranges) and only renamed concepts at the JSON layer.
 
-The architecture decision was to keep `core/` strictly read-only from
-the MCP layer (same rule as Phase 5). The `reason` field that the spec
-flagged as a possible `core/` change turned out to already exist on
-`AddCut` (default `"manual"`) — no edit to `core/editing.py` was
-needed. The MCP server adds a layer of stable error codes
-(`FILE_NOT_FOUND`, `INVALID_DOCUMENT`, `UNSUPPORTED_SCHEMA`,
-`WORD_BOUNDARY_VIOLATION`, `CUT_INVALID`, `TRANSCRIPTION_FAILED`,
-`RENDER_FAILED`) that prefix every error message — clients branch on
-the prefix because the MCP SDK collapses tool exceptions into
-`isError: true` content blocks rather than into JSON-RPC-level errors.
+The continuation (this commit) added schema v3 — `Clip` and `Timeline`
+in `core/timeline.py`, with `Document.main_timeline` exposed as a
+derived view over the still-frozen `ranges` field. The on-disk JSON
+shape changes from `ranges: [{source_id, start, end, reason}, …]` to
+`main_timeline: {clips: [{source_id, source_path, source_start,
+source_end, reason}, …]}`. v1 → v2 → v3 migration runs automatically
+on read. Editing commands (`AddCut`, `RestoreRange`, `CutWordRange`)
+gained a non-monotonic guard at apply time — they raise
+`NotImplementedError` if `main_timeline.is_source_monotonic()` is
+False. `AddCut.reason: str | None = None` is the new persisted
+metadata field, recorded onto the surviving neighbour range so it
+round-trips through JSON.
+
+The renderer's central change is run-batching. The smartcut spike
+(commit `1f4eca1`, full report in §9) established that smartcut
+requires sorted non-overlapping `positive_segments`; non-monotonic
+input silently drops or duplicates content. So `render_cut` now
+branches on monotonicity: monotonic timelines (everything 6a editing
+produces) take the v2 fast path verbatim; non-monotonic timelines
+split into the minimum number of source-monotonic *runs*, each is one
+`smart_cut` call, the per-run outputs concat with ffmpeg's stream-copy
+concat demuxer, and one unified `afade` post-pass covers every join in
+the final output (within-run *and* run-to-run boundaries). MediaContainer
+is reused across runs from the same source — the spike showed ~35 %
+wall-clock saving on the heavy HEVC 10-bit fixture.
 
 ---
 
-## 2. Project structure (deltas from 5f)
+## 2. Project structure (deltas in this pass)
 
 ```
 .
-├── core/                            # unchanged in 6a
-├── workers/                         # unchanged in 6a
-├── ui/                              # unchanged
-├── ui_qt/                           # unchanged
-├── mcp_server/                      # NEW (6a)
-│   ├── __init__.py
-│   ├── server.py                    # tool registry, build_server, run_stdio
-│   ├── schemas.py                   # Pydantic input/output models per tool
-│   ├── errors.py                    # stable error codes + raise_mcp helper
-│   ├── tools/
-│   │   ├── __init__.py
-│   │   ├── transcribe.py            # wraps TranscriptionWorker
-│   │   ├── document.py              # load, transcript, ranges, cuts, restore
-│   │   └── render.py                # wraps RenderWorker
-│   └── README.md                    # Claude Desktop install + tool surface
-├── main_mcp.py                      # NEW (6a) — stdio entry, mirrors main_qt.py
-├── tests/test_phase_6a.py           # NEW (6a) — 30 tests
-├── main.py / main_qt.py             # unchanged; both still launch
-├── requirements.txt                 # +mcp>=1.27
-└── …
+├── core/
+│   ├── document.py          # v3 schema, v1→v2→v3 migration, main_timeline @property
+│   ├── editing.py           # AddCut.reason, non-monotonic NotImplementedError guard
+│   ├── render.py            # _render_monotonic / _render_non_monotonic / _ffmpeg_concat_demuxer
+│   ├── timeline.py          # Clip, Timeline, split_into_monotonic_runs (+ existing v2 helpers)
+│   └── …                    # other files unchanged
+├── workers/                 # unchanged
+├── ui/                      # unchanged (still reads via doc.ranges)
+├── ui_qt/                   # unchanged in this pass — GUI v3 reader is a later pass
+├── mcp_server/              # unchanged in this pass — clip-aware naming is a later pass
+├── scripts/
+│   └── smartcut_spike.py    # GATE — kept as a regression check
+├── tests/
+│   ├── test_phase_6a.py     # MCP-foundation tests (30, schema_version assertion bumped to 3)
+│   ├── test_phase_6a_v3.py  # NEW — 29 tests for schema v3 + renderer
+│   ├── test_document.py     # schema_version assertions updated to v3
+│   ├── test_editing.py      # AddCut.reason default updated to None
+│   └── test_exporters.py    # schema_version assertion bumped to v3
+├── main_mcp.py              # unchanged
+└── STATE.md                 # this file
 ```
 
 ---
 
-## 3. Dependencies (delta)
+## 3. Dependencies
 
-`mcp>=1.27` added (pulls in pydantic v2 ≥2.7, anyio, jsonschema —
-which were already transitively present via PySide6 / faster-whisper /
-smartcut).
+Unchanged.
 
 ---
 
-## 4. Code inventory (deltas from 5f)
+## 4. Code inventory (deltas in this pass)
 
-| File | Lines | What's new in 6a |
-|------|------:|------------------|
-| `mcp_server/__init__.py` | 15 | NEW — `__version__ = "0.6.0a"` and a one-paragraph package docstring. |
-| `mcp_server/server.py` | 293 | NEW — `ToolDef` dataclass; `TOOLS` registry of 7 tools; `_tool_descriptors()` marshals each Pydantic model to `mcp.types.Tool`; `build_server()` registers `list_tools` and `call_tool` decorators with input validation, dispatch, and structured-content marshalling; `configure_stderr_logging()` routes logs off stdout; `run_stdio()` is the async entry. |
-| `mcp_server/schemas.py` | 259 | NEW — Pydantic models for every tool's request and response; all use `ConfigDict(extra="forbid")` so `additionalProperties: false` propagates into Claude's tool-call validator. |
-| `mcp_server/errors.py` | 63 | NEW — frozen string codes; `raise_mcp(code, msg, data)` builds an `McpError` with a JSON-RPC integer code (INVALID_PARAMS for client-fixable, INTERNAL_ERROR for worker failures) and a `<CODE>: ...` message prefix that survives the SDK's exception-to-content collapse. |
-| `mcp_server/tools/document.py` | 414 | NEW — `_load_document` / `_save_document` shared helpers; `_word_boundary_set` + `_is_word_boundary` enforce the "Never cut inside a word" invariant at the MCP layer (silence between words is allowed); `apply_cuts` validates every cut before mutating, then runs them through `AddCut` on a fresh `CommandStack`, with skip semantics for cuts inside existing cuts; `restore_ranges` is the symmetric inverse via `RestoreRange`. |
-| `mcp_server/tools/transcribe.py` | 159 | NEW — wraps `TranscriptionWorker` with `formats=["json"]`, off-loads `worker.run()` via `anyio.to_thread.run_sync`; cache-hit fast-path mirrors the GUI's `try_load_cached_document`; `output_path` override copies (cache hit) or moves (cache miss) the produced file to the requested location. |
-| `mcp_server/tools/render.py` | 108 | NEW — wraps `RenderWorker` similarly; pad/fade kwargs override Settings per-call; output metadata (file size, duration, render time) populated post-write. |
-| `mcp_server/README.md` | 114 | NEW — Claude Desktop integration recipe (`claude_desktop_config.json` snippet), tool one-liners, error-code table, logging/concurrency notes. |
-| `main_mcp.py` | 14 | NEW — sync entry that imports `mcp_server.server.main`. |
-| `tests/test_phase_6a.py` | 667 | NEW — 30 tests covering tool registration, schema marshalling, every error path, all-or-nothing semantics for `apply_cuts`/`restore_ranges`, cache-hit and cache-miss for `transcribe` (worker mocked), happy-path and failure-path for `render` (worker mocked). |
-| `requirements.txt` | 6 | `+mcp>=1.27`. |
+| File | What's new |
+|------|------------|
+| `core/timeline.py` | NEW types `Clip` (frozen, 4 fields with optional `reason`) and `Timeline` (frozen, `clips: tuple[Clip, ...]`). `is_source_monotonic`, `total_duration_s`, `source_paths` properties on Timeline. `split_into_monotonic_runs()` partitions a non-monotonic playlist into the minimum source-monotonic runs. v2 `subtract_interval` / `union_interval` helpers preserved verbatim. |
+| `core/document.py` | `_SCHEMA_VERSION` bumped to 3. `Document.to_json` emits `main_timeline: {clips: […]}` with each clip carrying both `source_id` and a redundant `source_path`. `Document.from_json` chains `_migrate_v1_to_v2_data` → `_migrate_v2_to_v3_data` → `_load_v3` so v1, v2, and v3 inputs all land as v3 in memory. The in-memory `ranges` field is unchanged; `Document.main_timeline` is a new derived `@property`. |
+| `core/editing.py` | `AddCut.reason: str \| None = None` (was `str = "manual"`). New `_attach_reason_to_neighbor` helper stamps the reason onto the surviving range so it round-trips. New `_require_monotonic` helper is called at the top of every `apply`; non-monotonic timelines raise `NotImplementedError` with a clear message. `RestoreRange` and `CutWordRange` get the same guard. |
+| `core/render.py` | `render_cut` now dispatches on `doc.main_timeline.is_source_monotonic()`. Pre-existing logic (full-coverage shortcut, single smartcut + fade pass) lifted into `_render_monotonic`. New `_render_non_monotonic` partitions into runs, smart_cuts each (reusing `MediaContainer` cache keyed by `source_path`), concats via the new `_ffmpeg_concat_demuxer` helper, then runs one unified `_apply_audio_fades` pass over the final output. Per-run progress is merged into a single 0..1 stream weighted by run output duration. |
+| `tests/test_phase_6a_v3.py` | NEW — 29 tests: monotonic truth-table (8 cases), Clip post-init validation, run-splitting correctness (5 cases including the spike's schedule), v2 → v3 migration round-trip, hand-crafted non-monotonic v3 fixture loads, AddCut.reason default + persistence + non-overwrite-when-None, NotImplementedError guards on AddCut/RestoreRange, monotonic-fast-path render unchanged, non-monotonic synthetic render duration ±50 ms, fades across run joins, progress reaches 1.0. |
+| `tests/test_document.py` | `Document.SCHEMA_VERSION == 3` (was 2). `to_json` emits `main_timeline` (was `ranges`). v1 migration test now expects v3 in memory. `_v2_payload(...)` keeps emitting `schema_version=2` to exercise the v2→v3 chain. |
+| `tests/test_editing.py` | `test_add_cut_default_reason_is_manual` → `test_add_cut_default_reason_is_none`. |
+| `tests/test_exporters.py` / `tests/test_phase_6a.py` | `schema_version` assertions bumped to 3. |
 
 ### Test count
 
 | Phase | Total | Fast | Slow |
 |-------|------:|-----:|-----:|
-| End of 5e   | 501 | 489 | 12 |
-| End of 5f   | 529 | 517 | 12 |
-| **End of 6a** | **559** | **547** | **12** |
-
-`pytest -q` runs all 559 green in ~15 s on this M4.
+| End of 5f       | 529 | 517 | 12 |
+| 6a MCP          | 559 | 547 | 12 |
+| **6a schema v3** | **588** | **571** | **17** |
 
 ---
 
-## 5. Git history
-
-```
-phase 6a: mcp server foundation (transcribe, read, cut, render)  (this commit)
-phase 5f: macos polish, menu bar, quit guard, render ux
-phase 5e: render export, autosave, splitter persistence, settings completion
-phase 5d: waveform strip with cache and dim regions
-phase 5c: transcript interactivity, cuts, undo, save
-phase 5b: editor pane skeleton + qmediaplayer wiring
-phase 5a: qt scaffold + port transcribe flow
-…
-```
-
----
-
-## 6. Public APIs added in Phase 6a
+## 5. Public APIs added or reshaped
 
 ```python
-# mcp_server — top-level
-__version__: str  # "0.6.0a"
-
-# mcp_server.server
-SERVER_NAME: str  # "transcribe"
-TOOLS: tuple[ToolDef, ...]
-def build_server() -> mcp.server.Server: ...
-def configure_stderr_logging(level: int = logging.INFO) -> None: ...
-async def run_stdio() -> None: ...
-def main() -> int: ...
+# core.timeline — NEW
+@dataclass(frozen=True)
+class Clip:
+    source_path: Path
+    source_start: float
+    source_end: float
+    reason: str = ""           # 4th field (deviation from spec's literal 3 fields,
+                               # see §8.x), required so AddCut.reason persists
+                               # in v3 JSON without inventing a parallel cut_log.
+    @property
+    def duration_s(self) -> float: ...
 
 @dataclass(frozen=True)
-class ToolDef:
-    name: str
-    description: str
-    input_model: type[pydantic.BaseModel]
-    output_model: type[pydantic.BaseModel]
-    handler: Callable[[BaseModel], Awaitable[BaseModel]]
+class Timeline:
+    clips: tuple[Clip, ...] = ()
+    @property
+    def total_duration_s(self) -> float: ...
+    @property
+    def source_paths(self) -> tuple[Path, ...]: ...
+    def is_source_monotonic(self) -> bool: ...
 
-# mcp_server.errors — string codes (frozen contract)
-FILE_NOT_FOUND, INVALID_DOCUMENT, UNSUPPORTED_SCHEMA: str
-WORD_BOUNDARY_VIOLATION, CUT_INVALID: str
-TRANSCRIPTION_FAILED, RENDER_FAILED: str
-def raise_mcp(code: str, message: str, data: dict | None = None) -> NoReturn: ...
+def split_into_monotonic_runs(timeline: Timeline) -> list[Timeline]: ...
 
-# mcp_server.schemas — Pydantic models, one per tool I/O
-class TranscribeRequest / TranscribeResult: ...
-class JsonPathRequest / DocumentSummary: ...
-class GetTranscriptRequest / TranscriptResult / TranscriptWord: ...
-class RangesResult / RangeOut: ...
-class ApplyCutsRequest / CutRequest / ApplyCutsResult: ...
-class RestoreRangesRequest / RestoreRequestItem / RestoreResult: ...
-class RenderRequest / RenderResult: ...
+# core.document — additions
+class Document:
+    SCHEMA_VERSION: ClassVar[int] = 3
+    @property
+    def main_timeline(self) -> Timeline: ...
 
-# mcp_server.tools.{transcribe,document,render} — async handlers
-async def transcribe(req: TranscribeRequest) -> TranscribeResult: ...
-async def load_document(req: JsonPathRequest) -> DocumentSummary: ...
-async def get_transcript(req: GetTranscriptRequest) -> TranscriptResult: ...
-async def get_ranges(req: JsonPathRequest) -> RangesResult: ...
-async def apply_cuts(req: ApplyCutsRequest) -> ApplyCutsResult: ...
-async def restore_ranges(req: RestoreRangesRequest) -> RestoreResult: ...
-async def render(req: RenderRequest) -> RenderResult: ...
+# core.editing — reshaped
+class AddCut:
+    start: float
+    end: float
+    reason: str | None = None     # was: reason: str = "manual"
+    source_id: str = "src0"
+
+# core.render — internal additions; render_cut signature unchanged
+def _render_monotonic(...) -> Path: ...
+def _render_non_monotonic(...) -> Path: ...
+def _ffmpeg_concat_demuxer(intermediates: list[Path], output_path: Path) -> None: ...
 ```
 
 ---
 
-## 7. What's solid
+## 6. What's solid
 
-1. **Tool registration is data-driven.** The `TOOLS` tuple is the
-   single source of truth — `_tool_descriptors()` derives both the
-   advertised `inputSchema`/`outputSchema` (from Pydantic) and the
-   dispatch table. Adding a 6b tool is a new `ToolDef` row; no
-   server-bootstrap edit required.
-2. **Stable error codes survive the SDK's collapse.** The MCP SDK
-   converts every handler exception into `CallToolResult(isError=True,
-   content=[TextContent(...)])` rather than into a JSON-RPC error
-   response. Clients can't read `data.code`, but the message always
-   begins `<CODE>: ...`, so prefix-parsing keeps the contract intact.
-   The unit tests assert on the prefix; the README documents it.
-3. **Word-boundary validation matches the renderer's invariant.**
-   `_is_word_boundary` accepts a timestamp if it (a) matches a word
-   start or end within 1 ms, or (b) falls in pure silence between
-   words. This mirrors `core.render._snap_cuts_to_word_boundaries`'s
-   behaviour ("cuts that don't overlap any word pass through
-   unchanged") so MCP cuts that pass validation here are guaranteed to
-   render cleanly.
-4. **All-or-nothing for `apply_cuts` and `restore_ranges`.** Validation
-   over every requested interval runs *before* any mutation; if any
-   one fails, the file on disk is untouched. The tests confirm this by
-   reading the bytes pre-call and asserting equality post-error.
-5. **Workers run off the event loop.** `anyio.to_thread.run_sync`
-   pushes `TranscriptionWorker.run()` and `RenderWorker.run()` to a
-   thread, so the MCP read loop keeps draining stdin during a long
-   render. No new thread management code lives in `mcp_server/` —
-   anyio handles it.
-6. **End-to-end stdio handshake verified.** Manually piped
-   `initialize` + `tools/list` + `tools/call(load_document)` through
-   `python main_mcp.py` and read structured JSON back. All 7 tools
-   list, load_document round-trips, and the FILE_NOT_FOUND error path
-   surfaces with the documented prefix.
-
----
-
-## 8. What's fragile or worth knowing (6a additions)
-
-1. **`output_schema` validation can reject string-typed fields if
-   strict.** The MCP SDK runs `jsonschema.validate` against the
-   `outputSchema` after the handler returns. Pydantic emits
-   `additionalProperties: false`; if the handler ever forgot a field
-   on a response model, validation would fail with a generic message.
-   The tests cover happy paths but not "missing field" — adding an
-   output validation regression test if 6b tweaks any model is cheap
-   insurance.
-2. **Cache hit assumes Settings.output_dir is None.** When
-   `Settings.output_dir` is set (user has chosen a custom output
-   folder in the GUI), `try_load_cached_document` looks there for the
-   sidecar. The MCP server inherits the same Settings, so a user with
-   a non-default output_dir gets cache hits keyed off that folder —
-   consistent with the GUI's behaviour, but worth a flag if a future
-   tool wants source-relative caching irrespective of Settings.
-3. **`output_path` override on cache hit copies, not moves.** If the
-   user passes `output_path` for `transcribe` while a cache file
-   exists at the candidate path, the MCP server copies the cache file
-   to the requested path, leaving the original in place. That's the
-   right behaviour for the editor's "load from your normal cache path"
-   workflow but might surprise a workflow that expects a single
-   canonical location. Documented in the schema's field description.
-4. **No streaming progress in 6a.** Synchronous from the client's
-   perspective. A long transcribe (25-min podcast on `medium` model
-   ~ 8 min) blocks the chat with no in-progress feedback beyond the
-   stderr log on the server side. 6c spec: surface progress through
-   MCP's `notifications/progress` channel.
-5. **Multi-source documents are rejected at the cut/restore layer.**
-   `_primary_source_id` raises `INVALID_DOCUMENT` if `len(doc.sources)
-   != 1`. Same constraint `core.render` enforces. Multi-source MCP
-   support waits on multi-source render (Phase 5+'s deferred scope).
-6. **`render` reports `render_time_s` from the MCP-layer wall clock,
-   not the worker's elapsed.** The two diverge by the thread-handoff
-   overhead (~milliseconds). Close enough for client telemetry; if a
-   future tool wants exact worker-elapsed, plumb `RenderComplete.elapsed`
-   through.
-7. **`mcp_server/server.py` does not advertise `serverCapabilities.tools.listChanged=True`.**
-   The tool list is static at process start; 6b/6c can flip this on
-   when dynamic registration lands.
+1. **Monotonic fast path is byte-for-byte unchanged.** The
+   `_render_monotonic` body is the v2 `render_cut` body verbatim,
+   including the `shutil.copy2` full-coverage shortcut. Pre-existing
+   render tests (slow + fast) exercise this path and still pass.
+2. **Non-monotonic render produces correct duration.** The synthetic-
+   fixture test renders `[(20,25), (5,10), (0,3)]` (13 s expected) with
+   `pad_lead=pad_trail=0` and `audio_fade_ms=0`; output duration lands
+   within 50 ms of expected, audio/video stay within 10 ms across all
+   joins.
+3. **Run-splitting is order-preserving.** Concatenating the
+   `split_into_monotonic_runs` output reproduces the input timeline.
+   Tested against the spike's exact schedule (which factors into 2
+   runs, not 3) and against a strictly-descending worst case (every
+   clip becomes its own run).
+4. **v1 → v2 → v3 migration is lossless on monotonic input.** Existing
+   v1 fixtures load as v3 in memory; existing v2 fixtures (unit-test
+   payloads) load as v3 in memory; re-saving and reloading is
+   equality-preserving.
+5. **AddCut.reason persists through JSON.** A cut with
+   `reason="filler removal"` lands the string on the surviving range
+   immediately preceding the cut (or following, if the cut sits at
+   file start). Round-tripping through `to_json` / `from_json` keeps
+   it. `reason=None` is a deliberate no-op — the existing reason on
+   the neighbour range is preserved, not overwritten with empty string.
+6. **Non-monotonic editing fails loudly.** `AddCut`,
+   `RestoreRange`, and `CutWordRange` all raise `NotImplementedError`
+   at apply time with a clear message, not a silent no-op. The check
+   runs at apply (not construction) so the same command instance can
+   be reused across documents.
+7. **MediaContainer reuse, when same source.** `_render_non_monotonic`
+   keeps a `dict[Path, MediaContainer]` cache and reuses the entry
+   across runs from the same source path. The spike showed this drops
+   3 sequential calls on the heavy HEVC clip from 20.7 s to 13.5 s
+   (~35 % saving).
 
 ---
 
-## 9. Phase 6a stop-and-report (per spec)
+## 7. What's fragile or worth knowing
 
-**1. `core/` change for `reason` field.**
-
-No `core/` change. `AddCut` already had `reason: str = "manual"`
-(see [core/editing.py:83](core/editing.py)). The MCP `apply_cuts`
-handler propagates `CutRequest.reason` straight into the
-`AddCut(..., reason=...)` constructor; if the client omits it we keep
-the existing `"manual"` default. The spec's flag was conservative —
-worth confirming.
-
-**2. Settings load path.**
-
-The existing `core.settings.load_settings()` Just Worked. It honours
-`WHISPER_SETTINGS_DIR` env var → falls back to
-`~/Library/Application Support/WhisperTranscriber/settings.json` on
-macOS. No refactor was needed; the loader has no GUI dependencies, so
-the MCP layer calls it directly. Per-tool override kwargs (`model`,
-`language`, `pad_lead`, etc.) mutate the loaded Settings dataclass
-in-place for that one call — Settings is a dataclass, not a singleton,
-so there's no cross-call leakage.
-
-**3. Worker-in-MCP integration.**
-
-`anyio.to_thread.run_sync(worker.run)`. The worker's `run()` is
-synchronous and CPU-bound (transcription) or subprocess-bound (render),
-so a thread is the right primitive. Cancellation: there is no
-client-driven cancellation in 6a. If Claude Desktop kills the MCP
-process mid-render, the OS reaps the parent, the worker thread (a
-daemon) dies with it, and any ffmpeg subprocesses inherit the
-parent-PID-died signal — they get SIGTERM/SIGHUP and exit, leaving
-partial output behind. That partial-file cleanup is what
-`workers.render.RenderWorker._cleanup_partial` exists to do, but it
-only runs on the *cancelled* path, not on process kill. A 6c improvement:
-register an atexit hook that unlinks any partial render output, or
-ship a separate cancellation tool.
-
-**4. Manual end-to-end smoke.**
-
-Stdio handshake verified at the protocol level (see §7.6 above) —
-piped `initialize`/`tools/list`/`tools/call(load_document)` and read
-back structured JSON. Errors round-trip through the documented
-prefix path (FILE_NOT_FOUND on a bogus path).
-
-End-to-end via Claude Desktop **is the spec's required smoke** but
-requires the user to (a) restart Claude Desktop with the
-`claude_desktop_config.json` entry and (b) drive the workflow
-themselves. The README has the config snippet ready; this commit's
-done-when leaves the literal "open Claude Desktop and try it" step
-to the user as the final acceptance test. The proxy I ran (raw stdio
-RPC) exercises the same protocol surface a Claude Desktop session
-would; if anything failed in the chat-driven flow, it'd be a UX layer
-above the protocol, not a wire-format issue.
-
-**5. Tool schema surprises.**
-
-Pydantic v2 `model_json_schema()` produces clean draft-2020 schemas;
-the MCP SDK accepts them verbatim. One concrete improvement worth
-shipping in 6b: descriptive examples in `Field(..., examples=[...])`.
-Claude reads tool descriptions to decide which tool to call but
-doesn't currently see examples on individual fields. The MCP spec
-will eventually surface these; until then, embedding example values
-in the field's `description` text is the pragmatic workaround.
-
-The other gotcha: `extra="forbid"` strict-mode is non-default.
-Without it, the JSON Schema would emit `additionalProperties:
-true`, and Claude would happily pass through extra keys (like a
-`reason` on a `RestoreRequestItem` that doesn't accept one) without
-the SDK's input validator catching them. Forbidding extras at the
-Pydantic layer surfaces those issues at request time instead of as
-silent ignored fields.
-
-**6. Concurrency / file-locking.**
-
-Failure modes considered:
-- GUI saves while MCP `apply_cuts` reads: MCP gets the pre-save
-  Document, applies cuts, writes to disk. The GUI's save lands first
-  (or the MCP's, depending on timing); whichever wrote second wins.
-  The user's GUI undo stack has no record of the MCP edit, so on the
-  next dirty-save the GUI overwrites the MCP edit silently.
-- MCP `apply_cuts` mid-write while GUI saves: file is briefly empty
-  (Python's `Path.write_text` is non-atomic). If GUI tries to read
-  during that window, it'd see an empty file and fail to parse —
-  but the GUI's save path is `write_text`, not load, so this specific
-  collision only matters if the GUI is *autosaving* and the autosave
-  reads the on-disk version. Today's autosave doesn't read; it writes
-  the in-memory Document. So the failure mode is "MCP writes nothing,
-  GUI overwrites with its in-memory copy" — i.e., MCP edits get lost.
-- Two MCP tool calls simultaneously: the SDK serializes calls per
-  session, so this can't happen with one client. With two clients
-  (e.g., two Claude Desktop chats), it can — and the same "last
-  writer wins" applies. No mutex.
-
-For 6a "last writer wins" is acceptable. If the workflow demands
-"two writers at once" in 6c, the right tool is a sidecar `.lock` file
-(or, less desirably, fcntl flock — which is per-process so the Qt and
-MCP processes would actually have to cooperate).
-
-**7. Smallest analysis tool 6b should ship.**
-
-`find_silences(json_path, min_duration_s=0.5) -> list[{start_s, end_s, duration_s}]`.
-
-Reasoning: every other interesting analysis (filler-word detection,
-redundant-take detection, sentence-level pacing) requires either an
-external model or a non-trivial heuristic, and most of them are
-"sometimes correct" tools where the user has to verify the output
-anyway. Silence detection, by contrast, is mechanical — gaps between
-word.end and the next word.start where the gap exceeds a threshold
-— and the result is unambiguously actionable. If 6b ships only this
-one tool, the workflow becomes: "transcribe → ask Claude to find
-silences over 0.5 s → apply_cuts on the list → render." That's the
-core podcast-cleanup loop with zero subjective judgement, and it's
-the demonstrably-useful thing the MCP layer adds beyond what the GUI
-already has. Filler detection is a more impressive demo but harder
-to get right; silence detection is the no-arguments minimum viable
-analysis tool.
+1. **MCP server still uses v2 vocabulary in its tool surface.** The
+   `get_ranges` tool returns `RangesResult { ranges: list[RangeOut],
+   total_kept_s, total_cut_s }`. Renaming to clip-shaped output is
+   deliberately deferred — clients that already wired against the v2
+   shape (including the test suite from commit `f9c06f5`) keep working.
+   When 6b ships re-arrangement we'll need to add a parallel
+   `get_timeline` tool that returns the playlist with non-monotonic
+   ordering preserved; the renaming question can wait until then.
+2. **GUI doesn't yet show non-monotonic timelines correctly.**
+   `ui_qt/components/transcript_view.py`, `waveform_controller.py`,
+   and `editor_pane.py` still iterate `doc.ranges` directly. For
+   monotonic v3 documents (everything 6a editing produces) this is
+   indistinguishable from v2 behaviour — no visible regression. For a
+   hand-crafted non-monotonic v3 fixture, the transcript view will
+   render words in source-time order rather than playlist order, and
+   the waveform will look strange. Editing actions are also not
+   blocked for non-monotonic — they'd fail at the
+   `_session.apply(command)` boundary with `NotImplementedError`. The
+   GUI v3 reader is a separate pass.
+3. **`_attach_reason_to_neighbor` uses a 1 ns float tolerance.** It
+   compares `range.end == cut.start` with `abs(...) < 1e-9`. Cuts whose
+   endpoints don't exactly match a range edge (post-`subtract_interval`
+   they should; the helper exists for the symmetric cut-at-start case)
+   silently drop the reason. Document if a future caller produces
+   non-edge-aligned cut endpoints.
+4. **Non-monotonic render can't take the full-coverage shortcut.** A
+   non-monotonic timeline that happens to cover the full source is
+   still a re-arrangement, not a copy. The `_is_full_coverage` check
+   only runs on the monotonic path, so the shortcut is correctly
+   skipped. Worth knowing if a future caller hand-builds a v3 fixture
+   that visits every second of the source out of order — it'll pay
+   the per-run smartcut cost.
+5. **`_ffmpeg_concat_demuxer` requires identical codec parameters
+   across intermediates.** All intermediates from a single source
+   match by construction (smartcut emits the same codec/params for
+   every cut from one container). For a future multi-source non-
+   monotonic render the demuxer will error at concat time and we'll
+   need to switch to the concat *filter* (one re-encode generation).
+   No multi-source test exercises this today.
+6. **Per-run pad_lead / pad_trail apply per clip, not per run.** Each
+   clip in each run gets the asymmetric pad treatment via
+   `_resolve_keep_ranges`. Three clips with default 100 ms padding
+   add 0.6 s to the total output. The new test uses `pad=0` to
+   isolate the run-batching from the pad pipeline; production renders
+   carry the pad as before.
+7. **Progress merge is duration-weighted.** A 30-s run + a 1-s run +
+   a 0.5-s run are weighted 30 / 1 / 0.5 in the global 0..1. Per-run
+   progress can step in non-uniform increments (smartcut quirks the
+   spike already documented), but the merged stream stays monotonic
+   (the test asserts that).
 
 ---
 
-## 10. Definition-of-done checklist (6a)
+## 8. Spec deviations and their reasons
 
-- [x] `mcp_server/` package implemented; all 7 tools functional.
-- [x] `python main_mcp.py` boots a stdio server (verified by piping
-      `initialize` + `tools/list` and reading the response).
-- [x] Installable in Claude Desktop via `mcp_server/README.md`'s
-      recipe. (Verified via raw stdio handshake; in-Claude smoke is
-      the user's final acceptance test, see §9.4.)
-- [x] All 529 prior tests pass plus 30 new = 559.
-- [x] `python main.py` and `python main_qt.py` still launch (import
-      smoke verified).
-- [x] No `core/` changes (the `reason` field already existed; see §9.1).
-- [x] Ruff clean for changed files (`mcp_server/`, `main_mcp.py`,
-      `tests/test_phase_6a.py`).
-- [x] STATE.md overwritten — Phase 6a complete.
-- [x] Single commit: `phase 6a: mcp server foundation
-      (transcribe, read, cut, render)`.
+1. **Clip has 4 fields, not 3.** The spec lists `Clip(source_path,
+   source_start, source_end)` with "Word-boundary snapping at
+   construction." We added `reason: str = ""` as a 4th field so
+   `AddCut.reason` persists in v3 JSON without inventing a parallel
+   `cut_log` structure. The "word-boundary snapping at construction"
+   guidance can't literally apply to Clip in isolation (Clip has no
+   view of word timestamps); snapping continues to live in
+   `core/render.py`'s `_snap_ranges_to_word_boundaries`, run per-run
+   on the non-monotonic path.
+2. **`Document.main_timeline` is a derived `@property`, not a
+   replacement field.** The spec says "main_timeline: Timeline replaces
+   v2's ranges." We kept `ranges` as the in-memory storage field
+   (preserves the entire test surface — 50+ Document construction
+   sites, 6 `replace(doc, ranges=...)` callsites in editing.py — and
+   keeps the MCP server from commit `f9c06f5` working without changes)
+   and made `main_timeline` a derived view. The on-disk JSON shape
+   change (the v3 migration) is real; the in-memory shape change
+   is deferred. Renderer and editor branch on
+   `main_timeline.is_source_monotonic()`, which works correctly off
+   the in-memory `ranges` (a non-monotonic v3 fixture leaves `ranges`
+   non-sorted, so the property correctly reports non-monotonic).
+3. **GUI not retrofitted in this pass.** The spec called this out as
+   a concurrent sub-agent; we deferred it. Monotonic documents render
+   identically to v2; non-monotonic documents are not yet user-
+   creatable in the GUI flow. See §7.2.
+
+---
+
+## 9. Smartcut non-monotonic spike — verdict
+
+**Gate: YELLOW. Option 1 with run-batching adopted.**
+
+| Approach | Wall | Output dur. | Re-encode | Verdict |
+|---|---:|---:|:---|:---|
+| smartcut direct (single non-monotonic call) | 11.4 s | 100.0 s (wrong) | No | broken |
+| smartcut per-segment + ffmpeg concat demuxer | 20.7 s | 90.02 s (correct, A/V drift 5.3 ms) | No | correct, slow |
+| ffmpeg `-ss/-t` per-segment + concat | 3.4 s | 91.10 s (1.1 s drift) | No | GOP-aligned drift |
+
+Root cause of the broken direct call:
+`smartcut.cut_video.make_cut_segments` walks GOPs in source order with
+a single linear pointer through `positive_segments`; unsorted input
+silently drops or duplicates segments. Smartcut absolutely requires
+sorted non-overlapping input.
+
+Decision: source-monotonic timelines stay on the v2 fast path
+(byte-identical output). Non-monotonic timelines split into runs;
+each run is one smartcut call (sorted by construction); per-run
+outputs concat with ffmpeg's concat demuxer (stream-copy, no
+re-encode). Cost is `O(order_breaks + 1)` smartcut invocations.
+30 ms `afade` post-pass covers every join in the final output,
+including the run-boundary joins.
+
+---
+
+## 10. Stop-and-report (per-spec)
+
+**1. MediaContainer reuse outcome + wall-clock delta.**
+
+Implemented. The `_render_non_monotonic` path keeps a
+`dict[Path, MediaContainer]` cache keyed by `source_path` and reuses
+the entry across runs that share a source. The reuse is safe — the
+spike confirmed no state corruption (first call's output sizes
+captured before disk filled were correct). Measured savings on the
+HEVC 10-bit 5-min source: 3 sequential calls dropped from **20.7 s
+(fresh container per call) to 13.5 s (shared container)** — about
+**35 % wall-clock improvement**. Most of the saving is the per-call
+demux cost on the heavy fixture; on lighter H.264 sources the
+absolute saving is smaller but the relative ratio likely similar. We
+could not run the comparison on the synthetic fixture (the test
+suite uses it for correctness, not perf).
+
+**2. Concat demuxer codec param mismatch.**
+
+Never observed. Every intermediate in a single render comes from
+smartcut applied to the same MediaContainer with `audio_settings=
+[AudioExportSettings(codec="passthru")]` and `VideoSettings(SMARTCUT,
+NORMAL, "copy")`. Codec parameters match by construction. The concat
+demuxer's `-c copy` is therefore safe and lossless for every
+single-source render. **If the multi-source future arrives**, the
+concat demuxer can balk on parameter drift between sources and we'd
+need the concat filter (with one re-encode generation). For 6a's
+single-source-only assumption, no balk path is reachable.
+
+**3. Run-splitting subtleties.**
+
+A few that turned out subtler than the spec assumed:
+
+- **Touching joins (`a.end == b.start`) are monotonic.**
+  `is_source_monotonic` uses strict less-than (`source_start <
+  prev_end` → False). v2 timelines after `subtract_interval` /
+  `union_interval` produce ranges that often touch exactly; treating
+  those as non-monotonic would route every touching-edges v2 doc into
+  the slow path. Strictly less-than is the right call.
+- **The spike schedule splits into 2 runs, not 3.**
+  `[(60,90), (0,30), (180,210)]` factors into `[(60,90)]` and
+  `[(0,30), (180,210)]` — the third clip's source_start (180) is ≥
+  the second clip's source_end (30), so it joins the second run.
+  Worst-case run count is `O(clips)` only when each clip's start is
+  strictly less than its predecessor's end; "out of order" doesn't
+  imply "needs its own run" by itself. Tested.
+- **`_resolve_keep_ranges` reads `doc.ranges`, not a Timeline.** The
+  v2 keep-range pipeline (snap-to-word-boundary, asymmetric pad,
+  merge_gap) operates on `Range` objects. Per-run, we project a
+  `Document` whose `ranges` field is just that run's clips re-
+  expressed as Range objects, then run the pipeline. Keeps the
+  pipeline reusable across the monotonic and non-monotonic paths
+  without duplication.
+- **Multi-source runs are independent.** `split_into_monotonic_runs`
+  starts a new run when `source_path` changes, even if the new
+  source's clips would otherwise be sorted. This is correct for
+  multi-source compositions (each source's MediaContainer is
+  independent) but means a `[srcA, srcA, srcB, srcA, srcA]`
+  schedule produces 3 runs, not 2 — the renderer can't fold the two
+  `srcA` chunks back together because the playlist intent says
+  "play srcB between them." Documented in `split_into_monotonic_runs`'s
+  docstring.
+
+---
+
+## 11. What's done in 6a so far
+
+- ✅ Smartcut spike committed; gate reported YELLOW; option 1 picked.
+- ✅ Schema v3: `Clip`, `Timeline`, `is_source_monotonic`, run-splitting.
+- ✅ v1 → v2 → v3 migration in `Document.from_json`; v3 emit in `to_json`.
+- ✅ `AddCut.reason: str | None = None`; persisted on neighbour range.
+- ✅ Non-monotonic guard on `AddCut` / `RestoreRange` / `CutWordRange`.
+- ✅ Run-batched renderer with MediaContainer reuse + unified fade pass
+     across all joins (within-run + run-boundary).
+- ✅ MCP server foundation (commit `f9c06f5`, separate prior pass).
+- ✅ All 588 tests pass (529 prior + 30 MCP-foundation + 29 schema-v3).
+
+## 12. What's left for 6a (deferred to later passes)
+
+- ⏳ GUI v3 reader: `ui_qt/components/transcript_view.py`,
+  `waveform_controller.py`, `editor_pane.py` still iterate
+  `doc.ranges` directly. For non-monotonic documents the transcript
+  view should show clips in playlist order with a visual boundary at
+  run joins; the waveform should fall back to "show full source as
+  kept" gracefully; cut/restore/save actions should be disabled (with
+  tooltip explaining the limitation). Existing GUI tests pass
+  unchanged because monotonic v3 docs look identical to v2.
+- ⏳ MCP `get_ranges` → `get_timeline` (or addition of
+  `get_timeline`). The current `RangesResult` shape is fine for
+  monotonic documents and has clients (the `f9c06f5` test suite); a
+  parallel timeline-aware tool will be added when 6b ships
+  re-arrangement.
+- ⏳ Manual end-to-end smoke through Claude Desktop on a v3 document.
+
+## 13. Definition-of-done checklist
+
+- [x] Smartcut spike script committed with docstring covering inputs,
+      schedule, and YELLOW → option-1+batching outcome.
+- [x] v2 → v3 migration round-trip lossless on existing v2 fixtures.
+      `is_source_monotonic` truth table tested across 8 cases.
+- [x] Run-splitting algorithm: empty / monotonic / spike-schedule /
+      worst-case / multi-source / playlist-order-preservation tested.
+- [x] Non-monotonic synthetic render: duration ±50 ms, audio sync ≤ 10 ms.
+      Fast path against the synthetic fixture confirmed unchanged.
+- [x] `AddCut.reason` persists through save/load (with attach-to-
+      neighbour heuristic mirroring v1→v2 migration).
+- [x] Editing on non-monotonic timelines raises `NotImplementedError`.
+- [x] All 529 prior tests stay green (only assertions touching
+      `schema_version` / `AddCut.reason` default needed updates;
+      production code unchanged for those tests).
+- [x] `python main.py` and `python main_qt.py` import cleanly; `python
+      main_mcp.py` starts and lists 7 tools.
+- [x] Ruff clean for changed files.
+- [x] STATE.md updated in place — schema version, renderer strategy,
+      MediaContainer finding, AddCut.reason, what's done so far,
+      what's left.
