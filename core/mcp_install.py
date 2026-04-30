@@ -86,6 +86,19 @@ def _read_config(path: Path) -> tuple[dict | None, str | None]:
 
 def _atomic_write(path: Path, payload: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Single rolling backup of the existing config. Atomic rename
+    # protects against partial writes; this protects against a logic
+    # bug in this module emitting a structurally valid but semantically
+    # destructive payload (e.g. wiping someone's other mcpServers
+    # entries). Best-effort: if we can't write the backup, proceed
+    # anyway — refusing to install over a non-writable backup path is
+    # worse than the residual risk.
+    if path.exists():
+        backup = path.parent / (path.name + ".bak")
+        try:
+            backup.write_bytes(path.read_bytes())
+        except OSError:
+            pass
     fd, tmp_name = tempfile.mkstemp(
         prefix=path.name + ".", dir=str(path.parent)
     )

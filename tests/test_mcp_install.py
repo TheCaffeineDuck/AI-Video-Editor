@@ -157,6 +157,95 @@ def test_install_missing_venv(config_path, tmp_path):
     assert not config_path.exists()
 
 
+def test_install_writes_rolling_backup(config_path, _stub_paths):
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    pre = {
+        "mcpServers": {
+            "other": {"command": "node", "args": ["o.js"]},
+            "transcribe": {
+                "command": "/old/python",
+                "args": ["/old/main_mcp.py"],
+            },
+        }
+    }
+    config_path.write_text(json.dumps(pre), encoding="utf-8")
+
+    venv, main_mcp = _stub_paths
+    result = mcp_install.install(config_path=config_path)
+    assert result.ok
+
+    after = _read(config_path)
+    # (a) other entry preserved
+    assert after["mcpServers"]["other"] == {"command": "node", "args": ["o.js"]}
+    # (b) transcribe updated
+    assert after["mcpServers"]["transcribe"] == {
+        "command": str(venv),
+        "args": [str(main_mcp)],
+    }
+    # (c) .bak holds the pre-install state, including old transcribe
+    backup = config_path.parent / (config_path.name + ".bak")
+    assert backup.exists()
+    bak_data = json.loads(backup.read_text(encoding="utf-8"))
+    assert bak_data == pre
+    assert bak_data["mcpServers"]["transcribe"]["command"] == "/old/python"
+
+
+def test_uninstall_writes_rolling_backup(config_path, _stub_paths):
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    pre = {
+        "mcpServers": {
+            "filesystem": {"command": "node", "args": ["fs.js"]},
+            "transcribe": {"command": "/x", "args": ["/y"]},
+            "other": {"command": "z", "args": []},
+        }
+    }
+    config_path.write_text(json.dumps(pre), encoding="utf-8")
+
+    result = mcp_install.uninstall(config_path=config_path)
+    assert result.ok
+
+    after = _read(config_path)
+    # (a) other servers preserved
+    assert after["mcpServers"]["filesystem"] == {"command": "node", "args": ["fs.js"]}
+    assert after["mcpServers"]["other"] == {"command": "z", "args": []}
+    # (b) transcribe removed
+    assert "transcribe" not in after["mcpServers"]
+    # (c) .bak contains pre-uninstall state
+    backup = config_path.parent / (config_path.name + ".bak")
+    assert backup.exists()
+    assert json.loads(backup.read_text(encoding="utf-8")) == pre
+
+
+def test_install_succeeds_when_backup_write_fails(
+    config_path, _stub_paths, monkeypatch
+):
+    """Backup is best-effort — a failure must not abort the install."""
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    pre = {"mcpServers": {"other": {"command": "node", "args": ["o.js"]}}}
+    config_path.write_text(json.dumps(pre), encoding="utf-8")
+
+    backup_path = config_path.parent / (config_path.name + ".bak")
+    real_write_bytes = Path.write_bytes
+
+    def fake_write_bytes(self, data):
+        if self == backup_path:
+            raise OSError("simulated backup write failure")
+        return real_write_bytes(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", fake_write_bytes)
+
+    venv, main_mcp = _stub_paths
+    result = mcp_install.install(config_path=config_path)
+    assert result.ok
+    assert not backup_path.exists()
+    after = _read(config_path)
+    assert after["mcpServers"]["transcribe"] == {
+        "command": str(venv),
+        "args": [str(main_mcp)],
+    }
+    assert after["mcpServers"]["other"] == {"command": "node", "args": ["o.js"]}
+
+
 def test_is_installed_false_when_missing(config_path, _stub_paths):
     assert mcp_install.is_installed(config_path=config_path) is False
 
