@@ -21,3 +21,19 @@ tests/fixtures/synthetic.mp4
 # committed (regenerated on demand via workers/waveform.py).
 *.peaks.npz
 .claude/
+
+# IDE configuration — kept local to each developer.
+.idea/
+.vscode/
+
+# OS / editor junk.
+*.swp
+*.swo
+Thumbs.db
+
+# Local-only artifacts: smoke / scratch outputs that may land next to
+# the repo. Test outputs from `pytest` go through pytest's tmp_path
+# which doesn't touch the working tree, so this is purely a guard
+# against ad-hoc smoke runs accidentally writing into the repo.
+/scratch/
+/smoke_output/
