@@ -40,8 +40,8 @@ import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, Qt, QTimer
-from PySide6.QtGui import QAction, QIcon, QKeySequence
+from PySide6.QtCore import QEvent, QSettings, Qt, QTimer, QUrl
+from PySide6.QtGui import QAction, QDesktopServices, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QDockWidget,
@@ -53,6 +53,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from core import mcp_install
 from core.document import Document, UnsupportedSchemaError
 from core.proposal import (
     ApplyResult,
@@ -149,6 +150,10 @@ class MainWindow(QMainWindow):
         self._pump_timer.setInterval(PUMP_INTERVAL_MS)
         self._pump_timer.timeout.connect(self.pump_once)
         self._pump_timer.start()
+
+        # First-launch MCP install prompt — deferred so the main window
+        # has time to paint before the modal appears.
+        QTimer.singleShot(0, self._maybe_prompt_mcp_install)
 
     # ----- accessors retained for tests + EditorPane swap detection -----
 
@@ -290,7 +295,13 @@ class MainWindow(QMainWindow):
 
         # Help — Qt auto-populates the macOS Search field; an explicit
         # placeholder action keeps the menu visible even when empty.
-        mb.addMenu("Help")
+        help_menu: QMenu = mb.addMenu("Help")
+        self._mcp_connect_action = QAction("Connect to Claude Desktop…", self)
+        self._mcp_connect_action.triggered.connect(self._handle_mcp_connect)
+        help_menu.addAction(self._mcp_connect_action)
+        self._mcp_disconnect_action = QAction("Disconnect from Claude Desktop", self)
+        self._mcp_disconnect_action.triggered.connect(self._handle_mcp_disconnect)
+        help_menu.addAction(self._mcp_disconnect_action)
 
         # Application-menu actions. macOS re-routes these to the bold
         # "Transcribe" menu via their ``MenuRole``; on other platforms
@@ -863,6 +874,78 @@ class MainWindow(QMainWindow):
         if self._editor_pane is not None and self._editor_pane.is_rendering:
             self._render_status.mark_cancelling()
             self._editor_pane.cancel_render()
+
+    # ----- Claude Desktop MCP install -----
+
+    _MCP_DISMISSED_KEY = "mcp/prompt_dismissed"
+
+    def _mcp_settings(self) -> QSettings:
+        return QSettings("Transcribe", "Transcribe")
+
+    def _maybe_prompt_mcp_install(self) -> None:
+        """Show the first-launch prompt unless installed or dismissed."""
+        try:
+            if mcp_install.is_installed():
+                return
+        except Exception:  # pragma: no cover - defensive; never block launch
+            return
+        settings = self._mcp_settings()
+        if settings.value(self._MCP_DISMISSED_KEY, False, type=bool):
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Connect to Claude Desktop?")
+        box.setText(
+            "Transcribe can connect to Claude Desktop so you can edit "
+            "videos and generate highlights through Claude. Connect now? "
+            "You can do this later from the Help menu."
+        )
+        connect_btn = box.addButton("Connect", QMessageBox.ButtonRole.AcceptRole)
+        not_now_btn = box.addButton("Not now", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(connect_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is connect_btn:
+            self._run_mcp_install()
+        elif clicked is not_now_btn:
+            settings.setValue(self._MCP_DISMISSED_KEY, True)
+
+    def _handle_mcp_connect(self) -> None:
+        """Help → Connect. Runs install regardless of dismissal state."""
+        self._run_mcp_install()
+
+    def _handle_mcp_disconnect(self) -> None:
+        result = mcp_install.uninstall()
+        if result.ok:
+            QMessageBox.information(self, "Disconnected", result.message)
+        else:
+            QMessageBox.critical(self, "Disconnect failed", result.message)
+
+    def _run_mcp_install(self) -> None:
+        result = mcp_install.install()
+        if result.ok:
+            QMessageBox.information(
+                self,
+                "Connected to Claude Desktop",
+                "Connected. Quit and relaunch Claude Desktop (Cmd-Q in "
+                "Claude) for the connection to take effect.\n\n"
+                f"{result.message}",
+            )
+            # Clear any prior dismissal so the menu state stays coherent.
+            self._mcp_settings().setValue(self._MCP_DISMISSED_KEY, False)
+            return
+        # Failure path — show the verbatim message and offer the user guide.
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle("Could not connect to Claude Desktop")
+        box.setText(result.message)
+        guide_btn = box.addButton("Open setup guide", QMessageBox.ButtonRole.HelpRole)
+        box.addButton(QMessageBox.StandardButton.Close)
+        box.exec()
+        if box.clickedButton() is guide_btn:
+            guide = Path(__file__).resolve().parent.parent / "USER_GUIDE.md"
+            if guide.is_file():
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(guide)))
 
     # ----- About / Settings -----
 
