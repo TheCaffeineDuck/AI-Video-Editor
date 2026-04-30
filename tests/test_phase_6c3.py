@@ -26,6 +26,7 @@ from core.cache import cache_key
 from core.document import Document, MediaSource, Range, Segment, Word
 from core.highlight import (
     Highlight,
+    SubSpan,
     list_highlights_for_document,
     mark_rendered,
     rendered_output_path_for,
@@ -98,10 +99,10 @@ def _make_highlight(
         highlight_id="",
         created_at=datetime(2026, 4, 29, tzinfo=UTC),
         parent_document_path=parent_path,
-        parent_source_hash=cache_key(media),
-        span_source_path=media,
-        span_source_start=start,
-        span_source_end=end,
+        parent_source_hashes={str(media): cache_key(media)},
+        sub_spans=(
+            SubSpan(source_path=media, source_start=start, source_end=end),
+        ),
         reason=reason,
         reframe_mode=reframe_mode,  # type: ignore[arg-type]
         captions_enabled=captions_enabled,

@@ -149,6 +149,64 @@ differ here.
 at the top of the render path), `tests/test_phase_6c1.py::test_highlight_from_json_rejects_v1_schema`,
 `tests/test_phase_6c1.py::test_render_does_not_invalidate_on_intra_doc_edit`.
 
+### Multi-cam highlights take audio from the master, never from cameras
+
+**Rule.** When a highlight references a sync group, every per-fragment
+intermediate's audio is replaced with the audio master's track at the
+offset-translated window. The cameras' own audio tracks are read for
+sync estimation only and never reach the rendered output.
+
+**Why.** In a podcast multi-cam shoot, the cameras' microphones are
+scratch tracks — built into the camera body, mounted on top of the
+hood, picking up room noise — and the audio master is the only thing
+worth listening to. A "use the camera audio for fragments from that
+camera" approach would create audible level / EQ jumps every time the
+playlist switches angles, on top of being lower-fidelity throughout.
+The sync group's offsets exist precisely so the master can be sliced
+to match each camera-time window. Camera audio still gets read for
+cross-correlation (sync estimation needs the same content from both
+sides) but it's discarded after that.
+
+This is also why the renderer normalizes every per-fragment
+intermediate to a uniform encode profile (1080×1920 H264 + AAC 48 kHz
+stereo): the cameras may have different codecs / resolutions / sample
+rates, but every intermediate has the master's audio at the canonical
+encoder settings, so the concat-demuxer can stream-copy the result
+losslessly.
+
+**Status.** `PASS` — Phase 7.
+
+**Where.** `core/highlight_render.py:_render_with_sync_group` (the
+audio-swap fragment build), `core/sync.py:extract_audio_master_window`
+(per-fragment master extraction at offset-translated start),
+`tests/test_phase_7.py::test_multicam_end_to_end_render`.
+
+### Highlight schema-v2 migrates on read; v1 still raises
+
+**Rule.** :class:`core.highlight.Highlight.from_json` accepts schema
+versions 2 and 3. v2 files (single-source, single-span,
+``parent_source_hash`` singular) lift to in-memory v3 highlights with
+one :class:`SubSpan` and a one-entry ``parent_source_hashes`` dict;
+write-through migration runs on the next save. v1 files (the broken
+``parent_document_state_hash`` field from an early Phase 6c) still
+raise :class:`UnsupportedSchemaError` with a re-propose remediation
+message.
+
+**Why.** Phase 7 widened the schema for multi-camera support. Forcing
+every existing single-camera highlight on disk to be re-authored
+would have been hostile to operators with months of edit history. The
+in-memory v3 representation collapses the v2 single-span into a
+length-1 sub_spans tuple, which the renderer's single-fragment path
+handles identically to the v2 behavior. The on-disk file is left
+alone until the next save touches it — same lazy-migration policy as
+:class:`core.document.Document` (4f-3).
+
+**Status.** `PASS` — Phase 7.
+
+**Where.** `core/highlight.py:_load_v2_as_v3`,
+`tests/test_phase_7.py::test_highlight_v2_payload_migrates_to_v3`,
+`tests/test_phase_7.py::test_highlight_v1_still_raises`.
+
 ### Smartcut's `emit()` is non-monotonic; wrap it
 
 **Rule.** Smartcut's progress callbacks emit non-uniform increments and can briefly exceed the announced total. Any progress signal piped to the UI must be clamped to `[0, 1]` and made monotonic by an adapter, never trusted raw.

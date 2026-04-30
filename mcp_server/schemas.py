@@ -554,40 +554,106 @@ class ReadApplyResultResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class HighlightSpec(BaseModel):
-    """One highlight to author against a parent document.
+class SubSpanSpec(BaseModel):
+    """One ordered fragment in a multi-fragment highlight.
 
-    Mirrors :class:`core.highlight.Highlight` minus the bookkeeping
-    fields (id, created_at, parent paths/hash, rendered_output_path) —
-    those are filled in by ``propose_highlights`` at materialization
-    time. Field validation is owed to the core dataclass; this model
-    is the wire shape only.
+    Wire shape mirrors :class:`core.highlight.SubSpan`. ``source_path``
+    names a camera (or the only source for a single-camera highlight);
+    the ``[source_start_s, source_end_s)`` interval is in *that
+    camera's* time, not audio-master time. The renderer applies any
+    relevant sync-group offset internally.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     source_path: str = Field(
         description=(
-            "Absolute path of the media file the highlight samples from. "
-            "Almost always equals the parent doc's primary source path; "
-            "stored explicitly so a future multi-source parent can carry "
-            "highlights from a specific source."
+            "Absolute path of the camera (or single-source) media. "
+            "When a sync_group_id is set on the parent highlight, this "
+            "must be one of the cameras registered in that group."
         )
     )
     source_start_s: float = Field(
         description=(
-            "Start of the highlight span in source time (seconds). Must "
-            "lie within [0, source_duration]; spec validation runs at "
-            "propose time and surfaces as INVALID_HIGHLIGHT with the "
-            "offending index in the message."
+            "Start of the fragment in *camera time* (seconds). "
+            "Source-time, not audio-master-time — the renderer "
+            "translates via the sync group's offset when needed."
         )
     )
     source_end_s: float = Field(
         description=(
-            "End of the highlight span in source time (seconds). Must be "
-            "strictly greater than source_start_s; zero-duration spans "
-            "are rejected."
+            "End of the fragment in camera time (seconds). Strictly "
+            "greater than source_start_s."
         )
+    )
+    reason: str = Field(
+        default="",
+        description=(
+            "Optional fragment-level rationale (e.g., 'wide for laughter "
+            "beat'). Distinct from the highlight's overall reason. "
+            "Free-form; not validated by is_valid_reason because empty "
+            "is a valid 'no comment'."
+        ),
+    )
+
+
+class HighlightSpec(BaseModel):
+    """One highlight to author against a parent document.
+
+    Phase 7 widens the wire shape: a highlight is now a tuple of
+    fragments (``sub_spans``), each naming its own source path and
+    interval. Optional ``sync_group_id`` ties the highlight to a
+    :class:`core.sync.SyncGroup` whose audio master overrides the
+    cameras' audio at render time.
+
+    Backward compatibility: the legacy single-span fields
+    (``source_path`` / ``source_start_s`` / ``source_end_s``) are
+    still accepted. When provided alongside an empty/missing
+    ``sub_spans``, the propose tool packs them into a one-fragment
+    sub_span list. Mixing both is rejected to keep the contract
+    crisp.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sub_spans: list[SubSpanSpec] = Field(
+        default_factory=list,
+        description=(
+            "Ordered fragments to concatenate. Each fragment names a "
+            "source_path (camera) and a [source_start_s, source_end_s) "
+            "interval in camera time. A single-camera highlight has one "
+            "fragment; a multi-cam highlight has the playlist of camera "
+            "+ interval picks. Either set this or the legacy single-span "
+            "fields below, not both."
+        ),
+    )
+    sync_group_id: str | None = Field(
+        default=None,
+        description=(
+            "Id of the sync group whose audio master should drive this "
+            "highlight's audio. null means 'use camera audio' (the "
+            "single-camera default). When set, every sub_span's "
+            "source_path must be a camera registered in the named group; "
+            "INVALID_HIGHLIGHT fires on a mismatch."
+        ),
+    )
+    source_path: str | None = Field(
+        default=None,
+        description=(
+            "DEPRECATED single-span shortcut. Legacy callers may pass "
+            "source_path / source_start_s / source_end_s instead of "
+            "sub_spans for a one-fragment highlight; the propose tool "
+            "translates internally. Mixing this with sub_spans is "
+            "rejected."
+        ),
+    )
+    source_start_s: float | None = Field(
+        default=None,
+        description="DEPRECATED — see source_path.",
+    )
+    source_end_s: float | None = Field(
+        default=None,
+        description="DEPRECATED — see source_path.",
     )
     reason: str = Field(
         description=(
@@ -601,21 +667,34 @@ class HighlightSpec(BaseModel):
         default="speaker_locked",
         description=(
             "How to crop the source frame onto the 9:16 output. "
-            "'speaker_locked' (default) face-locks once at span midpoint; "
-            "'center' takes a static centered crop. Anything else raises "
-            "INVALID_HIGHLIGHT."
+            "'speaker_locked' (default) face-locks once per camera at the "
+            "first fragment's midpoint; 'center' takes a static centered "
+            "crop. Anything else raises INVALID_HIGHLIGHT. Note: the "
+            "model can't see camera frames, so its angle picks should be "
+            "driven by structural cues (alternation, pacing) — face "
+            "detection happens at render time and isn't a model concern."
         ),
     )
     captions_enabled: bool = Field(
         default=False,
         description=(
             "When True, burns SRT captions derived from the parent doc's "
-            "word timestamps into the rendered output. Default False — "
-            "caption styling is fixed per build (Arial 56, white-on-black, "
-            "bottom-center, 80px margin); per-highlight overrides are "
-            "Phase 7+."
+            "word timestamps. For sync-group highlights the captions "
+            "come from the audio master's transcript (the parent doc by "
+            "convention). Default False."
         ),
     )
+
+
+class SubSpanOut(BaseModel):
+    """Wire shape for one fragment of a stored highlight."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_path: str
+    source_start_s: float
+    source_end_s: float
+    reason: str = ""
 
 
 class HighlightOut(BaseModel):
@@ -625,28 +704,34 @@ class HighlightOut(BaseModel):
 
     highlight_id: str
     created_at: str
-    source_path: str
-    source_start_s: float
-    source_end_s: float
+    sub_spans: list[SubSpanOut] = Field(
+        description=(
+            "Ordered fragments. A single-camera highlight has one entry; "
+            "a multi-cam highlight has the playlist."
+        )
+    )
+    sync_group_id: str | None = Field(
+        description=(
+            "Id of the sync group driving audio for this highlight, or "
+            "null if camera audio is used directly."
+        )
+    )
     reason: str
     reframe_mode: str
     captions_enabled: bool
     rendered_output_path: str | None = Field(
         description=(
             "Absolute path to the rendered <id>.highlight.mp4, or null "
-            "if the highlight has not yet been rendered. Set by "
-            "apply_highlight (and by the GUI Render button). The file's "
-            "presence at the path is not re-checked at read time — "
-            "callers that need a fresh existence check should stat it."
+            "if the highlight has not yet been rendered."
         )
     )
-    parent_source_hash: str = Field(
+    parent_source_hashes: dict[str, str] = Field(
         description=(
-            "core.cache.cache_key value of the source media at authoring "
-            "time (sha256 over absolute_path + mtime + size). Compared "
-            "against the live cache_key at apply time; mismatch raises "
-            "STALE_HIGHLIGHT. Tracks the source FILE only — intra-doc "
-            "edits don't invalidate, file replacement does."
+            "core.cache.cache_key value per unique source path at "
+            "authoring time. Compared against the live cache_key at "
+            "apply time; mismatch raises STALE_HIGHLIGHT. Tracks source "
+            "FILES only — intra-doc edits don't invalidate, file "
+            "replacement does."
         )
     )
 
@@ -690,8 +775,19 @@ class HighlightSummary(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     highlight_id: str
-    source_start_s: float
-    source_end_s: float
+    sub_spans: list[SubSpanOut] = Field(
+        description=(
+            "Ordered fragments — each carrying source_path, "
+            "source_start_s, source_end_s, and an optional reason. "
+            "A single-camera highlight has one entry."
+        )
+    )
+    sync_group_id: str | None = Field(
+        description=(
+            "Id of the sync group driving audio, or null when the "
+            "highlight uses camera audio directly."
+        )
+    )
     reframe_mode: str
     captions_enabled: bool
     reason: str
@@ -758,9 +854,16 @@ class RenderResultSummary(BaseModel):
     output_path: str
     face_detection_used: str = Field(
         description=(
-            "One of 'speaker_locked' (face detected and used), "
-            "'speaker_locked_fallback_to_center' (face detect failed; "
-            "renderer fell back), or 'center' (caller asked for center)."
+            "Aggregate face-detect outcome across all unique sources "
+            "in the highlight. 'speaker_locked' if every camera locked, "
+            "'speaker_locked_fallback_to_center' if at least one fell "
+            "back, or 'center' (caller asked for center)."
+        )
+    )
+    sync_group_id: str | None = Field(
+        description=(
+            "Id of the sync group used at render time, or null for "
+            "single-camera highlights."
         )
     )
     wall_clock_s: float
@@ -799,7 +902,162 @@ class ReadHighlightRenderResult(BaseModel):
     highlight_id: str
     created_at: str
     output_path: str
-    parent_source_hash: str
+    parent_source_hashes: dict[str, str] = Field(
+        description=(
+            "core.cache.cache_key matched at render time, keyed by "
+            "source path string. Single-source renders carry one entry."
+        )
+    )
     face_detection_used: str
-    crop_box: CropBoxOut
+    crop_box: CropBoxOut = Field(
+        description=(
+            "The crop window applied to the *first unique source*. Kept "
+            "for single-camera compat; multi-cam renders also populate "
+            "crop_boxes_by_source below."
+        )
+    )
+    crop_boxes_by_source: dict[str, CropBoxOut] = Field(
+        description=(
+            "Per-unique-source crop windows. Single-camera renders have "
+            "one entry; multi-cam renders have one per camera."
+        )
+    )
+    sync_group_id: str | None
     wall_clock_s: float
+
+
+# ---------------------------------------------------------------------------
+# Phase 7 — sync group lifecycle
+# ---------------------------------------------------------------------------
+
+
+class SyncSourceOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_path: str
+    source_hash: str
+    offset_s: float = Field(
+        description=(
+            "Seconds to add to camera time to land on audio-master time. "
+            "Convention: master_time = camera_time + offset_s."
+        )
+    )
+    manual_override: bool
+    confidence: float | None = Field(
+        description=(
+            "Cross-correlation peak-to-noise ratio. >5 is reliable; "
+            "2.5–5 is marginal; null for manually-set offsets."
+        )
+    )
+
+
+class SyncGroupOut(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sync_group_id: str
+    description: str
+    audio_master_path: str
+    audio_master_hash: str
+    cameras: list[SyncSourceOut]
+    created_at: str
+    estimated_at: str | None
+
+
+class CreateSyncGroupRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    json_path: str = Field(description="Absolute path to a .transcribe.json file.")
+    audio_master_path: str = Field(
+        description=(
+            "Absolute path to the audio master file (the file whose "
+            "audio drives every sync-group highlight render)."
+        )
+    )
+    camera_paths: list[str] = Field(
+        description=(
+            "Absolute paths of camera media files. Each camera's audio "
+            "is cross-correlated against the master to estimate its "
+            "offset; offsets land in the persisted sync group."
+        ),
+        min_length=1,
+    )
+    description: str = Field(
+        default="",
+        description="Optional human-readable label for the group.",
+    )
+    max_lag_s: float = Field(
+        default=30.0,
+        description=(
+            "Maximum offset to search, in seconds. Raise for shoots "
+            "where cameras started minutes apart."
+        ),
+    )
+    search_window_s: float = Field(
+        default=60.0,
+        description=(
+            "How much of each track to use for correlation. 60 s is "
+            "enough for conversational audio; raise for sparse content."
+        ),
+    )
+
+
+class CreateSyncGroupResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sync_group_id: str
+    sync_group_path: str
+    cameras: list[SyncSourceOut]
+    low_confidence_cameras: list[str] = Field(
+        description=(
+            "Source paths whose offset estimation produced a low-confidence "
+            "result (peak-to-noise < CONFIDENCE_GOOD). The offset is still "
+            "recorded; the operator may want to set a manual override."
+        )
+    )
+
+
+class ListSyncGroupsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    json_path: str = Field(description="Absolute path to a .transcribe.json file.")
+
+
+class ListSyncGroupsResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sync_groups: list[SyncGroupOut]
+
+
+class ReadSyncGroupRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    json_path: str = Field(description="Absolute path to a .transcribe.json file.")
+    sync_group_id: str
+
+
+class SetSyncOffsetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    json_path: str = Field(description="Absolute path to a .transcribe.json file.")
+    sync_group_id: str
+    camera_path: str = Field(
+        description=(
+            "Absolute path of the camera whose offset should be "
+            "overridden. Must match a registered camera in the named "
+            "group; otherwise INVALID_SYNC_GROUP fires."
+        )
+    )
+    offset_s: float = Field(
+        description=(
+            "Manual offset in seconds. Replaces any previous estimate; "
+            "the camera's record is marked manual_override=true and the "
+            "confidence is cleared."
+        )
+    )
+
+
+class SetSyncOffsetResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sync_group_id: str
+    camera: SyncSourceOut

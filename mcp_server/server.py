@@ -36,6 +36,8 @@ from mcp_server.schemas import (
     ApplyHighlightResult,
     ApplyProposalRequest,
     ApplyProposalResult,
+    CreateSyncGroupRequest,
+    CreateSyncGroupResult,
     DocumentSummary,
     GetTranscriptRequest,
     HighlightSummary,
@@ -48,6 +50,8 @@ from mcp_server.schemas import (
     ListHighlightsResult,
     ListProposalsRequest,
     ListProposalsResult,
+    ListSyncGroupsRequest,
+    ListSyncGroupsResult,
     ProposeHighlightsRequest,
     ProposeHighlightsResult,
     ProposeMovesRequest,
@@ -60,10 +64,14 @@ from mcp_server.schemas import (
     ReadHighlightRequest,
     ReadProposalRequest,
     ReadProposalResult,
+    ReadSyncGroupRequest,
     RenderRequest,
     RenderResult,
     RestoreRangesRequest,
     RestoreResult,
+    SetSyncOffsetRequest,
+    SetSyncOffsetResult,
+    SyncGroupOut,
     TimelineResult,
     TranscribeRequest,
     TranscribeResult,
@@ -94,6 +102,12 @@ from mcp_server.tools.proposals import (
     read_proposal,
 )
 from mcp_server.tools.render import render
+from mcp_server.tools.sync import (
+    create_sync_group,
+    list_sync_groups,
+    read_sync_group,
+    set_sync_offset,
+)
 from mcp_server.tools.transcribe import transcribe
 
 _LOG = logging.getLogger(__name__)
@@ -327,15 +341,28 @@ TOOLS: tuple[ToolDef, ...] = (
         name="propose_highlights",
         description=(
             "Author one or more highlight specs against a .transcribe.json "
-            "document. Each spec is {source_path, source_start_s, "
-            "source_end_s, reason, reframe_mode, captions_enabled}; "
+            "document. Each spec is {sub_spans, sync_group_id?, reason, "
+            "reframe_mode, captions_enabled} where sub_spans is an "
+            "ordered list of {source_path, source_start_s, source_end_s, "
+            "reason?} fragments. A single-camera highlight has one "
+            "fragment; a multi-cam highlight strings together fragments "
+            "from several cameras and references a sync_group_id whose "
+            "audio master overrides the cameras' audio at render time. "
+            "Legacy single-span shortcut (top-level source_path / "
+            "source_start_s / source_end_s instead of sub_spans) is still "
+            "accepted for backward compat — pick one form per spec. "
             "reframe_mode is 'speaker_locked' (default) or 'center'; "
-            "reason must pass core.edit_events.is_valid_reason. Single-pass "
-            "validation — INVALID_HIGHLIGHT names the offending index "
-            "and no entries are persisted on failure. Returns a list of "
-            "{highlight_id, json_path} pairs in the same order as the "
-            "input. No render is triggered yet — call apply_highlight on "
-            "each id."
+            "reason must pass core.edit_events.is_valid_reason. "
+            "IMPORTANT — camera angle picks: the model can't see camera "
+            "frames. When authoring multi-cam highlights, drive angle "
+            "choices from structural cues (alternate every 5–10 s, "
+            "switch on speaker change if known, hold on the active "
+            "speaker through laughter) rather than 'pick the best "
+            "shot'. Per-fragment reasons (the inner reason field on "
+            "each sub_span) are the place to record the angle "
+            "rationale. Single-pass validation — INVALID_HIGHLIGHT names "
+            "the offending index and no entries are persisted on "
+            "failure. SYNC_GROUP_NOT_FOUND fires for unknown sync_group_id."
         ),
         input_model=ProposeHighlightsRequest,
         output_model=ProposeHighlightsResult,
@@ -401,13 +428,78 @@ TOOLS: tuple[ToolDef, ...] = (
         description=(
             "Read one render-result by id. Carries the full record: "
             "render_result_id, highlight_id, created_at, output_path, "
-            "parent_source_hash (the cache_key matched at render time), "
-            "face_detection_used, crop_box {x, y, w, h}, and "
-            "wall_clock_s. RENDER_RESULT_NOT_FOUND on miss."
+            "parent_source_hashes (cache_key per unique source matched "
+            "at render time), face_detection_used (aggregate across all "
+            "cameras), crop_box for the primary source, "
+            "crop_boxes_by_source for every camera, sync_group_id (if "
+            "applicable), and wall_clock_s. RENDER_RESULT_NOT_FOUND on miss."
         ),
         input_model=ReadHighlightRenderRequest,
         output_model=ReadHighlightRenderResult,
         handler=read_highlight_render,  # type: ignore[arg-type]
+    ),
+    # ----- Phase 7 — multi-cam sync group lifecycle -----
+    ToolDef(
+        name="create_sync_group",
+        description=(
+            "Estimate per-camera offsets against an audio master via "
+            "audio cross-correlation, persist the result as a "
+            "<doc>.sync/<id>.sync.json sidecar. Inputs: an audio_master_path "
+            "(the file whose audio drives sync-group highlight renders) "
+            "and a list of camera_paths (camera media files). Each "
+            "camera's offset is recorded with a confidence score; "
+            "low_confidence_cameras names entries below the trustworthy "
+            "threshold so the operator can manually verify via "
+            "set_sync_offset. Synchronous — runs cross-correlation on "
+            "search_window_s (default 60s) of each track. "
+            "SYNC_ESTIMATION_FAILED fires when the audio master can't "
+            "be read; per-camera silent-input failures land as offset=0 "
+            "with a warning, not a hard error."
+        ),
+        input_model=CreateSyncGroupRequest,
+        output_model=CreateSyncGroupResult,
+        handler=create_sync_group,  # type: ignore[arg-type]
+    ),
+    ToolDef(
+        name="list_sync_groups",
+        description=(
+            "List every sync group authored against a .transcribe.json "
+            "document. Each entry carries sync_group_id, description, "
+            "audio_master_path/hash, the per-camera offset list, and "
+            "created_at / estimated_at timestamps. Sorted chronologically."
+        ),
+        input_model=ListSyncGroupsRequest,
+        output_model=ListSyncGroupsResult,
+        handler=list_sync_groups,  # type: ignore[arg-type]
+    ),
+    ToolDef(
+        name="read_sync_group",
+        description=(
+            "Read one sync group by id. Returns the full record: "
+            "sync_group_id, description, audio_master_path/hash, the "
+            "per-camera entries (path/hash/offset_s/manual_override/"
+            "confidence), and created_at/estimated_at. SYNC_GROUP_NOT_FOUND "
+            "on miss."
+        ),
+        input_model=ReadSyncGroupRequest,
+        output_model=SyncGroupOut,
+        handler=read_sync_group,  # type: ignore[arg-type]
+    ),
+    ToolDef(
+        name="set_sync_offset",
+        description=(
+            "Manually override one camera's offset_s in a sync group. "
+            "Replaces any previous estimate; the camera's record is "
+            "marked manual_override=true and confidence is cleared. Use "
+            "this when cross-correlation produced a low-confidence or "
+            "wrong result and the operator measured the offset by hand "
+            "(e.g., by aligning waveforms in an audio editor). "
+            "INVALID_SYNC_GROUP fires when camera_path isn't registered "
+            "in the named group."
+        ),
+        input_model=SetSyncOffsetRequest,
+        output_model=SetSyncOffsetResult,
+        handler=set_sync_offset,  # type: ignore[arg-type]
     ),
 )
 

@@ -84,6 +84,7 @@ from ui_qt.components.status_widgets import (
     AutosaveStatusLabel,
     RenderStatusWidget,
 )
+from ui_qt.components.sync_setup_dialog import SyncSetupDialog
 from ui_qt.editor_pane import EditorActions, EditorPane
 from ui_qt.style import (
     WINDOW_DEFAULT_SIZE,
@@ -260,6 +261,14 @@ class MainWindow(QMainWindow):
         self._highlights_action.setEnabled(False)  # enabled when an editor is open
         self._highlights_action.triggered.connect(self._handle_toggle_highlights)
 
+        # Phase 7: Edit menu entry that opens the multi-cam sync setup
+        # dialog. The dialog persists a sync group sidecar that
+        # subsequent highlight proposals can reference via
+        # ``sync_group_id``.
+        self._sync_setup_action = QAction("Set Up Multi-Cam Sync…", self)
+        self._sync_setup_action.setEnabled(False)  # enabled when an editor is open
+        self._sync_setup_action.triggered.connect(self._handle_setup_sync)
+
     def _build_menu_bar(self) -> None:
         mb = self.menuBar()
         mb.setNativeMenuBar(True)  # macOS-native; no-op on other platforms.
@@ -282,6 +291,8 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self._editor_actions.restore)
         edit_menu.addSeparator()
         edit_menu.addAction(self._review_proposal_action)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self._sync_setup_action)
 
         # View
         view_menu: QMenu = mb.addMenu("View")
@@ -478,6 +489,36 @@ class MainWindow(QMainWindow):
             self._editor_doc_path(),
         )
 
+    # ----- sync setup dialog (Phase 7) -----
+
+    def _handle_setup_sync(self) -> None:
+        """Open the multi-cam sync setup dialog for the current editor doc.
+
+        The dialog persists a ``<doc>.sync/<id>.sync.json`` sidecar.
+        We don't propagate the new id automatically — Claude Desktop
+        (or the operator's next ``propose_highlights`` call) picks
+        it up via :func:`core.sync.list_sync_groups_for_document`.
+        """
+        if self._editor_pane is None:
+            return
+        doc_path = self._editor_doc_path()
+        if doc_path is None:
+            QMessageBox.information(
+                self,
+                "Multi-cam sync",
+                "Save the project first — the sync group lives next to "
+                "the document on disk.",
+            )
+            return
+        dialog = SyncSetupDialog(doc_path, parent=self)
+        if dialog.exec() == dialog.DialogCode.Accepted and dialog.saved_group_id:
+            QMessageBox.information(
+                self,
+                "Multi-cam sync",
+                f"Saved sync group {dialog.saved_group_id}. Use it via the "
+                "MCP `propose_highlights` tool's `sync_group_id` argument.",
+            )
+
     def _editor_doc_path(self) -> Path | None:
         """Resolve the on-disk .transcribe.json path for the current editor doc.
 
@@ -612,6 +653,7 @@ class MainWindow(QMainWindow):
         self._proposal_review_pane.set_document(None, None)
         # Same treatment for the highlights dock.
         self._highlights_action.setEnabled(False)
+        self._sync_setup_action.setEnabled(False)
         if self._highlights_dock is not None:
             self._highlights_dock.hide()
         self._highlights_panel.set_document(None, None)
@@ -658,6 +700,7 @@ class MainWindow(QMainWindow):
         # Setting set_document fires highlights_present which may auto-
         # show the dock for a new doc.
         self._highlights_action.setEnabled(True)
+        self._sync_setup_action.setEnabled(True)
         self._refresh_highlights_panel()
         if self._highlights_dock is not None and self._highlights_dock.isVisible():
             self._highlights_panel.reload_highlights()

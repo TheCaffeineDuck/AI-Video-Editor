@@ -29,6 +29,7 @@ from core.highlight import (
     HIGHLIGHT_SCHEMA_VERSION,
     Highlight,
     StaleHighlightError,
+    SubSpan,
     highlights_dir_for_document,
     list_highlights_for_document,
     mark_rendered,
@@ -95,10 +96,10 @@ def _make_highlight(
         highlight_id="20260429T100000-deadbeef",
         created_at=datetime(2026, 4, 29, 10, 0, 0, tzinfo=UTC),
         parent_document_path=parent_path,
-        parent_source_hash=cache_key(media),
-        span_source_path=media,
-        span_source_start=start,
-        span_source_end=end,
+        parent_source_hashes={str(media): cache_key(media)},
+        sub_spans=(
+            SubSpan(source_path=media, source_start=start, source_end=end),
+        ),
         reason="highlight reel",
         reframe_mode=reframe_mode,  # type: ignore[arg-type]
         captions_enabled=captions_enabled,
@@ -131,17 +132,21 @@ def test_highlight_round_trip_preserves_full_precision(tmp_path):
         highlight_id="abc",
         created_at=datetime(2026, 4, 29, 10, 0, 0, tzinfo=UTC),
         parent_document_path=parent_path,
-        parent_source_hash=cache_key(media),
-        span_source_path=media,
-        span_source_start=12.345_678_9,
-        span_source_end=42.987_654_321,
+        parent_source_hashes={str(media): cache_key(media)},
+        sub_spans=(
+            SubSpan(
+                source_path=media,
+                source_start=12.345_678_9,
+                source_end=42.987_654_321,
+            ),
+        ),
         reason="highlight: emotional peak",
         reframe_mode="center",
         captions_enabled=True,
     )
     re_read = Highlight.from_json(json.loads(json.dumps(h.to_json())))
-    assert re_read.span_source_start == 12.345_678_9
-    assert re_read.span_source_end == 42.987_654_321
+    assert re_read.sub_spans[0].source_start == 12.345_678_9
+    assert re_read.sub_spans[0].source_end == 42.987_654_321
 
 
 def test_highlight_validates_reason(tmp_path):
@@ -153,10 +158,8 @@ def test_highlight_validates_reason(tmp_path):
             highlight_id="abc",
             created_at=datetime(2026, 4, 29, tzinfo=UTC),
             parent_document_path=parent,
-            parent_source_hash=cache_key(media),
-            span_source_path=media,
-            span_source_start=0.0,
-            span_source_end=10.0,
+            parent_source_hashes={str(media): cache_key(media)},
+            sub_spans=(SubSpan(source_path=media, source_start=0.0, source_end=10.0),),
             reason="x",  # too short, not a category
         )
 
@@ -170,10 +173,10 @@ def test_highlight_rejects_zero_or_inverted_span(tmp_path):
             highlight_id="abc",
             created_at=datetime(2026, 4, 29, tzinfo=UTC),
             parent_document_path=parent,
-            parent_source_hash=cache_key(media),
-            span_source_path=media,
-            span_source_start=10.0,
-            span_source_end=10.0,
+            parent_source_hashes={str(media): cache_key(media)},
+            sub_spans=(
+                SubSpan(source_path=media, source_start=10.0, source_end=10.0),
+            ),
             reason="highlight reel",
         )
 
@@ -187,10 +190,8 @@ def test_highlight_rejects_unknown_reframe_mode(tmp_path):
             highlight_id="abc",
             created_at=datetime(2026, 4, 29, tzinfo=UTC),
             parent_document_path=parent,
-            parent_source_hash=cache_key(media),
-            span_source_path=media,
-            span_source_start=0.0,
-            span_source_end=10.0,
+            parent_source_hashes={str(media): cache_key(media)},
+            sub_spans=(SubSpan(source_path=media, source_start=0.0, source_end=10.0),),
             reason="highlight reel",
             reframe_mode="dynamic_track",  # type: ignore[arg-type]
         )
@@ -292,10 +293,8 @@ def test_write_assigns_id_when_blank(tmp_path):
         highlight_id="",  # caller leaves blank
         created_at=datetime(2026, 4, 29, 10, 0, 0, tzinfo=UTC),
         parent_document_path=parent_path,
-        parent_source_hash=cache_key(media),
-        span_source_path=media,
-        span_source_start=0.0,
-        span_source_end=10.0,
+        parent_source_hashes={str(media): cache_key(media)},
+        sub_spans=(SubSpan(source_path=media, source_start=0.0, source_end=10.0),),
         reason="highlight reel",
     )
     materialized, _ = write_highlight(parent_path, h)
@@ -444,13 +443,11 @@ def test_render_raises_on_stale_hash(tmp_path, monkeypatch):
         highlight_id="20260429T100000-deadbeef",
         created_at=datetime(2026, 4, 29, 10, 0, 0, tzinfo=UTC),
         parent_document_path=parent_path,
-        parent_source_hash="not-the-real-hash",
-        span_source_path=media,
-        span_source_start=5.0,
-        span_source_end=10.0,
+        parent_source_hashes={str(media): "not-the-real-hash"},
+        sub_spans=(SubSpan(source_path=media, source_start=5.0, source_end=10.0),),
         reason="highlight reel",
     )
-    with pytest.raises(StaleHighlightError, match="parent_source_hash"):
+    with pytest.raises(StaleHighlightError, match="hash drifted"):
         render_highlight(h, doc)
 
 

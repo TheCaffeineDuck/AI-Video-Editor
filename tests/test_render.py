@@ -584,10 +584,10 @@ def test_render_cut_audio_fade_attenuates_envelope_around_join(
     pre_outside = envelope(join_t - 0.060, join_t - 0.040)
     post_outside = envelope(join_t + 0.040, join_t + 0.060)
     assert pre_outside > ref * 0.5, (
-        f"signal outside fade window (pre) should be near reference"
+        "signal outside fade window (pre) should be near reference"
     )
     assert post_outside > ref * 0.5, (
-        f"signal outside fade window (post) should be near reference"
+        "signal outside fade window (post) should be near reference"
     )
 
     pre_far = envelope(join_t - 0.025, join_t - 0.020)

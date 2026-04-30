@@ -115,15 +115,16 @@ def _make_doc_file(tmp_path: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def test_twenty_tools_registered():
+def test_twenty_four_tools_registered():
     """Tool count by phase: 8 (6a) + 6 (6b-2 proposals) + 6 (6c-2
-    highlights) = 20.
+    highlights) + 4 (Phase 7 sync groups) = 24.
 
-    The Phase 6c-2 surface adds: propose_highlights, list_highlights,
-    read_highlight, apply_highlight, list_highlight_renders,
-    read_highlight_render. The order is deliberate — proposals
-    register before highlights so a client scanning the tool list
-    encounters the older lifecycle first.
+    The Phase 7 surface adds: create_sync_group, list_sync_groups,
+    read_sync_group, set_sync_offset. The order is deliberate —
+    sync groups register after the highlight surface they support,
+    so a client scanning the tool list encounters the lifecycle
+    that consumes the sync-group context first and discovers the
+    estimation tools second.
     """
     descs = _tool_descriptors()
     names = [d.name for d in descs]
@@ -148,6 +149,10 @@ def test_twenty_tools_registered():
         "apply_highlight",
         "list_highlight_renders",
         "read_highlight_render",
+        "create_sync_group",
+        "list_sync_groups",
+        "read_sync_group",
+        "set_sync_offset",
     ]
 
 

@@ -1,7 +1,295 @@
 # Transcribe — Project State Report
 
-**Date:** 2026-04-29
-**Branch:** main
+**Date:** 2026-04-30
+**Branch:** phase-7-multicam
+
+> **Phase 7** — Synced multi-cam highlights. Schema v3 for highlights
+> (`SubSpan` fragments + per-source hash dict + optional
+> `sync_group_id`); v2 highlights migrate on read. New `core/sync.py`
+> with FFT cross-correlation offset estimation, `SyncGroup`/`SyncSource`
+> dataclasses, sidecar persistence at `<doc>.sync/`, and manual-override
+> support. Renderer extended with three paths: single-fragment (legacy),
+> multi-fragment same-source (concatenated cut + reframe), and
+> sync-group multi-source (per-fragment normalize + audio-master swap +
+> concat). Four new MCP tools (`create_sync_group`, `list_sync_groups`,
+> `read_sync_group`, `set_sync_offset`) bring the surface to **24 tools
+> total**. `propose_highlights` accepts `sub_spans` + `sync_group_id`;
+> legacy single-span shortcut still works for backward compat. GUI:
+> per-fragment camera reassignment dropdowns on highlight cards
+> (sync-group highlights only) and a new "Set Up Multi-Cam Sync…" Edit
+> menu entry that opens a dialog driving cross-correlation +
+> manual-override. Synthetic 3-camera fixture exercises auto-sync,
+> multi-fragment propose, and end-to-end render with mixed-source
+> fragments. **813 tests total (30 new in Phase 7), all green except
+> the pre-existing waveform failure.** Branch is `phase-7-multicam` off
+> `main`; no PR opened. Spec told us not to merge — see "What's next."
+
+**Status:** Phase 7 complete on the implementation side. The full
+chain from "operator points the GUI at an audio master + N cameras"
+through "Claude proposes a multi-fragment highlight with explicit
+camera angle picks via MCP" through "renderer produces a 1080×1920
+mp4 with master audio swapped over per-fragment camera video" runs
+end-to-end on the synthetic fixture. The PASS-rule additions in
+`docs/PRODUCTION_RULES.md` codify the load-bearing decisions: audio
+always comes from the master in a sync-group highlight, and the
+schema migration is on-read with write-through-on-save.
+
+---
+
+## 1. Phase 7 deliverables
+
+- **`core/highlight.py` schema v3.** New `SubSpan` dataclass (one
+  fragment: source path + interval + optional reason). `Highlight`
+  fields rename: `span_source_*` becomes `sub_spans: tuple[SubSpan,
+  ...]`, `parent_source_hash: str` becomes `parent_source_hashes:
+  dict[str, str]` keyed by source-path string. New optional
+  `sync_group_id`. Old single-source convenience properties
+  (`span_source_path`, `parent_source_hash`) survive as compat
+  accessors that raise on multi-fragment highlights. v2 highlights
+  migrate on read via `_load_v2_as_v3`; v1 still raises with a
+  re-propose remediation message. New helper
+  `reassign_fragment_source` swaps one fragment's source path,
+  re-hashes, prunes obsolete hash entries, clears
+  `rendered_output_path` (re-render required). `HighlightRenderResult`
+  bumped to v2 with per-source crop + sync-group fields; v1
+  render-results migrate on read.
+- **`core/sync.py` (new).** `SyncSource` (per-camera offset record)
+  and `SyncGroup` (one-shoot collection) dataclasses with full
+  JSON round-trip. `estimate_offset()` cross-correlates 16 kHz mono
+  PCM extractions of each camera vs the audio master via
+  `numpy.fft.rfft` (no scipy dep). Returns `OffsetEstimate(offset_s,
+  confidence, peak_correlation)`; convention is `master_time =
+  camera_time + offset_s`. `build_sync_group()` runs estimation
+  across N cameras and packs the result; failure on individual
+  cameras lands as `offset_s=0.0` with a warning, not a hard error.
+  `set_manual_offset()` produces an override-flagged
+  :class:`SyncGroup`. `validate_sync_group_freshness()` raises
+  `StaleSyncGroupError` when any source's `cache_key` has drifted.
+  `extract_audio_master_window()` extracts the master's audio at
+  offset-translated times into the canonical AAC profile, with
+  silence-padding when the requested start is negative.
+- **`core/highlight_render.py` extended.** Three paths under one
+  `render_highlight` entrypoint:
+  1. Single fragment, no sync group — existing behavior; ephemeral
+     one-clip Document → `render_cut` → reframe.
+  2. Multi-fragment, single source, no sync group — ephemeral
+     Document with N ranges from one source → `render_cut` (uses
+     monotonic-runs path or non-monotonic depending on order) →
+     reframe + caption pass.
+  3. Multi-fragment with sync group — per-fragment normalize: cut
+     camera video at fragment window, replace audio with master at
+     `start + offset` for `duration`, encode to canonical
+     1080×1920 H264 + AAC 48 kHz stereo. Concat-demuxer stitches
+     fragments losslessly. Optional caption pass on top.
+  Per-source crop math: face detection runs once per unique
+  source (at the midpoint of the first fragment from that source),
+  cached for the run. Aggregate `face_detection_used` reports the
+  worst outcome across cameras.
+- **MCP surface — 24 tools.** Highlight schemas widened to take
+  `sub_spans: list[SubSpanSpec]` plus `sync_group_id: str | None`
+  on `HighlightSpec`; legacy single-span shortcut still accepted
+  for backward compat (mixing both forms raises
+  `INVALID_HIGHLIGHT`). `propose_highlights` validates fragment
+  source paths against the named sync group when present.
+  `apply_highlight` reads the sync group at apply time and surfaces
+  staleness as `STALE_SYNC_GROUP`. Render-result wire shape carries
+  `parent_source_hashes` dict + `crop_boxes_by_source` +
+  `sync_group_id`. Four new sync tools: `create_sync_group` runs
+  cross-correlation + persists; `list_sync_groups` /
+  `read_sync_group` for inspection; `set_sync_offset` for manual
+  override. New error codes: `SYNC_GROUP_NOT_FOUND`,
+  `INVALID_SYNC_GROUP`, `STALE_SYNC_GROUP`,
+  `SYNC_ESTIMATION_FAILED`. The `propose_highlights` description
+  now includes the camera-angle prompt: "the model can't see camera
+  frames; drive angle choices from structural cues (alternation,
+  pacing, speaker change), and use per-fragment reasons to record
+  the rationale."
+- **GUI updates.** `HighlightsPanel`'s `_HighlightCard` renders one
+  row per `SubSpan` showing the time window. For sync-group
+  highlights, each row gets a `QComboBox` listing every camera in
+  the group; switching writes back via `reassign_fragment_source`
+  and clears the rendered output. Single-camera highlights show
+  the source as plain text. New `SyncSetupDialog`
+  (ui_qt/components/sync_setup_dialog.py) walks the operator
+  through pick-master → add-cameras → estimate → eyeball/override
+  → save. Confidence colors: green ≥ 5, amber 2.5–5, red < 2.5.
+  New "Set Up Multi-Cam Sync…" Edit menu entry on
+  `MainWindow`.
+- **Tests.** 30 new tests in `tests/test_phase_7.py` (26 fast + 4
+  slow). Coverage: SubSpan validation + JSON round-trip,
+  Highlight v3 round-trip including multi-fragment, v2-payload
+  migration on read, v1 still raises, fragment reassignment,
+  HighlightRenderResult v1 → v2 migration, sync estimation against
+  known shifted signals (positive + negative shifts), silent /
+  too-short input rejection, SyncGroup persistence + manual
+  override + freshness validation, multi-fragment same-source
+  render (slow), synthetic 3-camera fixture (slow), end-to-end
+  auto-sync + propose + render with mixed-source fragments (slow),
+  MCP propose with sub_spans / legacy / mixed-rejection /
+  unknown-sync-group / and the four sync tools (incl. the
+  set-offset reject-on-unknown-camera path).
+
+---
+
+## 2. Tool count delta (cumulative)
+
+| Phase | Tool count |
+|-------|-----------:|
+| 6a final        | 8 |
+| 6b-2            | 14 (+ proposal lifecycle) |
+| 6c-2            | 20 (+ highlight lifecycle) |
+| **Phase 7**     | **24** (+ create_sync_group / list_sync_groups / read_sync_group / set_sync_offset) |
+
+The previously named test
+`tests/test_phase_6a.py::test_twenty_tools_registered` is now
+`test_twenty_four_tools_registered` and asserts the canonical name
+list of all 24 tools in registration order.
+
+---
+
+## 3. Test count delta
+
+| Phase | Total | Fast | Slow |
+|-------|------:|-----:|-----:|
+| 6c-A/B/C (prior) | 771 | 743 | 28 |
+| Pre-Phase-7 (carry-over fixes) | 783 | 755 | 28 |
+| **Phase 7**      | **813** | **781** | **32** |
+
+The Phase 7 pass added:
+
+- 26 fast tests + 4 slow tests in `tests/test_phase_7.py` (sync
+  unit tests, schema migration tests, MCP wiring tests, the
+  multi-cam fixture, and the end-to-end render).
+
+The pre-existing waveform failure
+(`tests/test_waveform.py::test_strip_dim_overlay_distinguishes_cut_regions`)
+predates Phase 7 and was already documented as "predates this pass"
+in the prior STATE entry.
+
+---
+
+## 4. Render-time impact (multi-cam vs single-cam)
+
+The synthetic 3-camera fixture (3 × 30 s, 320×240, h264 + aac;
+audio master at 30 s, AAC stereo 48 kHz) renders an end-to-end
+multi-fragment 9:16 highlight (3 × 2 s = 6 s output) in **~3 s wall
+clock on an Apple M-series laptop**. The cost breakdown:
+
+- Per-fragment encode (3 fragments): ≈ 2.4 s total.
+- Concat-demuxer pass: ≈ 0.2 s.
+- No caption burn (the smoke test runs without captions).
+
+The headline: **the sync-group path is dominated by the per-fragment
+re-encode**, not by cross-correlation (which runs once at sync-group
+creation time, not at render time). Compared to the single-camera
+6c-2 path, which uses smartcut's stream-copy keep-ranges path and is
+near-zero-cost when no audio fade is needed, the Phase 7 path pays a
+fixed re-encode tax per fragment. This is unavoidable: matching codec
+parameters across cameras is the only way to make concat-demuxer
+safe, and the per-fragment audio swap requires re-encoding the audio
+track anyway. Mitigations explored:
+
+- **Concat-filter instead of concat-demuxer.** Would let the per-camera
+  encodes stay native (no normalize), but the overall output still
+  needs one re-encode pass — and the concat filter is the path that
+  STATE 6c-2 §7.5 flagged as fragile when codecs differ. Not adopted.
+- **Lossless segment-extract for matched-codec multi-cam.** When every
+  camera shares identical encoding params (rare in practice — even
+  same-model cameras produce slightly different bitstreams), the
+  per-fragment cut could be `-c copy`. Not adopted; the matched-codec
+  detection has too many edge cases (e.g. PSNR vs CRF re-encode by
+  the camera firmware) and the lossless gain is < 5 % on typical
+  podcast shoot sizes.
+
+The multi-fragment same-source path (still re-using `render_cut`
+under the hood) is essentially free relative to single-camera —
+adding fragments only widens the keep-list.
+
+---
+
+## 5. What's deliberately not addressed (Phase 7+ debt — carried)
+
+- **Per-frame speaker tracking.** Still one face-detection sample
+  per source per render. With multi-cam where each camera typically
+  frames the speaker statically, this is rarely a problem in
+  practice.
+- **Sub-full-height vertical crop.** Source aspect ≥ 9:16 still
+  forces full-height crop — vertical placement follows source
+  framing.
+- **Async/streaming `apply_highlight`.** Synchronous; a 3-fragment
+  multi-cam render still blocks Claude Desktop for the encode
+  duration. Not painful at fixture sizes but would matter for
+  10-minute podcast highlights.
+- **Auto-renormalize on schema drift.** The on-disk v2 file stays
+  v2 until a save touches it. A future audit could write a script
+  that walks `<doc>.highlights/` and rewrites in v3 form for
+  consistency, but the lazy approach matches every other migration
+  in this codebase.
+- **GUI "re-estimate offsets" button.** The `SyncSetupDialog`
+  re-runs estimation when the operator clicks "Estimate offsets",
+  but there's no "re-estimate just this camera" button — the whole
+  group rebuilds. Not painful at 2–4 cameras.
+- **Camera audio fallback.** If the audio master is missing on
+  disk at render time, `STALE_SYNC_GROUP` fires and refuses. There's
+  no "fall back to camera audio for this fragment" option. By
+  design — the production rule is explicit that audio always comes
+  from the master.
+
+---
+
+## 6. Architectural decisions surfaced (recorded)
+
+- **Sign convention for `offset_s`.** `master_time = camera_time +
+  offset_s`. A camera that started rolling 1 s after the master
+  has `offset = +1.0` (master is 1 s ahead of cam at the same
+  content). The cross-correlation lag at the peak directly
+  corresponds to this value with no sign flip. Documented in
+  `core/sync.py`'s module docstring.
+- **`parent_source_hashes` is a dict keyed by path string.** Phase 7
+  considered a list of `(path, hash)` tuples, but the dict shape
+  makes the renderer's stale-guard loop clean (`for path, hash in
+  highlight.parent_source_hashes.items()`) and matches the
+  multi-source intent. The audio master's hash lives on the sync
+  group, *not* on the highlight — separating concerns means a
+  highlight referencing a sync group doesn't need to repeat the
+  master's hash.
+- **Schema migration on read, write-through on save.** Same lazy
+  policy that 4f-3 established for `Document`. v2 highlights load
+  as v3 in memory; the on-disk file stays v2 until the next save.
+  The test suite covers both: `test_highlight_v2_payload_migrates_to_v3`
+  (in-memory shape) and the implicit "next write produces v3"
+  pattern (verified by reading back after `write_highlight`).
+- **GUI camera reassignment is sync-group-only.** Reassigning a
+  fragment to a camera that's NOT in the sync group would require
+  the operator to either provide a new offset out-of-band or accept
+  using camera audio (which violates the production rule). The
+  cleanest answer is "you can swap among cameras the group already
+  knows about"; cross-group reassignment is a future feature with
+  its own UX questions.
+
+---
+
+## 7. What's next
+
+The spec was explicit: **branch `phase-7-multicam` off `main`, do
+not merge to main, do not open a PR**. The branch is pushed; further
+review happens out-of-band. Next steps (not for this pass):
+
+- Real-fixture smoke against a podcast multi-cam shoot (current
+  smoke is synthetic only — solid colors + lab noise).
+- Per-frame speaker tracking on the speaker-locked path (the sync
+  group's offsets give us audio-driven speaker selection cheaply
+  enough that a "follow the loudest mic" heuristic for the active
+  camera becomes viable).
+- The carry-over Phase 6 follow-ups still on the books:
+  `apply_proposal` UX for "all rejected" runs, editor-side drag-to-
+  reorder, waveform v3 reader, multi-source compositions on the
+  main timeline, `find_silences` analysis tool.
+
+---
+
+## 8. Pre-Phase-7 carry-over (preserved for context)
+
 
 > **Phase 6c (this pass)** — Highlight artifact + 9:16 reframe / caption
 > render path + MCP lifecycle + GUI panel. New `core/highlight.py`

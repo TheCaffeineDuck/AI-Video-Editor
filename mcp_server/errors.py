@@ -89,6 +89,26 @@ re-author the highlight against the current source. Distinct from
 ``STALE_PROPOSAL`` (which guards intra-doc edits) — highlights are
 source-time spans, so only file replacement triggers staleness."""
 
+# Phase 7 — multi-cam sync group lifecycle.
+SYNC_GROUP_NOT_FOUND = "SYNC_GROUP_NOT_FOUND"
+"""``read_sync_group`` / ``apply_highlight`` referenced an id with no
+matching ``<id>.sync.json`` file in the document's sidecar dir."""
+
+INVALID_SYNC_GROUP = "INVALID_SYNC_GROUP"
+"""``create_sync_group`` / ``set_sync_offset`` rejected an input:
+unregistered camera path, missing audio master, malformed offset."""
+
+STALE_SYNC_GROUP = "STALE_SYNC_GROUP"
+"""``apply_highlight`` refused because the sync group's stored hashes
+(audio master or one of its cameras) no longer match the live
+``cache_key``. Re-estimate the sync group against the current files."""
+
+SYNC_ESTIMATION_FAILED = "SYNC_ESTIMATION_FAILED"
+"""``create_sync_group`` could not run cross-correlation on one or
+more cameras (silent audio, bad codec, file truncated). The group
+was still created with placeholder offsets; the operator can set
+manual offsets via ``set_sync_offset``."""
+
 # Server-side: a worker raised. Surface the underlying message so the
 # client (or the human reading the chat) has something to act on.
 TRANSCRIPTION_FAILED = "TRANSCRIPTION_FAILED"
@@ -113,6 +133,10 @@ _CLIENT_CODES = frozenset(
         RENDER_RESULT_NOT_FOUND,
         INVALID_HIGHLIGHT,
         STALE_HIGHLIGHT,
+        SYNC_GROUP_NOT_FOUND,
+        INVALID_SYNC_GROUP,
+        STALE_SYNC_GROUP,
+        SYNC_ESTIMATION_FAILED,
     }
 )
 

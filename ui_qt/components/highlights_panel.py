@@ -1,22 +1,29 @@
-"""GUI pane for inspecting + rendering highlights (Phase 6c-3).
+"""GUI pane for inspecting + rendering highlights.
 
-Read-only counterpart to :class:`~ui_qt.components.proposal_review_pane.ProposalReviewPane`.
-The highlight path has *no human review* — Claude proposes via the MCP
+Largely read-only — Claude proposes highlights via the MCP
 ``propose_highlights`` tool and the renders run via ``apply_highlight``.
-This panel exists for the human's convenience: see what's been proposed,
-trigger a render with one click, open the rendered .mp4 in the OS
-player. No editing of highlight specs from the GUI; if the user wants
-to change a highlight, they re-propose via Claude Desktop.
+The panel surfaces what's been proposed, lets the operator trigger a
+render with one click, and opens the rendered .mp4 in the OS player.
 
-Per-card actions:
+Phase 7 additions:
+
+* Each highlight card lists every *fragment* (one per :class:`SubSpan`),
+  showing the camera assigned to it.
+* For sync-group highlights, every fragment gets a small drop-down
+  letting the operator reassign the camera before render. The
+  reassignment writes the new source path (and hash) back to the
+  sidecar JSON via :func:`core.highlight.reassign_fragment_source`
+  and clears any prior render output — re-render is required.
+* Single-camera (no sync group) highlights show the source as plain
+  text without a drop-down — there's no other camera to swap to.
+
+Per-card actions are unchanged from 6c-3:
 
 * **Render** — runs :func:`core.highlight_render.render_highlight` in
-  a :class:`QThread` so the GUI stays responsive. Greyed out while a
-  render is in flight; the per-card status line shows progress.
+  a :class:`QThread` so the GUI stays responsive.
 * **Open** — opens the rendered .mp4 with the OS default player via
   :class:`QDesktopServices`. Disabled until the highlight has been
-  rendered (i.e., the highlight's sidecar JSON carries a non-null
-  ``rendered_output_path`` *and* the file actually exists on disk).
+  rendered.
 
 State machine:
 
@@ -47,6 +54,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -58,13 +66,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from core.cache import cache_key
 from core.document import Document
 from core.highlight import (
     Highlight,
+    SubSpan,
     list_highlights_for_document,
     read_highlight,
+    reassign_fragment_source,
 )
 from core.highlight_render import render_highlight
+from core.sync import read_sync_group
 from ui_qt.style import ACCENT, DANGER, MUTED, SUCCESS
 
 _LOG = logging.getLogger(__name__)
@@ -127,6 +139,11 @@ def _format_duration(start: float, end: float) -> str:
     return f"{start:.1f}s – {end:.1f}s ({span:.1f}s)"
 
 
+def _camera_label(path: Path) -> str:
+    """Short label for a camera path (filename stem)."""
+    return Path(path).name
+
+
 class _HighlightCard(QFrame):
     """Outline group for a single highlight: header, status, controls.
 
@@ -185,14 +202,13 @@ class _HighlightCard(QFrame):
         header.setStyleSheet("font-weight: bold;")
         outer.addWidget(header)
 
-        time_lbl = QLabel(
-            _format_duration(
-                self._highlight.span_source_start,
-                self._highlight.span_source_end,
-            )
-        )
-        time_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
-        outer.addWidget(time_lbl)
+        # Fragment list — one row per SubSpan, with optional camera
+        # reassignment combo for sync-group highlights.
+        self._fragment_combos: list[QComboBox | None] = []
+        self._available_cameras: list[Path] = self._resolve_available_cameras()
+        for idx, span in enumerate(self._highlight.sub_spans):
+            row = self._build_fragment_row(idx, span)
+            outer.addLayout(row)
 
         reason_lbl = QLabel(f"Reason: {self._highlight.reason}")
         reason_lbl.setWordWrap(True)
@@ -225,10 +241,105 @@ class _HighlightCard(QFrame):
         controls.addStretch(1)
         outer.addLayout(controls)
 
+    def _resolve_available_cameras(self) -> list[Path]:
+        """Return the list of cameras the user can swap a fragment to.
+
+        For sync-group highlights, this is every camera registered in
+        the group. For non-sync-group highlights this is empty (the
+        only camera is the highlight's existing source path; reassignment
+        across unrelated sources is intentionally not supported here
+        because there's no offset translation to fall back on).
+        """
+        if self._highlight.sync_group_id is None:
+            return []
+        try:
+            group = read_sync_group(
+                self._document_path, self._highlight.sync_group_id
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            _LOG.warning(
+                "highlights panel: could not load sync group %s: %s",
+                self._highlight.sync_group_id,
+                exc,
+            )
+            return []
+        return [cam.source_path for cam in group.cameras.values()]
+
+    def _build_fragment_row(self, idx: int, span: SubSpan) -> QHBoxLayout:
+        """Build the row for one SubSpan: time label + camera label/combo."""
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        time_lbl = QLabel(
+            f"#{idx + 1} {_format_duration(span.source_start, span.source_end)}"
+        )
+        time_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        row.addWidget(time_lbl)
+        if self._available_cameras:
+            combo = QComboBox()
+            for cam in self._available_cameras:
+                combo.addItem(_camera_label(cam), userData=str(cam))
+            current_str = str(span.source_path)
+            for i in range(combo.count()):
+                if combo.itemData(i) == current_str:
+                    combo.setCurrentIndex(i)
+                    break
+            combo.currentIndexChanged.connect(
+                lambda _idx, fragment_index=idx, c=combo: self._on_camera_changed(
+                    fragment_index, c
+                )
+            )
+            row.addWidget(combo, 1)
+            self._fragment_combos.append(combo)
+        else:
+            cam_lbl = QLabel(_camera_label(span.source_path))
+            cam_lbl.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+            row.addWidget(cam_lbl, 1)
+            self._fragment_combos.append(None)
+        return row
+
+    def _on_camera_changed(self, fragment_index: int, combo: QComboBox) -> None:
+        """Persist a fragment camera change and surface the dirty state."""
+        new_path_str = combo.currentData()
+        if not new_path_str:
+            return
+        new_path = Path(new_path_str)
+        if self._highlight.sub_spans[fragment_index].source_path == new_path:
+            return
+        try:
+            new_hash = cache_key(new_path)
+        except FileNotFoundError as exc:
+            _LOG.warning(
+                "highlights panel: cannot reassign — camera missing: %s", exc
+            )
+            return
+        self._highlight = reassign_fragment_source(
+            self._document_path,
+            self._highlight,
+            fragment_index=fragment_index,
+            new_source_path=new_path,
+            new_source_hash=new_hash,
+        )
+        # The reassignment cleared rendered_output_path; reflect that.
+        self._refresh_open_state()
+        if self._is_rendered():
+            return
+        self._status_lbl.setText("Reassigned — needs render.")
+        self._status_lbl.setStyleSheet(f"color: {ACCENT};")
+
     def _format_header(self) -> str:
         captions = " · captions on" if self._highlight.captions_enabled else ""
+        sync = (
+            f" · sync:{self._highlight.sync_group_id[:8]}"
+            if self._highlight.sync_group_id
+            else ""
+        )
+        nfrag = (
+            f" · {len(self._highlight.sub_spans)} fragments"
+            if len(self._highlight.sub_spans) > 1
+            else ""
+        )
         return (
-            f"{self._highlight.reframe_mode}{captions} · "
+            f"{self._highlight.reframe_mode}{captions}{sync}{nfrag} · "
             f"{self._highlight.highlight_id[:15]}"
         )
 

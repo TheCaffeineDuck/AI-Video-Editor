@@ -38,6 +38,7 @@ from core.cache import cache_key
 from core.document import Document, MediaSource, Range, Segment, Word
 from core.highlight import (
     Highlight,
+    SubSpan,
     list_highlights_for_document,
     list_render_results_for_document,
     write_highlight,
@@ -325,8 +326,10 @@ def test_list_highlights_returns_summaries(tmp_path):
     result = _run(list_highlights(ListHighlightsRequest(json_path=str(doc_path))))
     assert len(result.highlights) == 1
     s = result.highlights[0]
-    assert s.source_start_s == 2.0
-    assert s.source_end_s == 8.0
+    assert len(s.sub_spans) == 1
+    assert s.sub_spans[0].source_start_s == 2.0
+    assert s.sub_spans[0].source_end_s == 8.0
+    assert s.sync_group_id is None
     assert s.reason == "highlight reel"
     assert s.reframe_mode == "speaker_locked"
     assert s.rendered_output_path is None
@@ -349,8 +352,9 @@ def test_read_highlight_round_trips(tmp_path):
         read_highlight(ReadHighlightRequest(json_path=str(doc_path), highlight_id=hid))
     )
     assert summary.highlight_id == hid
-    assert summary.source_start_s == 12.345
-    assert summary.source_end_s == 18.678
+    assert len(summary.sub_spans) == 1
+    assert summary.sub_spans[0].source_start_s == 12.345
+    assert summary.sub_spans[0].source_end_s == 18.678
     assert summary.reason == "best-take"
 
 
@@ -499,10 +503,8 @@ def test_apply_highlight_stale_when_source_replaced(tmp_path):
         highlight_id="20260429T100000-deadbeef",
         created_at=datetime(2026, 4, 29, tzinfo=UTC),
         parent_document_path=doc_path,
-        parent_source_hash=cache_key(media),
-        span_source_path=media,
-        span_source_start=2.0,
-        span_source_end=8.0,
+        parent_source_hashes={str(media): cache_key(media)},
+        sub_spans=(SubSpan(source_path=media, source_start=2.0, source_end=8.0),),
         reason="highlight reel",
         reframe_mode="center",
     )
@@ -604,7 +606,8 @@ def test_read_highlight_render_round_trips(synthetic_video, tmp_path):
     assert rr.output_path == apply_result.output_path
     assert rr.face_detection_used == "center"
     assert rr.crop_box.w > 0 and rr.crop_box.h > 0
-    assert rr.parent_source_hash != ""
+    assert rr.parent_source_hashes  # at least one entry
+    assert rr.crop_boxes_by_source  # at least one entry
 
 
 @pytest.mark.slow
