@@ -40,6 +40,7 @@ Progress contract:
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import subprocess
 import warnings
@@ -325,6 +326,83 @@ def _join_times_in_output(keeps: list[tuple[float, float]]) -> list[float]:
     return joins
 
 
+# Matches the first video stream line in ``ffmpeg -i`` stderr.
+# Example: ``Stream #0:0[0x1](und): Video: hevc (Main 10) (hev1 / 0x31766568), ...``
+_VIDEO_STREAM_RE = re.compile(
+    r"Stream #\d+:\d+.*?: Video: (?P<codec>\w+).*?\((?P<tag>\w{4}) /"
+)
+
+
+def _probe_video_codec_and_tag(path: Path) -> tuple[str | None, str | None]:
+    """Return ``(codec_name, codec_tag)`` of the first video stream.
+
+    Parses ``ffmpeg -i`` stderr because we don't ship ffprobe (matching
+    ``core.audio.get_duration``'s approach). Both values are lowercased.
+    Returns ``(None, None)`` when no video stream is found or the line
+    can't be parsed — callers must treat that as "skip retag".
+    """
+    ffmpeg = get_ffmpeg_path()
+    result = subprocess.run(
+        [str(ffmpeg), "-hide_banner", "-i", str(path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    for line in result.stderr.splitlines():
+        m = _VIDEO_STREAM_RE.search(line)
+        if m:
+            return m.group("codec").lower(), m.group("tag").lower()
+    return None, None
+
+
+def _ensure_quicktime_compatible(path: Path) -> None:
+    """Retag HEVC outputs with ``codec_tag=hvc1`` so QuickTime opens them.
+
+    libavformat defaults HEVC's MP4 codec_tag to ``hev1``; QuickTime
+    Player rejects ``hev1`` and requires ``hvc1``. Both tags describe
+    the same bitstream — they differ only in whether parameter sets
+    (VPS/SPS/PPS) live solely in the sample description (``hvc1``) or
+    may also appear inline (``hev1``). Smartcut + libavformat output
+    has parameter sets in the sample description, so a metadata-only
+    remux is safe and lossless.
+
+    No-op when the video stream isn't HEVC, is already tagged ``hvc1``,
+    or can't be probed.
+    """
+    codec, tag = _probe_video_codec_and_tag(path)
+    if codec != "hevc" or tag != "hev1":
+        return
+
+    tmp = path.with_name(path.name + ".qt.tmp")
+    ffmpeg = get_ffmpeg_path()
+    cmd = [
+        str(ffmpeg),
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        str(path),
+        "-c",
+        "copy",
+        "-tag:v",
+        "hvc1",
+        "-movflags",
+        "+faststart",
+        str(tmp),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    if result.returncode != 0:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise RuntimeError(
+            f"ffmpeg hvc1 retag failed (rc={result.returncode}): "
+            f"{result.stderr[-400:]}"
+        )
+    tmp.replace(path)
+
+
 def _apply_audio_fades(
     smartcut_output: Path,
     final_output: Path,
@@ -439,7 +517,7 @@ def render_cut(
     output_path = Path(output_path)
 
     if doc.main_timeline.is_source_monotonic():
-        return _render_monotonic(
+        result = _render_monotonic(
             doc,
             output_path,
             on_progress=on_progress,
@@ -448,15 +526,18 @@ def render_cut(
             merge_gap=merge_gap,
             audio_fade_ms=audio_fade_ms,
         )
-    return _render_non_monotonic(
-        doc,
-        output_path,
-        on_progress=on_progress,
-        pad_lead=pad_lead,
-        pad_trail=pad_trail,
-        merge_gap=merge_gap,
-        audio_fade_ms=audio_fade_ms,
-    )
+    else:
+        result = _render_non_monotonic(
+            doc,
+            output_path,
+            on_progress=on_progress,
+            pad_lead=pad_lead,
+            pad_trail=pad_trail,
+            merge_gap=merge_gap,
+            audio_fade_ms=audio_fade_ms,
+        )
+    _ensure_quicktime_compatible(result)
+    return result
 
 
 # ---------------------------------------------------------------------------

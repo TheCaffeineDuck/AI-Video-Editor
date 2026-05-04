@@ -55,6 +55,16 @@ If a rule looks wrong while you're modifying code that touches it, change the ru
 
 **Where.** `core/[render.py](http://render.py):render_cut`.
 
+### HEVC outputs use the ``hvc1`` codec tag, not ``hev1``
+
+**Rule.** Every rendered MP4 with an HEVC video stream carries `codec_tag = hvc1`. The renderer probes the final output and remuxes with `-tag:v hvc1` when libavformat's default `hev1` tag slips through.
+
+**Why.** QuickTime Player on macOS refuses to open MP4s tagged `hev1` and requires `hvc1` — same bitstream, different signal about whether parameter sets (VPS/SPS/PPS) are stored in the sample description (`hvc1`) or also inline (`hev1`). pyav (smartcut) and libavformat default to `hev1` when writing HEVC into MP4, so untreated output silently breaks playback in the most common consumer player on the platform we ship for. Files still play in VLC and ffmpeg either way; the bug only surfaces when the user double-clicks the output. Fixing every mux site individually is fragile (smartcut's direct write, the fade post-pass, and the concat demuxer all produce final outputs in different code paths) so a single post-render retag pass at the end of `render_cut` covers all of them. The retag is metadata-only — no re-encode, no quality loss, ~30s for a 10 GB file.
+
+**Status.** `PASS` — `core/render.py:_ensure_quicktime_compatible` runs at the end of `render_cut`. It probes the output's first video stream via `ffmpeg -i` stderr; if it's HEVC tagged `hev1` it remuxes with `-tag:v hvc1 -movflags +faststart` and atomically replaces the file. No-op for h264, for HEVC already tagged `hvc1`, or when the codec/tag can't be parsed.
+
+**Where.** `core/render.py:_ensure_quicktime_compatible` and `core/render.py:render_cut`.
+
 ### 30ms audio fades at every segment boundary
 
 **Rule.** Every cut boundary in the rendered output applies a 30ms fade on the audio track — fade-out before the cut, fade-in after. Configurable via `audio_fade_ms`, default 30. Values above 50ms are discouraged (viewers hear the dissolve).

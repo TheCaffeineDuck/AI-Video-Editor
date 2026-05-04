@@ -22,10 +22,12 @@ import pytest
 
 from core.document import Document, MediaSource, Range, Segment, Word
 from core.render import (
+    _ensure_quicktime_compatible,
     _is_full_coverage,
     _join_times_in_output,
     _merge_close_keep_ranges,
     _pad_and_merge_keep_ranges,
+    _probe_video_codec_and_tag,
     _ProgressAdapter,
     _resolve_keep_ranges,
     _snap_ranges_to_word_boundaries,
@@ -674,3 +676,128 @@ def test_resolve_snaps_ranges_outward(tmp_path: Path):
     # Snap → range becomes (1.0, 2.5) — start to earlier word start, end to
     # later word end (the next word end ≥ 1.95 is 2.5).
     assert keeps == [(1.0, 2.5)]
+
+
+# ---------------------------------------------------------------------------
+# QuickTime hvc1 retag (Phase 6c-3 follow-up)
+# ---------------------------------------------------------------------------
+
+
+_HEVC_HEV1_STDERR = (
+    "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from '/x.mp4':\n"
+    "  Stream #0:0[0x1](und): Video: hevc (Main 10) (hev1 / 0x31766568), "
+    "yuv420p10le(tv, bt709, progressive), 3840x2160 [SAR 1:1 DAR 16:9], "
+    "47164 kb/s, 24 fps, 24 tbr, 12288 tbn (default)\n"
+    "  Stream #0:1[0x2](und): Audio: aac (LC) (mp4a / 0x6134706D), "
+    "48000 Hz, stereo, fltp, 127 kb/s (default)\n"
+)
+_HEVC_HVC1_STDERR = _HEVC_HEV1_STDERR.replace("hev1 / 0x31766568", "hvc1 / 0x31637668")
+_H264_STDERR = (
+    "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from '/x.mp4':\n"
+    "  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), "
+    "yuv420p(tv, bt709, progressive), 1920x1080, 5000 kb/s, 24 fps\n"
+)
+
+
+class _FakeCompletedProcess:
+    def __init__(self, *, returncode: int = 0, stdout: str = "", stderr: str = ""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def test_probe_video_codec_and_tag_parses_hevc_hev1(monkeypatch):
+    monkeypatch.setattr(
+        "core.render.subprocess.run",
+        lambda *_a, **_k: _FakeCompletedProcess(stderr=_HEVC_HEV1_STDERR),
+    )
+    assert _probe_video_codec_and_tag(Path("/dummy.mp4")) == ("hevc", "hev1")
+
+
+def test_probe_video_codec_and_tag_parses_h264_avc1(monkeypatch):
+    monkeypatch.setattr(
+        "core.render.subprocess.run",
+        lambda *_a, **_k: _FakeCompletedProcess(stderr=_H264_STDERR),
+    )
+    assert _probe_video_codec_and_tag(Path("/dummy.mp4")) == ("h264", "avc1")
+
+
+def test_probe_video_codec_and_tag_no_video_returns_nones(monkeypatch):
+    monkeypatch.setattr(
+        "core.render.subprocess.run",
+        lambda *_a, **_k: _FakeCompletedProcess(stderr="Stream #0:0: Audio: aac\n"),
+    )
+    assert _probe_video_codec_and_tag(Path("/dummy.mp4")) == (None, None)
+
+
+def test_ensure_quicktime_compatible_retags_hevc_hev1(monkeypatch, tmp_path):
+    target = tmp_path / "out.mp4"
+    target.write_bytes(b"original")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, *_a, **_k):
+        calls.append(list(cmd))
+        # First call is the probe (just ffmpeg -i); second is the remux which
+        # should write the temp file.
+        if "-tag:v" in cmd:
+            tmp = Path(cmd[-1])
+            tmp.write_bytes(b"retagged")
+            return _FakeCompletedProcess(returncode=0)
+        return _FakeCompletedProcess(stderr=_HEVC_HEV1_STDERR)
+
+    monkeypatch.setattr("core.render.subprocess.run", fake_run)
+    _ensure_quicktime_compatible(target)
+    assert target.read_bytes() == b"retagged"
+    # Two ffmpeg invocations: one probe, one remux with hvc1 tag and faststart.
+    assert len(calls) == 2
+    remux = calls[1]
+    assert "-tag:v" in remux and remux[remux.index("-tag:v") + 1] == "hvc1"
+    assert "+faststart" in remux
+
+
+def test_ensure_quicktime_compatible_noop_when_already_hvc1(monkeypatch, tmp_path):
+    target = tmp_path / "out.mp4"
+    target.write_bytes(b"unchanged")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, *_a, **_k):
+        calls.append(list(cmd))
+        return _FakeCompletedProcess(stderr=_HEVC_HVC1_STDERR)
+
+    monkeypatch.setattr("core.render.subprocess.run", fake_run)
+    _ensure_quicktime_compatible(target)
+    assert target.read_bytes() == b"unchanged"
+    # Probe-only — no remux call.
+    assert len(calls) == 1
+
+
+def test_ensure_quicktime_compatible_noop_when_h264(monkeypatch, tmp_path):
+    target = tmp_path / "out.mp4"
+    target.write_bytes(b"unchanged")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, *_a, **_k):
+        calls.append(list(cmd))
+        return _FakeCompletedProcess(stderr=_H264_STDERR)
+
+    monkeypatch.setattr("core.render.subprocess.run", fake_run)
+    _ensure_quicktime_compatible(target)
+    assert target.read_bytes() == b"unchanged"
+    assert len(calls) == 1
+
+
+def test_ensure_quicktime_compatible_raises_on_remux_failure(monkeypatch, tmp_path):
+    target = tmp_path / "out.mp4"
+    target.write_bytes(b"original")
+
+    def fake_run(cmd, *_a, **_k):
+        if "-tag:v" in cmd:
+            return _FakeCompletedProcess(returncode=1, stderr="boom")
+        return _FakeCompletedProcess(stderr=_HEVC_HEV1_STDERR)
+
+    monkeypatch.setattr("core.render.subprocess.run", fake_run)
+    with pytest.raises(RuntimeError, match="hvc1 retag failed"):
+        _ensure_quicktime_compatible(target)
+    # Original file untouched, temp cleaned up.
+    assert target.read_bytes() == b"original"
+    assert not (tmp_path / "out.mp4.qt.tmp").exists()
